@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::fmt::{self, Display};
 
 use thiserror::Error;
 
@@ -23,19 +23,43 @@ pub enum OperatorToken {
 }
 
 impl OperatorToken {
+    pub const fn as_char(self) -> char {
+        match self {
+            Self::Equal => '=',
+            Self::Star => '*',
+            Self::Colon => ':',
+            Self::Comma => ',',
+            Self::LeftParenthesis => '(',
+            Self::RightParenthesis => ')',
+            Self::LeftBracket => '[',
+            Self::RightBracket => ']',
+            Self::LeftBrace => '{',
+            Self::RightBrace => '}',
+        }
+    }
+
+    pub const fn from_char(c: char) -> Option<Self> {
+        match c {
+            '=' => Some(Self::Equal),
+            '*' => Some(Self::Star),
+            ':' => Some(Self::Colon),
+            ',' => Some(Self::Comma),
+            '(' => Some(Self::LeftParenthesis),
+            ')' => Some(Self::RightParenthesis),
+            '[' => Some(Self::LeftBracket),
+            ']' => Some(Self::RightBracket),
+            '{' => Some(Self::LeftBrace),
+            '}' => Some(Self::RightBrace),
+            _ => None,
+        }
+    }
+
     pub fn new(value: &str) -> Result<Self, OperatorError> {
-        match value {
-            "=" => Ok(Self::Equal),
-            "*" => Ok(Self::Star),
-            ":" => Ok(Self::Colon),
-            "," => Ok(Self::Comma),
-            "(" => Ok(Self::LeftParenthesis),
-            ")" => Ok(Self::RightParenthesis),
-            "[" => Ok(Self::LeftBracket),
-            "]" => Ok(Self::RightBracket),
-            "{" => Ok(Self::LeftBrace),
-            "}" => Ok(Self::RightBrace),
-            _ => Err(OperatorError::InvalidOperatorError(value.to_string())),
+        let invalid = || OperatorError::InvalidOperatorError(value.to_owned());
+        let mut chars = value.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) => Self::from_char(c).ok_or_else(invalid),
+            _ => Err(invalid()),
         }
     }
 }
@@ -49,19 +73,8 @@ impl TryFrom<&str> for OperatorToken {
 }
 
 impl Display for OperatorToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Equal => write!(f, "="),
-            Self::Star => write!(f, "*"),
-            Self::Colon => write!(f, ":"),
-            Self::Comma => write!(f, ","),
-            Self::LeftParenthesis => write!(f, "("),
-            Self::RightParenthesis => write!(f, ")"),
-            Self::LeftBracket => write!(f, "["),
-            Self::RightBracket => write!(f, "]"),
-            Self::LeftBrace => write!(f, "{}", '{'),
-            Self::RightBrace => write!(f, "{}", '}'),
-        }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_char())
     }
 }
 
@@ -80,26 +93,26 @@ pub enum LiteralToken {
     Label(String),
 }
 
+pub const fn is_label_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '.'
+}
+
+fn is_label_str(value: &str) -> bool {
+    !value.is_empty()
+        && value.split(['_', '.']).all(|segment| {
+            !segment.is_empty() && segment.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+}
+
 impl LiteralToken {
-    fn is_label_segment(segment: &str) -> bool {
-        !segment.is_empty() && segment.chars().all(|c| c.is_ascii_alphanumeric())
-    }
-
-    fn is_label_str(value: &str) -> bool {
-        !value.is_empty()
-            && value
-                .split(|c| c == '_' || c == '.')
-                .all(Self::is_label_segment)
-    }
-
     pub fn new(value: &str) -> Result<Self, LiteralError> {
         match value {
             "BIT" => Ok(Self::Bit),
             "NAND" => Ok(Self::Nand),
             "BRANCH" => Ok(Self::Branch),
             "CALL" => Ok(Self::Call),
-            value if Self::is_label_str(value) => Ok(Self::Label(value.to_string())),
-            _ => Err(LiteralError::InvalidLiteralError(value.to_string())),
+            _ if is_label_str(value) => Ok(Self::Label(value.to_owned())),
+            _ => Err(LiteralError::InvalidLiteralError(value.to_owned())),
         }
     }
 }
@@ -113,7 +126,7 @@ impl TryFrom<&str> for LiteralToken {
 }
 
 impl Display for LiteralToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Bit => write!(f, "BIT"),
             Self::Nand => write!(f, "NAND"),
@@ -138,15 +151,10 @@ pub enum Token {
 
 impl Token {
     pub fn new(value: &str) -> Result<Self, TokenError> {
-        if let Ok(operator) = OperatorToken::new(value) {
-            return Ok(Self::Operator(operator));
-        }
-
-        if let Ok(literal) = LiteralToken::new(value) {
-            return Ok(Self::Literal(literal));
-        }
-
-        Err(TokenError::InvalidTokenError(value.to_string()))
+        OperatorToken::new(value)
+            .map(Self::Operator)
+            .or_else(|_| LiteralToken::new(value).map(Self::Literal))
+            .map_err(|_| TokenError::InvalidTokenError(value.to_owned()))
     }
 }
 
@@ -159,18 +167,21 @@ impl TryFrom<&str> for Token {
 }
 
 impl Display for Token {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Token::Operator(operator) => write!(f, "{operator}"),
-            Token::Literal(literal) => write!(f, "{literal}"),
+            Self::Operator(operator) => write!(f, "{operator}"),
+            Self::Literal(literal) => write!(f, "{literal}"),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TokenizerError {
-    #[error("Token Error: {0}")]
-    TokenError(#[from] TokenError),
+    #[error("unexpected character {0:?}")]
+    UnexpectedCharacter(char),
+
+    #[error("malformed label `{0}`")]
+    MalformedLabel(String),
 }
 
 #[derive(Debug, Clone)]
@@ -187,37 +198,49 @@ impl<'a> Tokenizer<'a> {
         self.src = self.src.trim_start();
     }
 
-    fn skip_comment(&mut self) {
-        if self.src.starts_with("//") {
-            let end = self.src.find('\n').unwrap_or(self.src.len());
-            self.src = &self.src[end..];
+    fn skip_line_comment(&mut self) -> bool {
+        match self.src.strip_prefix("//") {
+            Some(comment) => {
+                let end = comment.find('\n').map_or(comment.len(), |nl| nl + 1);
+                self.src = &comment[end..];
+                true
+            }
+            None => false,
         }
     }
 
-    fn skip_whitespace_and_comments(&mut self) {
+    fn skip_trivia(&mut self) {
         loop {
-            let before = self.src.len();
             self.skip_whitespace();
-            self.skip_comment();
-            if self.src.len() == before {
-                break;
+            if !self.skip_line_comment() {
+                return;
             }
         }
     }
 
     pub fn next_token(&mut self) -> Option<Result<Token, TokenizerError>> {
-        self.skip_whitespace_and_comments();
-        for end in (1..=self.src.len()).rev() {
-            if !self.src.is_char_boundary(end) {
-                continue;
-            }
+        self.skip_trivia();
 
-            if let Ok(token) = Token::try_from(&self.src[..end]) {
-                self.src = &self.src[end..];
-                return Some(Ok(token));
-            }
+        let first = self.src.chars().next()?;
+
+        if let Some(operator) = OperatorToken::from_char(first) {
+            self.src = &self.src[first.len_utf8()..];
+            return Some(Ok(Token::Operator(operator)));
         }
-        None
+
+        if first.is_ascii_alphanumeric() {
+            let len = self.src.len() - self.src.trim_start_matches(is_label_char).len();
+            let word = &self.src[..len];
+            self.src = &self.src[len..];
+
+            return Some(match LiteralToken::new(word) {
+                Ok(literal) => Ok(Token::Literal(literal)),
+                Err(_) => Err(TokenizerError::MalformedLabel(word.to_owned())),
+            });
+        }
+
+        self.src = &self.src[first.len_utf8()..];
+        Some(Err(TokenizerError::UnexpectedCharacter(first)))
     }
 }
 
@@ -331,5 +354,66 @@ mod tests {
             assert_eq!(tokenizer.next_token(), Some(Ok(expected)));
         }
         assert_eq!(tokenizer.next_token(), None);
+    }
+
+    #[test]
+    fn test_tokenizer_no_whitespace() {
+        let mut tokenizer = Tokenizer::new("a=BIT");
+        assert_eq!(tokenizer.next_token(), Some(Ok(Token::new("a").unwrap())));
+        assert_eq!(tokenizer.next_token(), Some(Ok(Token::new("=").unwrap())));
+        assert_eq!(tokenizer.next_token(), Some(Ok(Token::new("BIT").unwrap())));
+        assert_eq!(tokenizer.next_token(), None);
+    }
+
+    #[test]
+    fn test_tokenizer_reports_unknown_character() {
+        let mut tokenizer = Tokenizer::new("zero = ;foo");
+        assert_eq!(
+            tokenizer.next_token(),
+            Some(Ok(Token::new("zero").unwrap()))
+        );
+        assert_eq!(tokenizer.next_token(), Some(Ok(Token::new("=").unwrap())));
+        assert_eq!(
+            tokenizer.next_token(),
+            Some(Err(TokenizerError::UnexpectedCharacter(';')))
+        );
+    }
+
+    #[test]
+    fn test_tokenizer_rejects_malformed_label() {
+        let mut tokenizer = Tokenizer::new("a..b");
+        assert_eq!(
+            tokenizer.next_token(),
+            Some(Err(TokenizerError::MalformedLabel("a..b".to_owned())))
+        );
+    }
+
+    #[test]
+    fn test_tokenizer_skips_comments() {
+        let mut tokenizer = Tokenizer::new("//\nfoo // trailing\nBAR");
+        assert_eq!(
+            tokenizer.next_token(),
+            Some(Ok(Token::Literal(LiteralToken::Label("foo".to_owned()))))
+        );
+        assert_eq!(
+            tokenizer.next_token(),
+            Some(Ok(Token::Literal(LiteralToken::Label("BAR".to_owned()))))
+        );
+        assert_eq!(tokenizer.next_token(), None);
+    }
+
+    #[test]
+    fn test_tokenizer_iterator_collect() {
+        let tokens: Result<Vec<_>, _> = Tokenizer::new("main = () BIT").collect();
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new("main").unwrap(),
+                Token::new("=").unwrap(),
+                Token::new("(").unwrap(),
+                Token::new(")").unwrap(),
+                Token::new("BIT").unwrap(),
+            ])
+        );
     }
 }
