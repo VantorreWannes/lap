@@ -20,7 +20,6 @@ pub enum OperatorToken {
     RightBracket,
     LeftBrace,
     RightBrace,
-    Dot,
 }
 
 impl OperatorToken {
@@ -30,7 +29,6 @@ impl OperatorToken {
             "*" => Ok(Self::Star),
             ":" => Ok(Self::Colon),
             "," => Ok(Self::Comma),
-            "." => Ok(Self::Dot),
             "(" => Ok(Self::LeftParenthesis),
             ")" => Ok(Self::RightParenthesis),
             "[" => Ok(Self::LeftBracket),
@@ -57,7 +55,6 @@ impl Display for OperatorToken {
             Self::Star => write!(f, "*"),
             Self::Colon => write!(f, ":"),
             Self::Comma => write!(f, ","),
-            Self::Dot => write!(f, "."),
             Self::LeftParenthesis => write!(f, "("),
             Self::RightParenthesis => write!(f, ")"),
             Self::LeftBracket => write!(f, "["),
@@ -79,17 +76,20 @@ pub enum LiteralToken {
     Bit,
     Nand,
     Branch,
-    Sys,
-    Std,
+    Call,
     Label(String),
 }
 
 impl LiteralToken {
+    fn is_label_segment(segment: &str) -> bool {
+        !segment.is_empty() && segment.chars().all(|c| c.is_ascii_alphanumeric())
+    }
+
     fn is_label_str(value: &str) -> bool {
         !value.is_empty()
             && value
-                .chars()
-                .all(|value_char| value_char.is_ascii_alphanumeric() || value_char == '_')
+                .split(|c| c == '_' || c == '.')
+                .all(Self::is_label_segment)
     }
 
     pub fn new(value: &str) -> Result<Self, LiteralError> {
@@ -97,8 +97,7 @@ impl LiteralToken {
             "BIT" => Ok(Self::Bit),
             "NAND" => Ok(Self::Nand),
             "BRANCH" => Ok(Self::Branch),
-            "SYS" => Ok(Self::Sys),
-            "STD" => Ok(Self::Std),
+            "CALL" => Ok(Self::Call),
             value if Self::is_label_str(value) => Ok(Self::Label(value.to_string())),
             _ => Err(LiteralError::InvalidLiteralError(value.to_string())),
         }
@@ -119,8 +118,7 @@ impl Display for LiteralToken {
             Self::Bit => write!(f, "BIT"),
             Self::Nand => write!(f, "NAND"),
             Self::Branch => write!(f, "BRANCH"),
-            Self::Sys => write!(f, "SYS"),
-            Self::Std => write!(f, "STD"),
+            Self::Call => write!(f, "CALL"),
             Self::Label(label) => write!(f, "{label}"),
         }
     }
@@ -241,7 +239,6 @@ mod tests {
         assert_eq!(OperatorToken::new("*"), Ok(OperatorToken::Star));
         assert_eq!(OperatorToken::new(":"), Ok(OperatorToken::Colon));
         assert_eq!(OperatorToken::new(","), Ok(OperatorToken::Comma));
-        assert_eq!(OperatorToken::new("."), Ok(OperatorToken::Dot));
         assert_eq!(OperatorToken::new("("), Ok(OperatorToken::LeftParenthesis));
         assert_eq!(OperatorToken::new(")"), Ok(OperatorToken::RightParenthesis));
         assert_eq!(OperatorToken::new("["), Ok(OperatorToken::LeftBracket));
@@ -268,6 +265,10 @@ mod tests {
             OperatorToken::new("=="),
             Err(OperatorError::InvalidOperatorError("==".to_owned()))
         );
+        assert_eq!(
+            OperatorToken::new("."),
+            Err(OperatorError::InvalidOperatorError(".".to_owned()))
+        );
     }
 
     #[test]
@@ -275,8 +276,7 @@ mod tests {
         assert_eq!(LiteralToken::new("BIT"), Ok(LiteralToken::Bit));
         assert_eq!(LiteralToken::new("NAND"), Ok(LiteralToken::Nand));
         assert_eq!(LiteralToken::new("BRANCH"), Ok(LiteralToken::Branch));
-        assert_eq!(LiteralToken::new("STD"), Ok(LiteralToken::Std));
-        assert_eq!(LiteralToken::new("SYS"), Ok(LiteralToken::Sys));
+        assert_eq!(LiteralToken::new("CALL"), Ok(LiteralToken::Call));
         assert_eq!(
             LiteralToken::new("u1"),
             Ok(LiteralToken::Label("u1".to_string()))
@@ -289,6 +289,29 @@ mod tests {
             LiteralToken::new("INDEX"),
             Ok(LiteralToken::Label("INDEX".to_string()))
         );
+        assert_eq!(
+            LiteralToken::new("BIT.zero"),
+            Ok(LiteralToken::Label("BIT.zero".to_string()))
+        );
+        assert_eq!(
+            LiteralToken::new("cast.u2.to.pair"),
+            Ok(LiteralToken::Label("cast.u2.to.pair".to_string()))
+        );
+        assert_eq!(
+            LiteralToken::new("system_state_1"),
+            Ok(LiteralToken::Label("system_state_1".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_literal_token_invalid_labels() {
+        assert!(LiteralToken::new("_label").is_err());
+        assert!(LiteralToken::new("label_").is_err());
+        assert!(LiteralToken::new(".label").is_err());
+        assert!(LiteralToken::new("label.").is_err());
+        assert!(LiteralToken::new("a..b").is_err());
+        assert!(LiteralToken::new("a._b").is_err());
+        assert!(LiteralToken::new("").is_err());
     }
 
     #[test]
@@ -304,16 +327,9 @@ mod tests {
             assert_eq!(tokenizer.next_token(), Some(Ok(expected)));
         }
         {
-            let expected = Token::new("BIT").unwrap();
+            let expected = Token::new("BIT.zero").unwrap();
             assert_eq!(tokenizer.next_token(), Some(Ok(expected)));
         }
-        {
-            let expected = Token::new(".").unwrap();
-            assert_eq!(tokenizer.next_token(), Some(Ok(expected)));
-        }
-        {
-            let expected = Token::new("zero").unwrap();
-            assert_eq!(tokenizer.next_token(), Some(Ok(expected)));
-        }
+        assert_eq!(tokenizer.next_token(), None);
     }
 }
