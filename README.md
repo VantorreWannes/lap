@@ -1,63 +1,174 @@
 # Labels and Primitives
 
-Labels and Primitives is a minimal, deterministic systems programming language built on a single hardware-level premise: **everything is a `BIT` or an array of `BIT`s.**
+Labels and Primitives is a timeless, cross-paradigm, unchangeable programming language. Only the tooling and compiler implementations around it may change.
 
-There is no heap, no allocator, no implicit integer types, and no hidden memory layout. Computation scales from raw universal gates (`NAND`) to nested bit arrays. Standard software operations defined in `STD` can be automatically hoisted by the compiler into native CPU instructions.
+## Primitives
 
-## Key Ideas
+- `BIT`: The data primitive. Initialized to an arbitrary state.
+- `NAND`: The operation primitive. Computes Sheffer stroke over two `BIT` values.
+- `BRANCH`: The branching primitive. Selects an expression block based on a `BIT`.
+- `[item, ...]`: The collection primitive. Groups ordered, heterogeneous elements.
+- `(param: Type, ...) Type { ... }`: The function definition primitive.
+- `label = ...`: The assignment primitive. Copies right-to-left into storage.
+- `*label`: The reference primitive. Aliases an existing storage slot.
+- `CALL`: The external primitive. Accesses syscalls, allocators, and intrinsics.
 
-- **Six Primitives:** `BIT`, `NAND`, `BRANCH`, `SYS`, `STD`, and `*`.
-- **Pure Structural Layout:** Memory consists solely of bits and arrays defined with brackets (`[...]`). Arrays are unpacked using the same structural syntax used to build them.
-- **No Literal Numbers:** The grammar contains no decimal, hexadecimal, or scalar number literals. The ground and power states of a bit are defined directly as `BIT.zero` and `BIT.one`.
-- **Downward References (`*`):** References exist solely to pass mutable views of existing memory down the call stack. Because references cannot be returned, stored in global memory, or stored into heap structures, dangling pointers and memory leaks are structurally impossible.
-- **Hierarchical Dot Paths (`.`):** Periods only ever exist between two labels, acting as an infix scope delimiter. Chaining is fully supported (e.g., `STD.u8.add`), allowing operations and types to be grouped directly under what contains them. There are no classes, receivers, or access modifiers—anyone can call any path directly.
-- **Transparent Compilation:** Operations in `STD` are defined from raw gates. When compiling for targets with dedicated hardware instructions (such as an ALU), the compiler hoists canonical paths (like `STD.u8.not`) directly into single machine instructions.
+## Core Rules
 
-## Code Example
+1. **Bare Storage:** Every value is either an explicit primitive or held in a labeled memory slot. Labels are statically typed and invariant. Types are nominal: explicit casting functions must be implemented to convert between different types, even if they share the same layout.
+2. **Infix Label Grammar:** Labels allow `_` and `.` strictly between alphanumeric characters: `[a-zA-Z0-9]+([_.][a-zA-Z0-9]+)*`. Neither `_` nor `.` may begin or end a label.
+3. **Rust-Like Expression Blocks:** The terminal expression in a block produces its return value. A statement terminating with an assignment yields no value and cannot be returned.
+4. **Reference Lifetimes:** Functions cannot return reference types (`*Type`). References only alias downward or sideways on the stack, preventing dangling references by design.
+5. **External Memory:** `CALL` acts as an optimization barrier. Dynamic heap storage is addressed using value handles (e.g., bit collections), never through language-level `*` references.
 
-```text
-zero = BIT.zero
-one = BIT.one
+## Canonical Example
 
-// Standard 8-bit byte from the STD primitive
-u8 = STD.u8
+The following annotated program demonstrates bootstrapping, nominal typing, explicit casting, pass-by-reference mutation, heterogeneous collections, unbinding, expression-oriented branching, and heap interactions via `CALL`.
 
-// Invert a byte in place using a downward reference
-invert = (val: *u8) BIT {
-    val = STD.u8.not(val)
-    zero
+```
+// 1. BOOTSTRAPPING CONSTANTS
+// Bits begin in an arbitrary state. Standard values must be algebraically derived.
+seed = BIT
+ONE: BIT = NAND(seed, NAND(seed, seed))
+ZERO: BIT = NAND(ONE, ONE)
+
+// 2. NOMINAL TYPES AND EXPLICIT CASTING
+// Types are invariant. Identical underlying layouts require explicit casts.
+U2 = [BIT, BIT]
+PAIR = [BIT, BIT]
+
+cast.u2.to.pair = (src: U2) PAIR {
+    [b0, b1] = src
+    [b0, b1]
 }
 
-main = () BIT {
-    byte = [zero, one, zero, one, zero, one, zero, one]
-    invert(byte) // hoisted to a native NOT instruction
+// Heterogeneous collection containing different types
+TUPLE = [BIT, U2, PAIR]
 
-    // Deconstruct byte into its individual bits
-    [b0, b1, b2, b3, b4, b5, b6, b7] = byte
-    b1
+// 3. LOGIC OPERATORS
+not = (a: BIT) BIT {
+    NAND(a, a)
+}
+
+xor = (a: BIT, b: BIT) BIT {
+    n = NAND(a, b)
+    NAND(NAND(a, n), NAND(b, n))
+}
+
+// 4. REFERENCES AND IN-PLACE MUTATION
+// Functions cannot return references, but parameters can be passed as references.
+toggle = (target: *BIT) [] {
+    target = not(target)
+    []
+}
+
+// 5. BRANCHING AND BLOCK EVALUATION
+// Both branches must yield the same type. The final bare expression is returned.
+choose = (flag: BIT, opt.a: U2, opt.b: U2) U2 {
+    BRANCH (flag) {
+        opt.a
+    } {
+        // Assignments cannot serve as return values.
+        // The bare expression opt.b is placed last.
+        dummy: BIT = ZERO
+        opt.b
+    }
+}
+
+// 6. HEAP MANAGEMENT VIA CALL
+// Heap pointers are stored as data handles, not language references.
+OP.ALLOC = [ZERO, ONE]
+OP.FREE  = [ONE, ZERO]
+
+alloc.slot = () U2 {
+    CALL(OP.ALLOC)
+}
+
+free.slot = (handle: *U2) [] {
+    CALL(OP.FREE, handle)
+    handle = [ZERO, ZERO]
+    []
+}
+
+// 7. CANONICAL EXECUTION FLOW
+main = () BIT {
+    // Label storage declaration
+    state: BIT = ZERO
+
+    // Reference creation and write-through mutation
+    alias: *BIT = *state
+    alias = ONE
+    // Both 'state' and 'alias' now store ONE
+
+    toggle(*state)
+    // 'state' is toggled back to ZERO
+
+    // Instantiating collections
+    first.u2: U2 = [ZERO, ONE]
+    second.u2: U2 = [ONE, ONE]
+
+    // Branch expression
+    selected: U2 = choose(state, first.u2, second.u2)
+
+    // Explicit casting between nominal types
+    paired: PAIR = cast.u2.to.pair(selected)
+
+    // Heterogeneous collection grouping and unbinding
+    bundle: TUPLE = [state, selected, paired]
+    [head.bit, *tail.u2, out.pair] = bundle
+
+    // Heap allocation pattern
+    heap.ptr: U2 = alloc.slot()
+    free.slot(*heap.ptr)
+
+    // Return the final evaluated bit
+    head.bit
 }
 ```
 
-## How It Works
+## Truth Values
 
-### Uniform Storage
+- `not a = NAND(a, a)`
+- `a and b = NAND(NAND(a, b), NAND(a, b))`
+- `a or b = NAND(NAND(a, a), NAND(b, b))`
+- `a xor b = NAND(NAND(a, NAND(a, b)), NAND(b, NAND(a, b)))`
 
-All data is concrete and composed of `BIT`. A composite word is simply an array of bits. Multi-bit values are constructed explicitly from arrays of bit constants (`BIT.zero` and `BIT.one`).
+## Formal Grammar
 
-### Dot Semantics and Hierarchical Scoping
+```ebnf
+Program        ::= Statement*
 
-A period (`.`) is strictly an infix delimiter that sits between two labels (`Left.Right`). Dots can be chained to express deeper containment (e.g., `STD.u8.add`). 
+Statement      ::= Binding | Expression
 
-Each segment is just a label scoped under the preceding label. There is no object-oriented dispatch, `this`/`self` hidden arguments, or visibility restriction (no `public`/`private`); any path can be referenced and called directly from anywhere.
+Binding        ::= Target "=" Expression
+Target         ::= TypedIdent
+                 | "*" Label
+                 | "[" Target ("," Target)* "]"
 
-### In-Place Mutation
+TypedIdent     ::= Label (":" Type)?
 
-Passing a variable to a function by value copies its bits. Prefixing a parameter or binding pattern with `*` creates a zero-overhead reference to the caller's storage slot. Any assignment to that reference writes through to the original location.
+Expression     ::= Primary
+                 | CallExpr
+                 | BranchExpr
+                 | NandExpr
+                 | CollectionExpr
+                 | FunctionDef
 
-### The `STD` Library and Hardware Hoisting
+Primary        ::= Label | "*" Label | "BIT"
 
-The `STD` primitive provides a baseline library of types, constants, and operations built from pure gates. On platforms where hardware support exists, the compiler recognizes canonical labels (such as `STD.u32.add` or `STD.u64.mul`) and emits the target CPU's native assembly instructions instead of expanding the gate network.
+NandExpr       ::= "NAND" "(" Expression "," Expression ")"
+BranchExpr     ::= "BRANCH" "(" Expression ")" Block Block
+CallExpr       ::= "CALL" "(" Expression ("," Expression)* ")"
+CollectionExpr ::= "[" (Expression ("," Expression)*)? "]"
 
-### System Calls
+FunctionDef    ::= "(" ParamList? ")" Type Block
+ParamList      ::= Param ("," Param)*
+Param          ::= Label ":" Type
+Type           ::= "BIT"
+                 | Label
+                 | "*" Type
+                 | "[" (Type ("," Type)*)? "]"
 
-Programs interact with the operating system kernel directly via the `SYS` primitive, which binds to host system call conventions without requiring a C runtime.
+Block          ::= "{" Statement* Expression? "}"
+Label          ::= [a-zA-Z0-9]+ ( ("_" | ".") [a-zA-Z0-9]+ )*
+```
