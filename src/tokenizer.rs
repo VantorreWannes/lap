@@ -124,7 +124,7 @@ impl Display for LiteralToken {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TokenError {
     #[error("Invalid Token: {0}")]
     InvalidTokenError(String),
@@ -167,7 +167,7 @@ impl Display for Token {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TokenizerError {
     #[error("Token Error: {0}")]
     TokenError(#[from] TokenError),
