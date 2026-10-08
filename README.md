@@ -11,7 +11,7 @@ Labels and Primitives is a timeless, cross-paradigm, unchangeable programming la
 - `(param: Type, ...) Type { ... }`: The function definition primitive.
 - `label = ...`: The assignment primitive. Copies right-to-left into storage.
 - `*label`: The reference primitive. Aliases an existing storage slot.
-- `CALL`: The external primitive. Accesses syscalls, allocators, and intrinsics.
+- `EXTERN`: The external primitive. Accesses syscalls, allocators, and intrinsics.
 
 ## Core Rules
 
@@ -19,11 +19,11 @@ Labels and Primitives is a timeless, cross-paradigm, unchangeable programming la
 2. **Infix Label Grammar:** Labels allow `_` and `.` strictly between alphanumeric characters: `[a-zA-Z0-9]+([_.][a-zA-Z0-9]+)*`. Neither `_` nor `.` may begin or end a label.
 3. **Rust-Like Expression Blocks:** The terminal expression in a block produces its return value. A statement terminating with an assignment yields no value and cannot be returned.
 4. **Reference Lifetimes:** Functions cannot return reference types (`*Type`). References only alias downward or sideways on the stack, preventing dangling references by design.
-5. **External Memory:** `CALL` acts as an optimization barrier. Dynamic heap storage is addressed using value handles (e.g., bit collections), never through language-level `*` references.
+5. **External Memory:** `EXTERN` acts as an optimization barrier. Dynamic heap storage is addressed using value handles (e.g., bit collections), never through language-level `*` references.
 
 ## Canonical Example
 
-The following annotated program demonstrates bootstrapping, nominal typing, explicit casting, pass-by-reference mutation, heterogeneous collections, unbinding, expression-oriented branching, and heap interactions via `CALL`.
+The following annotated program demonstrates bootstrapping, nominal typing, explicit casting, pass-by-reference mutation, heterogeneous collections, unbinding, expression-oriented branching, and heap interactions via `EXTERN`.
 
 ```
 // 1. BOOTSTRAPPING CONSTANTS
@@ -75,17 +75,17 @@ choose = (flag: BIT, opt.a: U2, opt.b: U2) U2 {
     }
 }
 
-// 6. HEAP MANAGEMENT VIA CALL
+// 6. HEAP MANAGEMENT VIA EXTERN
 // Heap pointers are stored as data handles, not language references.
 OP.ALLOC = [ZERO, ONE]
 OP.FREE  = [ONE, ZERO]
 
 alloc.slot = () U2 {
-    CALL(OP.ALLOC)
+    EXTERN(OP.ALLOC)
 }
 
 free.slot = (handle: *U2) [] {
-    CALL(OP.FREE, handle)
+    EXTERN(OP.FREE, handle)
     handle = [ZERO, ZERO]
     []
 }
@@ -148,7 +148,7 @@ Target         ::= TypedIdent
 TypedIdent     ::= Label (":" Type)?
 
 Expression     ::= Primary
-                 | CallExpr
+                 | ExternExpr
                  | BranchExpr
                  | NandExpr
                  | CollectionExpr
@@ -158,7 +158,7 @@ Primary        ::= Label | "*" Label | "BIT"
 
 NandExpr       ::= "NAND" "(" Expression "," Expression ")"
 BranchExpr     ::= "BRANCH" "(" Expression ")" Block Block
-CallExpr       ::= "CALL" "(" Expression ("," Expression)* ")"
+CallExpr       ::= "EXTERN" "(" Expression ("," Expression)* ")"
 CollectionExpr ::= "[" (Expression ("," Expression)*)? "]"
 
 FunctionDef    ::= "(" ParamList? ")" Type Block

@@ -89,7 +89,7 @@ pub enum LiteralToken {
     Bit,
     Nand,
     Branch,
-    Call,
+    Extern,
     Label(String),
 }
 
@@ -110,7 +110,7 @@ impl LiteralToken {
             "BIT" => Ok(Self::Bit),
             "NAND" => Ok(Self::Nand),
             "BRANCH" => Ok(Self::Branch),
-            "CALL" => Ok(Self::Call),
+            "EXTERN" => Ok(Self::Extern),
             _ if is_label_str(value) => Ok(Self::Label(value.to_owned())),
             _ => Err(LiteralError::InvalidLiteralError(value.to_owned())),
         }
@@ -131,7 +131,7 @@ impl Display for LiteralToken {
             Self::Bit => write!(f, "BIT"),
             Self::Nand => write!(f, "NAND"),
             Self::Branch => write!(f, "BRANCH"),
-            Self::Call => write!(f, "CALL"),
+            Self::Extern => write!(f, "EXTERN"),
             Self::Label(label) => write!(f, "{label}"),
         }
     }
@@ -299,7 +299,7 @@ mod tests {
         assert_eq!(LiteralToken::new("BIT"), Ok(LiteralToken::Bit));
         assert_eq!(LiteralToken::new("NAND"), Ok(LiteralToken::Nand));
         assert_eq!(LiteralToken::new("BRANCH"), Ok(LiteralToken::Branch));
-        assert_eq!(LiteralToken::new("CALL"), Ok(LiteralToken::Call));
+        assert_eq!(LiteralToken::new("EXTERN"), Ok(LiteralToken::Extern));
         assert_eq!(
             LiteralToken::new("u1"),
             Ok(LiteralToken::Label("u1".to_string()))

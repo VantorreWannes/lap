@@ -119,11 +119,11 @@ impl Display for FunctionCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompilerCall {
+pub struct ExternCall {
     pub arguments: Vec<Expression>,
 }
 
-impl Display for CompilerCall {
+impl Display for ExternCall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let arguments = self
             .arguments
@@ -131,7 +131,7 @@ impl Display for CompilerCall {
             .map(|argument| argument.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        write!(f, "CALL({arguments})")
+        write!(f, "EXTERN({arguments})")
     }
 }
 
@@ -174,7 +174,7 @@ pub enum Expression {
     Nand(NandOperation),
     Branch(BranchOperation),
     FunctionCall(FunctionCall),
-    CompilerCall(CompilerCall),
+    ExternCall(ExternCall),
     Collection(Vec<Expression>),
     FunctionDefinition(FunctionDefinition),
 }
@@ -188,7 +188,7 @@ impl Display for Expression {
             Self::Nand(nand) => write!(f, "{nand}"),
             Self::Branch(branch) => write!(f, "{branch}"),
             Self::FunctionCall(call) => write!(f, "{call}"),
-            Self::CompilerCall(call) => write!(f, "{call}"),
+            Self::ExternCall(call) => write!(f, "{call}"),
             Self::Collection(elements) => {
                 let formatted = elements
                     .iter()
@@ -271,49 +271,17 @@ impl Display for Program {
 }
 
 #[derive(Debug, PartialEq, Eq, Error)]
-pub enum TypeError {
-    #[error("Unexpected End of Stream while parsing Type")]
-    UnexpectedEndOfStream,
-    #[error("Expected Type, found {0}")]
-    ExpectedType(Token),
-}
-
-#[derive(Debug, PartialEq, Eq, Error)]
-pub enum TargetError {
-    #[error("Unexpected End of Stream while parsing Target")]
-    UnexpectedEndOfStream,
-    #[error("Expected Target, found {0}")]
-    ExpectedTarget(Token),
-}
-
-#[derive(Debug, PartialEq, Eq, Error)]
-pub enum ExpressionError {
-    #[error("Unexpected End of Stream while parsing Expression")]
-    UnexpectedEndOfStream,
-    #[error("Expected Expression, found {0}")]
-    ExpectedExpression(Token),
-}
-
-#[derive(Debug, PartialEq, Eq, Error)]
-pub enum BlockError {
-    #[error("Unexpected End of Stream while parsing Block")]
-    UnexpectedEndOfStream,
-    #[error("Expected '{{', found {0}")]
-    ExpectedOpeningBrace(Token),
-}
-
-#[derive(Debug, PartialEq, Eq, Error)]
 pub enum ParserError {
     #[error("Tokenizer Error: {0}")]
     TokenizerError(#[from] TokenizerError),
-    #[error("Type Error: {0}")]
-    TypeError(#[from] TypeError),
-    #[error("Target Error: {0}")]
-    TargetError(#[from] TargetError),
-    #[error("Expression Error: {0}")]
-    ExpressionError(#[from] ExpressionError),
-    #[error("Block Error: {0}")]
-    BlockError(#[from] BlockError),
+    #[error("Unexpected End of Stream")]
+    UnexpectedEndOfStream,
+    #[error("Expected Type, found {0}")]
+    ExpectedType(Token),
+    #[error("Expected Target, found {0}")]
+    ExpectedTarget(Token),
+    #[error("Expected Expression, found {0}")]
+    ExpectedExpression(Token),
     #[error("Expected Operator '{expected}', found {found:?}")]
     ExpectedOperator {
         expected: OperatorToken,
@@ -342,11 +310,10 @@ impl<'a> Parser<'a> {
             return Err(ParserError::TokenizerError(error));
         }
 
-        match self.tokenizer.peek() {
-            Some(Ok(token)) => Ok(Some(token)),
-            None => Ok(None),
-            Some(Err(_)) => unreachable!(),
-        }
+        Ok(self
+            .tokenizer
+            .peek()
+            .and_then(|result| result.as_ref().ok()))
     }
 
     fn next_token(&mut self) -> Result<Option<Token>, ParserError> {
@@ -440,8 +407,8 @@ impl<'a> Parser<'a> {
             Some(Token::Operator(OperatorToken::LeftBracket)) => self
                 .parse_separated_sequence(OperatorToken::RightBracket, Self::parse_type)
                 .map(Type::Collection),
-            Some(token) => Err(TypeError::ExpectedType(token).into()),
-            None => Err(TypeError::UnexpectedEndOfStream.into()),
+            Some(token) => Err(ParserError::ExpectedType(token)),
+            None => Err(ParserError::UnexpectedEndOfStream),
         }
     }
 
@@ -458,8 +425,8 @@ impl<'a> Parser<'a> {
                 .then(|| self.parse_type())
                 .transpose()
                 .map(|r#type| Target::Identifier(TypedIdentifier { name, r#type })),
-            Some(token) => Err(TargetError::ExpectedTarget(token).into()),
-            None => Err(TargetError::UnexpectedEndOfStream.into()),
+            Some(token) => Err(ParserError::ExpectedTarget(token)),
+            None => Err(ParserError::UnexpectedEndOfStream),
         }
     }
 
@@ -489,13 +456,13 @@ impl<'a> Parser<'a> {
                     secondary_branch,
                 }))
             }
-            Some(Token::Literal(LiteralToken::Call)) => {
+            Some(Token::Literal(LiteralToken::Extern)) => {
                 self.expect_operator(OperatorToken::LeftParenthesis)?;
                 self.parse_separated_sequence(
                     OperatorToken::RightParenthesis,
                     Self::parse_expression,
                 )
-                .map(|arguments| Expression::CompilerCall(CompilerCall { arguments }))
+                .map(|arguments| Expression::ExternCall(ExternCall { arguments }))
             }
             Some(Token::Operator(OperatorToken::LeftBracket)) => self
                 .parse_separated_sequence(OperatorToken::RightBracket, Self::parse_expression)
@@ -526,8 +493,8 @@ impl<'a> Parser<'a> {
                 .map(|arguments| Expression::FunctionCall(FunctionCall { callee, arguments }))
             }
             Some(Token::Literal(LiteralToken::Label(name))) => Ok(Expression::Identifier(name)),
-            Some(token) => Err(ExpressionError::ExpectedExpression(token).into()),
-            None => Err(ExpressionError::UnexpectedEndOfStream.into()),
+            Some(token) => Err(ParserError::ExpectedExpression(token)),
+            None => Err(ParserError::UnexpectedEndOfStream),
         }
     }
 
@@ -546,37 +513,29 @@ impl<'a> Parser<'a> {
     pub fn parse_block(&mut self) -> Result<Block, ParserError> {
         self.expect_operator(OperatorToken::LeftBrace)?;
 
-        match self.match_operator(OperatorToken::RightBrace)? {
-            true => Ok(Block {
-                statements: Vec::new(),
-                trailing_expression: None,
-            }),
-            false => {
-                let mut statements = Vec::new();
-                let mut trailing_expression = None;
+        let mut statements = Vec::new();
+        let mut trailing_expression = None;
 
-                while !self.match_operator(OperatorToken::RightBrace)? {
-                    let statement = self.parse_statement()?;
-                    match self.match_operator(OperatorToken::RightBrace)? {
-                        true => match statement {
-                            Statement::Expression(expression) => {
-                                trailing_expression = Some(Box::new(expression));
-                                break;
-                            }
-                            Statement::Binding(_) => {
-                                return Err(ParserError::TrailingAssignmentError);
-                            }
-                        },
-                        false => statements.push(statement),
+        while !self.match_operator(OperatorToken::RightBrace)? {
+            let statement = self.parse_statement()?;
+            if self.match_operator(OperatorToken::RightBrace)? {
+                match statement {
+                    Statement::Expression(expression) => {
+                        trailing_expression = Some(Box::new(expression));
+                    }
+                    Statement::Binding(_) => {
+                        return Err(ParserError::TrailingAssignmentError);
                     }
                 }
-
-                Ok(Block {
-                    statements,
-                    trailing_expression,
-                })
+                break;
             }
+            statements.push(statement);
         }
+
+        Ok(Block {
+            statements,
+            trailing_expression,
+        })
     }
 
     pub fn parse_program(&mut self) -> Result<Program, ParserError> {
@@ -646,8 +605,8 @@ mod tests {
             }))
         );
         assert_eq!(
-            Parser::new(Tokenizer::new("CALL(OP.ALLOC, size)")).parse_expression(),
-            Ok(Expression::CompilerCall(CompilerCall {
+            Parser::new(Tokenizer::new("EXTERN(OP.ALLOC, size)")).parse_expression(),
+            Ok(Expression::ExternCall(ExternCall {
                 arguments: vec![
                     Expression::Identifier("OP.ALLOC".to_string()),
                     Expression::Identifier("size".to_string()),

@@ -22,25 +22,25 @@ This document details the concrete operational decisions and runtime interfaces 
     2. The compiler invokes `main()`.
     3. The `BIT` value returned by `main()` is used directly as the final exit status of the process.
 
-## 3. Supported `CALL` Operations
+## 3. Supported `EXTERN` Operations
 
-The `CALL` primitive allows variable arguments, where the first argument is an operation code (`OP`), followed by any operation-specific parameters:
-`CALL(OP, param_1, param_2, ...)`
+The `EXTERN` primitive allows variable arguments, where the first argument is an operation code (`OP`), followed by any operation-specific parameters:
+`EXTERN(OP, param_1, param_2, ...)`
 
 ### 3.1 Memory Management
 
 Memory operations use collections of bits as opaque data handles to reference heap addresses:
 
-- `CALL(OP.ALLOC, size)`
+- `EXTERN(OP.ALLOC, size)`
     - Parameter: `size` (collection of `BIT` specifying capacity).
     - Returns: An opaque handle collection pointing to the allocated storage.
-- `CALL(OP.FREE, handle)`
+- `EXTERN(OP.FREE, handle)`
     - Parameter: `handle` (collection returned by `OP.ALLOC`).
     - Returns: `[]`.
-- `CALL(OP.READ, handle, offset)`
+- `EXTERN(OP.READ, handle, offset)`
     - Parameters: `handle` (allocation handle), `offset` (bit offset collection).
     - Returns: `BIT`.
-- `CALL(OP.WRITE, handle, offset, value)`
+- `EXTERN(OP.WRITE, handle, offset, value)`
     - Parameters: `handle` (allocation handle), `offset` (bit offset collection), `value` (`BIT`).
     - Returns: `[]`.
 
@@ -48,22 +48,22 @@ Memory operations use collections of bits as opaque data handles to reference he
 
 I/O does not assume ASCII or byte alignments. The runtime buffers single bits and only communicates with the external host when explicitly requested:
 
-- `CALL(OP.PUSH_BIT, bit)`
+- `EXTERN(OP.PUSH_BIT, bit)`
     - Parameter: `bit` (`BIT`).
     - Returns: `[]`.
     - Appends a single bit to the runtime output buffer.
-- `CALL(OP.FLUSH)`
+- `EXTERN(OP.FLUSH)`
     - Parameters: None.
     - Returns: `[]`.
     - Transmits all accumulated bits in the output buffer to the host environment.
-- `CALL(OP.PULL_BIT)`
+- `EXTERN(OP.PULL_BIT)`
     - Parameters: None.
     - Returns: `BIT`.
     - Reads a single bit from the host input stream.
 
 ### 3.3 Process Termination
 
-- `CALL(OP.EXIT, code)`
+- `EXTERN(OP.EXIT, code)`
     - Parameter: `code` (`BIT`).
     - Returns: Does not return.
     - Halts execution immediately with the supplied exit bit.
