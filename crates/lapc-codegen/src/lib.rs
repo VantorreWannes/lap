@@ -18,6 +18,9 @@ use lapc_ir::{BitVector, Block, Function, Intrinsic, Program, Slot, Statement, T
 const STACK_SLOT_SLACK: usize = 8;
 const STACK_SLOT_ALIGNMENT_SHIFT: u8 = 3;
 const EXTERN_OUTPUT_SIZE: usize = 2 * STACK_SLOT_SLACK;
+const INLINE_BUDGET: usize = 4096;
+const INLINE_DEPTH_LIMIT: usize = 32;
+const INLINE_SIZE_LIMIT: usize = 64;
 
 pub fn emit_object(program: &Program) -> Result<Vec<u8>, CodegenError> {
     let instruction_set = host_instruction_set()?;
@@ -182,6 +185,19 @@ enum Lowered {
 }
 
 #[derive(Clone, Copy)]
+enum BitPointer {
+    Byte { address: CraneliftValue, bit: u8 },
+    Bit(CraneliftValue),
+}
+
+#[derive(Clone)]
+struct InlineBinding {
+    parameter: Slot,
+    parameter_type: Type,
+    argument: Value,
+}
+
+#[derive(Clone, Copy)]
 enum WideOperation {
     Nand,
     Not,
@@ -202,6 +218,8 @@ struct Lowering<'builder, 'function, 'program, M: Module> {
     output_pointer: Option<CraneliftValue>,
     pointer_type: CraneliftType,
     body_block: Option<CraneliftBlock>,
+    inline_depth: usize,
+    inline_budget: usize,
 }
 
 impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'program, M> {
@@ -241,6 +259,8 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
             output_pointer,
             pointer_type,
             body_block: None,
+            inline_depth: 0,
+            inline_budget: INLINE_BUDGET,
         })
     }
 
@@ -267,8 +287,11 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
                 };
                 self.store_word(storage, word);
             } else {
-                let destination = self.slot_bit_pointer(storage);
-                let source = self.builder.ins().ishl_imm_u(incoming, 3);
+                let destination = self.slot_pointer(storage);
+                let source = BitPointer::Byte {
+                    address: incoming,
+                    bit: 0,
+                };
                 self.copy_bits(source, destination, parameter_type.width())?;
             }
         }
@@ -289,8 +312,11 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
                 .ok_or_else(|| CodegenError::new("a wide result needs an out pointer"))?;
             match result {
                 Lowered::Slot(address) => {
-                    let source = self.builder.ins().ishl_imm_u(address, 3);
-                    let destination = self.builder.ins().ishl_imm_u(output_pointer, 3);
+                    let source = BitPointer::Byte { address, bit: 0 };
+                    let destination = BitPointer::Byte {
+                        address: output_pointer,
+                        bit: 0,
+                    };
                     self.copy_bits(source, destination, result_type.width())?;
                 }
                 Lowered::Word(_) => return Err(CodegenError::new("a wide result was expected")),
@@ -327,7 +353,7 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
                         Type::Reference(inner) => *inner,
                         _ => return Err(CodegenError::new("a store needs a reference")),
                     };
-                    let pointer = self.lower_word(reference, 64)?;
+                    let pointer = self.lower_pointer(reference)?;
                     let lowered = self.lower_value(value, &inner)?;
                     self.write_bits(pointer, lowered, inner.width())?;
                 }
@@ -379,7 +405,11 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
                 self.lower_element(collection, *index, expected)
             }
             Value::Reference { slot, bit_offset } => {
-                self.lower_reference(*slot, *bit_offset, expected)
+                if !expected.is_reference() {
+                    return Err(CodegenError::new("a reference has the wrong type"));
+                }
+                let pointer = self.lower_reference(*slot, *bit_offset)?;
+                Ok(Lowered::Word(self.pointer_as_bit(pointer)))
             }
             Value::Load(reference) => self.lower_load(reference, expected),
             Value::Call(label, arguments) => self.lower_call(label.text(), arguments, expected),
@@ -420,12 +450,12 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
             Ok(Lowered::Word(self.builder.ins().iconst(types::I64, word)))
         } else {
             let slot = self.allocate_value_slot(width)?;
-            let destination = self.slot_bit_pointer(slot);
+            let destination = self.slot_pointer(slot);
             let mut offset = 0;
             while offset < width {
                 let chunk = (width - offset).min(64);
                 let word = bits_to_word(bits.bits(), offset, chunk);
-                let pointer = self.builder.ins().iadd_imm_u(destination, offset as i64);
+                let pointer = self.pointer_offset(destination, offset);
                 let constant = self.builder.ins().iconst(types::I64, word);
                 self.store_bits(pointer, constant, chunk)?;
                 offset += chunk;
@@ -466,6 +496,9 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
     ) -> Result<Lowered, CodegenError> {
         if arguments.len() != intrinsic.arity() {
             return Err(CodegenError::new("an intrinsic has the wrong arity"));
+        }
+        if intrinsic == Intrinsic::DivMod {
+            return self.lower_div_mod(arguments, expected);
         }
         let result_width = expected.width();
         let operand_width = if intrinsic.is_comparison() {
@@ -513,6 +546,11 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
                     self.builder.ins().uextend(types::I64, flag)
                 }
                 Intrinsic::Select => self.builder.ins().select(words[0], words[1], words[2]),
+                Intrinsic::DivMod => {
+                    return Err(CodegenError::new(
+                        "a division is lowered before word operations",
+                    ));
+                }
             };
             Ok(Lowered::Word(self.mask(word, result_width)))
         } else {
@@ -549,6 +587,110 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         self.lower_value(value, &type_)
     }
 
+    fn lower_div_mod(
+        &mut self,
+        arguments: &[Value],
+        expected: &Type,
+    ) -> Result<Lowered, CodegenError> {
+        let operand_type = self.type_of(&arguments[0])?;
+        let operand_width = operand_type.width();
+        if operand_width > 64 {
+            return Err(CodegenError::new(
+                "a division is only defined for widths up to 64",
+            ));
+        }
+        let paired = matches!(
+            expected,
+            Type::Collection(elements)
+                if elements.len() == 2
+                    && elements[0] == operand_type
+                    && elements[1] == operand_type
+        );
+        if !paired {
+            return Err(CodegenError::new("a division has the wrong type"));
+        }
+        let value = self.lower_word(&arguments[0], operand_width)?;
+        let divisor = self.lower_word(&arguments[1], operand_width)?;
+        let (quotient, remainder) = self.divide(value, divisor, &arguments[1])?;
+        let total = 2 * operand_width;
+        if total <= 64 {
+            let high = self
+                .builder
+                .ins()
+                .ishl_imm_u(remainder, operand_width as i64);
+            let word = self.builder.ins().bor(quotient, high);
+            Ok(Lowered::Word(self.mask(word, total)))
+        } else {
+            let slot = self.allocate_value_slot(total)?;
+            let destination = self.slot_pointer(slot);
+            self.store_bits(destination, quotient, operand_width)?;
+            let remainder_pointer = self.pointer_offset(destination, operand_width);
+            self.store_bits(remainder_pointer, remainder, operand_width)?;
+            Ok(Lowered::Slot(self.builder.ins().stack_addr(
+                self.pointer_type,
+                slot,
+                0,
+            )))
+        }
+    }
+
+    fn divide(
+        &mut self,
+        value: CraneliftValue,
+        divisor: CraneliftValue,
+        divisor_value: &Value,
+    ) -> Result<(CraneliftValue, CraneliftValue), CodegenError> {
+        if let Value::Constant(bits) = divisor_value {
+            return self.divide_by_constant(value, bits);
+        }
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        let one = self.builder.ins().iconst(types::I64, 1);
+        let is_zero = self.builder.ins().icmp(IntCC::Equal, divisor, zero);
+        let safe = self.builder.ins().select(is_zero, one, divisor);
+        let quotient = self.builder.ins().udiv(value, safe);
+        let product = self.builder.ins().imul(quotient, safe);
+        let remainder = self.builder.ins().isub(value, product);
+        Ok((
+            self.builder.ins().select(is_zero, zero, quotient),
+            self.builder.ins().select(is_zero, zero, remainder),
+        ))
+    }
+
+    fn divide_by_constant(
+        &mut self,
+        value: CraneliftValue,
+        bits: &BitVector,
+    ) -> Result<(CraneliftValue, CraneliftValue), CodegenError> {
+        let divisor = bits_to_word(bits.bits(), 0, bits.width()) as u64;
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        if divisor == 0 {
+            return Ok((zero, zero));
+        }
+        if divisor == 1 {
+            return Ok((value, zero));
+        }
+        if divisor.is_power_of_two() {
+            let shift = divisor.trailing_zeros() as i64;
+            let quotient = self.builder.ins().ushr_imm_u(value, shift);
+            let remainder = self.builder.ins().band_imm_u(value, (divisor - 1) as i64);
+            return Ok((quotient, remainder));
+        }
+        if let Some((magic, shift)) = magic_division(divisor) {
+            let magic_constant = self.builder.ins().iconst(types::I64, magic as i64);
+            let high = self.builder.ins().umulhi(value, magic_constant);
+            let quotient = self.builder.ins().ushr_imm_u(high, i64::from(shift));
+            let divisor_constant = self.builder.ins().iconst(types::I64, divisor as i64);
+            let product = self.builder.ins().imul(quotient, divisor_constant);
+            let remainder = self.builder.ins().isub(value, product);
+            return Ok((quotient, remainder));
+        }
+        let divisor_constant = self.builder.ins().iconst(types::I64, divisor as i64);
+        let quotient = self.builder.ins().udiv(value, divisor_constant);
+        let product = self.builder.ins().imul(quotient, divisor_constant);
+        let remainder = self.builder.ins().isub(value, product);
+        Ok((quotient, remainder))
+    }
+
     fn lower_wide_operation(
         &mut self,
         operation: WideOperation,
@@ -556,7 +698,7 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         width: usize,
     ) -> Result<Lowered, CodegenError> {
         let slot = self.allocate_value_slot(width)?;
-        let destination = self.slot_bit_pointer(slot);
+        let destination = self.slot_pointer(slot);
         let mut carry = self.builder.ins().iconst(types::I64, 0);
         let mut offset = 0;
         while offset < width {
@@ -608,7 +750,7 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
                 }
             };
             let masked = self.mask(word, chunk);
-            let pointer = self.builder.ins().iadd_imm_u(destination, offset as i64);
+            let pointer = self.pointer_offset(destination, offset);
             self.store_bits(pointer, masked, chunk)?;
             offset += chunk;
         }
@@ -627,8 +769,8 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
     ) -> Result<CraneliftValue, CodegenError> {
         match lowered {
             Lowered::Slot(address) => {
-                let shifted = self.builder.ins().ishl_imm_u(address, 3);
-                let pointer = self.builder.ins().iadd_imm_u(shifted, offset as i64);
+                let base = BitPointer::Byte { address, bit: 0 };
+                let pointer = self.pointer_offset(base, offset);
                 self.load_bits(pointer, width)
             }
             Lowered::Word(word) => {
@@ -668,11 +810,11 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
             Ok(Lowered::Word(self.mask(word, width)))
         } else {
             let slot = self.allocate_value_slot(width)?;
-            let destination = self.slot_bit_pointer(slot);
+            let destination = self.slot_pointer(slot);
             let mut offset = 0;
             for (element, element_type) in elements.iter().zip(element_types) {
                 let lowered = self.lower_value(element, element_type)?;
-                let pointer = self.builder.ins().iadd_imm_u(destination, offset as i64);
+                let pointer = self.pointer_offset(destination, offset);
                 self.write_bits(pointer, lowered, element_type.width())?;
                 offset += element_type.width();
             }
@@ -696,6 +838,13 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         if width != expected.width() {
             return Err(CodegenError::new("an element has the wrong width"));
         }
+        if width <= 64 {
+            if let Value::Load(reference) = operand {
+                let pointer = self.lower_pointer(reference)?;
+                let pointer = self.pointer_offset(pointer, offset);
+                return Ok(Lowered::Word(self.load_bits(pointer, width)?));
+            }
+        }
         let lowered = self.lower_value(operand, &operand_type)?;
         match lowered {
             Lowered::Word(word) => {
@@ -703,13 +852,13 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
                 Ok(Lowered::Word(self.mask(shifted, width)))
             }
             Lowered::Slot(address) => {
-                let shifted = self.builder.ins().ishl_imm_u(address, 3);
-                let pointer = self.builder.ins().iadd_imm_u(shifted, offset as i64);
+                let base = BitPointer::Byte { address, bit: 0 };
+                let pointer = self.pointer_offset(base, offset);
                 if width <= 64 {
                     Ok(Lowered::Word(self.load_bits(pointer, width)?))
                 } else {
                     let slot = self.allocate_value_slot(width)?;
-                    let destination = self.slot_bit_pointer(slot);
+                    let destination = self.slot_pointer(slot);
                     self.copy_bits(pointer, destination, width)?;
                     Ok(Lowered::Slot(self.builder.ins().stack_addr(
                         self.pointer_type,
@@ -721,30 +870,27 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         }
     }
 
-    fn lower_reference(
-        &mut self,
-        slot: Slot,
-        offset: usize,
-        expected: &Type,
-    ) -> Result<Lowered, CodegenError> {
-        if !expected.is_reference() {
-            return Err(CodegenError::new("a reference has the wrong type"));
-        }
+    fn lower_reference(&mut self, slot: Slot, offset: usize) -> Result<BitPointer, CodegenError> {
         let slot_type = self.slot_type(slot)?;
         let storage = self.storage(slot)?;
         let pointed_type = self.storage_type(slot)?;
         self.type_at_bit_offset(&pointed_type, offset)?;
         let pointer = if slot_type.is_reference() {
-            self.load_word(storage)
+            BitPointer::Bit(self.load_word(storage))
         } else {
-            self.slot_bit_pointer(storage)
+            BitPointer::Byte {
+                address: self.builder.ins().stack_addr(self.pointer_type, storage, 0),
+                bit: 0,
+            }
         };
-        let pointer = if offset == 0 {
-            pointer
-        } else {
-            self.builder.ins().iadd_imm_u(pointer, offset as i64)
-        };
-        Ok(Lowered::Word(pointer))
+        Ok(self.pointer_offset(pointer, offset))
+    }
+
+    fn lower_pointer(&mut self, value: &Value) -> Result<BitPointer, CodegenError> {
+        match value {
+            Value::Reference { slot, bit_offset } => self.lower_reference(*slot, *bit_offset),
+            other => Ok(BitPointer::Bit(self.lower_word(other, 64)?)),
+        }
     }
 
     fn lower_load(&mut self, reference: &Value, expected: &Type) -> Result<Lowered, CodegenError> {
@@ -756,12 +902,12 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         if inner.width() != expected.width() {
             return Err(CodegenError::new("a load has the wrong width"));
         }
-        let pointer = self.lower_word(reference, 64)?;
+        let pointer = self.lower_pointer(reference)?;
         if inner.width() <= 64 {
             Ok(Lowered::Word(self.load_bits(pointer, inner.width())?))
         } else {
             let slot = self.allocate_value_slot(inner.width())?;
-            let destination = self.slot_bit_pointer(slot);
+            let destination = self.slot_pointer(slot);
             self.copy_bits(pointer, destination, inner.width())?;
             Ok(Lowered::Slot(self.builder.ins().stack_addr(
                 self.pointer_type,
@@ -777,6 +923,14 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         arguments: &[Value],
         expected: &Type,
     ) -> Result<Lowered, CodegenError> {
+        if self.inline_depth < INLINE_DEPTH_LIMIT {
+            if let Some(substituted) = self.inline_call(label, arguments)? {
+                self.inline_depth += 1;
+                let lowered = self.lower_value(&substituted, expected);
+                self.inline_depth -= 1;
+                return lowered;
+            }
+        }
         let symbol = self
             .symbols
             .functions
@@ -814,8 +968,8 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
                 Lowered::Slot(address) => {
                     let width = parameter_type.width();
                     let temporary = self.allocate_value_slot(width)?;
-                    let destination = self.slot_bit_pointer(temporary);
-                    let source = self.builder.ins().ishl_imm_u(address, 3);
+                    let destination = self.slot_pointer(temporary);
+                    let source = BitPointer::Byte { address, bit: 0 };
                     self.copy_bits(source, destination, width)?;
                     let pointer = self
                         .builder
@@ -838,6 +992,60 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         } else {
             Ok(Lowered::Word(self.builder.inst_results(call)[0]))
         }
+    }
+
+    fn inline_call(
+        &mut self,
+        label: &str,
+        arguments: &[Value],
+    ) -> Result<Option<Value>, CodegenError> {
+        let symbol = match self.symbols.functions.get(label) {
+            Some(symbol) => symbol,
+            None => return Ok(None),
+        };
+        let callee = symbol.function;
+        if callee.label().text() == self.function.label().text() {
+            return Ok(None);
+        }
+        if callee.parameters().len() != arguments.len() {
+            return Ok(None);
+        }
+        let body = callee.body();
+        if !body.statements().is_empty() {
+            return Ok(None);
+        }
+        let result = match body.result() {
+            Some(result) => result,
+            None => return Ok(None),
+        };
+        if !value_is_inline_safe(result) {
+            return Ok(None);
+        }
+        let size = value_size(result);
+        if size > INLINE_SIZE_LIMIT || size > self.inline_budget {
+            return Ok(None);
+        }
+        if arguments.iter().any(|argument| !value_is_pure(argument)) {
+            return Ok(None);
+        }
+        let mut bindings = Vec::new();
+        for (parameter, argument) in callee.parameters().iter().zip(arguments) {
+            let parameter_type = match callee.slots().get(parameter.slot().index()) {
+                Some(parameter_type) => parameter_type.clone(),
+                None => return Ok(None),
+            };
+            bindings.push(InlineBinding {
+                parameter: parameter.slot(),
+                parameter_type,
+                argument: argument.clone(),
+            });
+        }
+        let substituted = match substitute_parameters(result, &bindings) {
+            Some(substituted) => substituted,
+            None => return Ok(None),
+        };
+        self.inline_budget -= size;
+        Ok(Some(substituted))
     }
 
     fn lower_self_tail_call(
@@ -964,9 +1172,9 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
             Ok(Lowered::Word(self.mask(word, total)))
         } else {
             let slot = self.allocate_value_slot(total)?;
-            let destination = self.slot_bit_pointer(slot);
+            let destination = self.slot_pointer(slot);
             self.store_bits(destination, status, 1)?;
-            let payload_pointer = self.builder.ins().iadd_imm_u(destination, 1);
+            let payload_pointer = self.pointer_offset(destination, 1);
             self.store_bits(payload_pointer, payload, payload_width)?;
             Ok(Lowered::Slot(self.builder.ins().stack_addr(
                 self.pointer_type,
@@ -1017,14 +1225,14 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
 
     fn write_bits(
         &mut self,
-        pointer: CraneliftValue,
+        pointer: BitPointer,
         lowered: Lowered,
         width: usize,
     ) -> Result<(), CodegenError> {
         match lowered {
             Lowered::Word(word) => self.store_bits(pointer, word, width),
             Lowered::Slot(address) => {
-                let source = self.builder.ins().ishl_imm_u(address, 3);
+                let source = BitPointer::Byte { address, bit: 0 };
                 self.copy_bits(source, pointer, width)
             }
         }
@@ -1036,14 +1244,14 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         lowered: Lowered,
         width: usize,
     ) -> Result<(), CodegenError> {
-        let destination = self.slot_bit_pointer(slot);
+        let destination = self.slot_pointer(slot);
         self.write_bits(destination, lowered, width)
     }
 
     fn read_slot(&mut self, slot: StackSlot, expected: &Type) -> Result<Lowered, CodegenError> {
         if expected.width() <= 64 {
-            let word = self.load_word(slot);
-            Ok(Lowered::Word(self.mask(word, expected.width())))
+            let pointer = self.slot_pointer(slot);
+            Ok(Lowered::Word(self.load_bits(pointer, expected.width())?))
         } else {
             Ok(Lowered::Slot(self.builder.ins().stack_addr(
                 self.pointer_type,
@@ -1055,7 +1263,7 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
 
     fn load_bits(
         &mut self,
-        pointer: CraneliftValue,
+        pointer: BitPointer,
         width: usize,
     ) -> Result<CraneliftValue, CodegenError> {
         if width == 0 {
@@ -1064,28 +1272,62 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         if width > 64 {
             return Err(CodegenError::new("a word load is too wide"));
         }
-        let byte_pointer = self.builder.ins().ushr_imm_u(pointer, 3);
-        let shift = self.builder.ins().band_imm_u(pointer, 7);
-        let low = self
-            .builder
-            .ins()
-            .load(types::I64, memory_flags(), byte_pointer, 0);
-        let high = self
-            .builder
-            .ins()
-            .uload8(types::I64, memory_flags(), byte_pointer, 8);
-        let low_shifted = self.builder.ins().ushr(low, shift);
-        let negated = self.builder.ins().ineg(shift);
-        let high_shifted = self.builder.ins().ishl(high, negated);
-        let combined = self.builder.ins().bor(low_shifted, high_shifted);
-        let aligned = self.builder.ins().icmp_imm_u(IntCC::Equal, shift, 0);
-        let selected = self.builder.ins().select(aligned, low, combined);
-        Ok(self.mask(selected, width))
+        match pointer {
+            BitPointer::Byte { address, bit } => {
+                let bit = usize::from(bit);
+                if bit == 0 && width == 64 {
+                    return Ok(self
+                        .builder
+                        .ins()
+                        .load(types::I64, memory_flags(), address, 0));
+                }
+                let low = self
+                    .builder
+                    .ins()
+                    .load(types::I64, memory_flags(), address, 0);
+                if bit + width <= 64 {
+                    let shifted = if bit == 0 {
+                        low
+                    } else {
+                        self.builder.ins().ushr_imm_u(low, bit as i64)
+                    };
+                    Ok(self.mask(shifted, width))
+                } else {
+                    let high = self
+                        .builder
+                        .ins()
+                        .uload8(types::I64, memory_flags(), address, 8);
+                    let low_shifted = self.builder.ins().ushr_imm_u(low, bit as i64);
+                    let high_shifted = self.builder.ins().ishl_imm_u(high, (64 - bit) as i64);
+                    let combined = self.builder.ins().bor(low_shifted, high_shifted);
+                    Ok(self.mask(combined, width))
+                }
+            }
+            BitPointer::Bit(value) => {
+                let byte_pointer = self.builder.ins().ushr_imm_u(value, 3);
+                let shift = self.builder.ins().band_imm_u(value, 7);
+                let low = self
+                    .builder
+                    .ins()
+                    .load(types::I64, memory_flags(), byte_pointer, 0);
+                let high = self
+                    .builder
+                    .ins()
+                    .uload8(types::I64, memory_flags(), byte_pointer, 8);
+                let low_shifted = self.builder.ins().ushr(low, shift);
+                let negated = self.builder.ins().ineg(shift);
+                let high_shifted = self.builder.ins().ishl(high, negated);
+                let combined = self.builder.ins().bor(low_shifted, high_shifted);
+                let aligned = self.builder.ins().icmp_imm_u(IntCC::Equal, shift, 0);
+                let selected = self.builder.ins().select(aligned, low, combined);
+                Ok(self.mask(selected, width))
+            }
+        }
     }
 
     fn store_bits(
         &mut self,
-        pointer: CraneliftValue,
+        pointer: BitPointer,
         word: CraneliftValue,
         width: usize,
     ) -> Result<(), CodegenError> {
@@ -1095,93 +1337,219 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         if width > 64 {
             return Err(CodegenError::new("a word store is too wide"));
         }
-        let byte_pointer = self.builder.ins().ushr_imm_u(pointer, 3);
-        let shift = self.builder.ins().band_imm_u(pointer, 7);
-        let low = self
-            .builder
-            .ins()
-            .load(types::I64, memory_flags(), byte_pointer, 0);
-        let low_mask_constant = self.builder.ins().iconst(types::I64, mask_immediate(width));
-        let low_mask = self.builder.ins().ishl(low_mask_constant, shift);
-        let inverted_low_mask = self.builder.ins().bnot(low_mask);
-        let cleared_low = self.builder.ins().band(low, inverted_low_mask);
-        let inserted_low = self.builder.ins().ishl(word, shift);
-        let new_low = self.builder.ins().bor(cleared_low, inserted_low);
-        self.builder
-            .ins()
-            .store(memory_flags(), new_low, byte_pointer, 0);
-        let high = self
-            .builder
-            .ins()
-            .uload8(types::I64, memory_flags(), byte_pointer, 8);
-        let extra = self.builder.ins().iadd_imm_s(shift, width as i64 - 64);
-        let positive = self
-            .builder
-            .ins()
-            .icmp_imm_s(IntCC::SignedGreaterThan, extra, 0);
-        let zero = self.builder.ins().iconst(types::I64, 0);
-        let clamped = self.builder.ins().select(positive, extra, zero);
-        let one = self.builder.ins().iconst(types::I64, 1);
-        let shifted_one = self.builder.ins().ishl(one, clamped);
-        let high_mask = self.builder.ins().isub(shifted_one, one);
-        let negated = self.builder.ins().ineg(shift);
-        let shifted_word = self.builder.ins().ushr(word, negated);
-        let inserted_high = self.builder.ins().band(shifted_word, high_mask);
-        let inverted_high_mask = self.builder.ins().bnot(high_mask);
-        let cleared_high = self.builder.ins().band(high, inverted_high_mask);
-        let new_high = self.builder.ins().bor(cleared_high, inserted_high);
-        self.builder
-            .ins()
-            .istore8(memory_flags(), new_high, byte_pointer, 8);
-        Ok(())
+        match pointer {
+            BitPointer::Byte { address, bit } => {
+                let bit = usize::from(bit);
+                match (bit, width) {
+                    (0, 64) => {
+                        self.builder.ins().store(memory_flags(), word, address, 0);
+                        return Ok(());
+                    }
+                    (0, 32) => {
+                        self.builder
+                            .ins()
+                            .istore32(memory_flags(), word, address, 0);
+                        return Ok(());
+                    }
+                    (0, 16) => {
+                        self.builder
+                            .ins()
+                            .istore16(memory_flags(), word, address, 0);
+                        return Ok(());
+                    }
+                    (0, 8) => {
+                        self.builder.ins().istore8(memory_flags(), word, address, 0);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                let low_mask = if bit + width >= 64 {
+                    (!0u64) << bit
+                } else {
+                    ((1u64 << width) - 1) << bit
+                };
+                let low = self
+                    .builder
+                    .ins()
+                    .load(types::I64, memory_flags(), address, 0);
+                let low_mask_constant = self.builder.ins().iconst(types::I64, low_mask as i64);
+                let inverted_low_mask = self.builder.ins().bnot(low_mask_constant);
+                let cleared_low = self.builder.ins().band(low, inverted_low_mask);
+                let inserted_low = if bit == 0 {
+                    word
+                } else {
+                    self.builder.ins().ishl_imm_u(word, bit as i64)
+                };
+                let new_low = self.builder.ins().bor(cleared_low, inserted_low);
+                self.builder
+                    .ins()
+                    .store(memory_flags(), new_low, address, 0);
+                if bit + width > 64 {
+                    let high = self
+                        .builder
+                        .ins()
+                        .uload8(types::I64, memory_flags(), address, 8);
+                    let high_mask = (1u64 << (bit + width - 64)) - 1;
+                    let high_mask_constant =
+                        self.builder.ins().iconst(types::I64, high_mask as i64);
+                    let inverted_high_mask = self.builder.ins().bnot(high_mask_constant);
+                    let cleared_high = self.builder.ins().band(high, inverted_high_mask);
+                    let shifted_word = self.builder.ins().ushr_imm_u(word, (64 - bit) as i64);
+                    let inserted_high = self.builder.ins().band(shifted_word, high_mask_constant);
+                    let new_high = self.builder.ins().bor(cleared_high, inserted_high);
+                    self.builder
+                        .ins()
+                        .istore8(memory_flags(), new_high, address, 8);
+                }
+                Ok(())
+            }
+            BitPointer::Bit(value) => {
+                let byte_pointer = self.builder.ins().ushr_imm_u(value, 3);
+                let shift = self.builder.ins().band_imm_u(value, 7);
+                let low = self
+                    .builder
+                    .ins()
+                    .load(types::I64, memory_flags(), byte_pointer, 0);
+                let low_mask_constant =
+                    self.builder.ins().iconst(types::I64, mask_immediate(width));
+                let low_mask = self.builder.ins().ishl(low_mask_constant, shift);
+                let inverted_low_mask = self.builder.ins().bnot(low_mask);
+                let cleared_low = self.builder.ins().band(low, inverted_low_mask);
+                let inserted_low = self.builder.ins().ishl(word, shift);
+                let new_low = self.builder.ins().bor(cleared_low, inserted_low);
+                self.builder
+                    .ins()
+                    .store(memory_flags(), new_low, byte_pointer, 0);
+                let high = self
+                    .builder
+                    .ins()
+                    .uload8(types::I64, memory_flags(), byte_pointer, 8);
+                let extra = self.builder.ins().iadd_imm_s(shift, width as i64 - 64);
+                let positive = self
+                    .builder
+                    .ins()
+                    .icmp_imm_s(IntCC::SignedGreaterThan, extra, 0);
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                let clamped = self.builder.ins().select(positive, extra, zero);
+                let one = self.builder.ins().iconst(types::I64, 1);
+                let shifted_one = self.builder.ins().ishl(one, clamped);
+                let high_mask = self.builder.ins().isub(shifted_one, one);
+                let negated = self.builder.ins().ineg(shift);
+                let shifted_word = self.builder.ins().ushr(word, negated);
+                let inserted_high = self.builder.ins().band(shifted_word, high_mask);
+                let inverted_high_mask = self.builder.ins().bnot(high_mask);
+                let cleared_high = self.builder.ins().band(high, inverted_high_mask);
+                let new_high = self.builder.ins().bor(cleared_high, inserted_high);
+                self.builder
+                    .ins()
+                    .istore8(memory_flags(), new_high, byte_pointer, 8);
+                Ok(())
+            }
+        }
     }
 
     fn copy_bits(
         &mut self,
-        source: CraneliftValue,
-        destination: CraneliftValue,
+        source: BitPointer,
+        destination: BitPointer,
         width: usize,
     ) -> Result<(), CodegenError> {
         let chunk_count = width / 64;
         let remainder = width % 64;
         if chunk_count > 0 {
-            let loop_block = self.builder.create_block();
-            let body_block = self.builder.create_block();
-            let done_block = self.builder.create_block();
-            self.builder.append_block_param(loop_block, types::I64);
-            let zero = self.builder.ins().iconst(types::I64, 0);
-            self.builder
-                .ins()
-                .jump(loop_block, &[BlockArg::Value(zero)]);
-            self.builder.switch_to_block(loop_block);
-            let index = self.builder.block_params(loop_block)[0];
-            let condition =
-                self.builder
-                    .ins()
-                    .icmp_imm_u(IntCC::UnsignedLessThan, index, chunk_count as i64);
-            self.builder
-                .ins()
-                .brif(condition, body_block, &[], done_block, &[]);
-            self.builder.switch_to_block(body_block);
-            self.builder.seal_block(body_block);
-            let offset = self.builder.ins().ishl_imm_u(index, 6);
-            let source_pointer = self.builder.ins().iadd(source, offset);
-            let source_chunk = self.load_bits(source_pointer, 64)?;
-            let destination_pointer = self.builder.ins().iadd(destination, offset);
-            self.store_bits(destination_pointer, source_chunk, 64)?;
-            let next = self.builder.ins().iadd_imm_u(index, 1);
-            self.builder
-                .ins()
-                .jump(loop_block, &[BlockArg::Value(next)]);
-            self.builder.seal_block(loop_block);
-            self.builder.switch_to_block(done_block);
-            self.builder.seal_block(done_block);
+            match (source, destination) {
+                (
+                    BitPointer::Byte {
+                        address: source_address,
+                        bit: source_bit,
+                    },
+                    BitPointer::Byte {
+                        address: destination_address,
+                        bit: destination_bit,
+                    },
+                ) => {
+                    let loop_block = self.builder.create_block();
+                    let body_block = self.builder.create_block();
+                    let done_block = self.builder.create_block();
+                    self.builder.append_block_param(loop_block, types::I64);
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    self.builder
+                        .ins()
+                        .jump(loop_block, &[BlockArg::Value(zero)]);
+                    self.builder.switch_to_block(loop_block);
+                    let index = self.builder.block_params(loop_block)[0];
+                    let condition = self.builder.ins().icmp_imm_u(
+                        IntCC::UnsignedLessThan,
+                        index,
+                        chunk_count as i64,
+                    );
+                    self.builder
+                        .ins()
+                        .brif(condition, body_block, &[], done_block, &[]);
+                    self.builder.switch_to_block(body_block);
+                    self.builder.seal_block(body_block);
+                    let offset = self.builder.ins().ishl_imm_u(index, 3);
+                    let source_pointer = BitPointer::Byte {
+                        address: self.builder.ins().iadd(source_address, offset),
+                        bit: source_bit,
+                    };
+                    let source_chunk = self.load_bits(source_pointer, 64)?;
+                    let destination_pointer = BitPointer::Byte {
+                        address: self.builder.ins().iadd(destination_address, offset),
+                        bit: destination_bit,
+                    };
+                    self.store_bits(destination_pointer, source_chunk, 64)?;
+                    let next = self.builder.ins().iadd_imm_u(index, 1);
+                    self.builder
+                        .ins()
+                        .jump(loop_block, &[BlockArg::Value(next)]);
+                    self.builder.seal_block(loop_block);
+                    self.builder.switch_to_block(done_block);
+                    self.builder.seal_block(done_block);
+                }
+                (source, destination) => {
+                    let source = self.pointer_as_bit(source);
+                    let destination = self.pointer_as_bit(destination);
+                    let loop_block = self.builder.create_block();
+                    let body_block = self.builder.create_block();
+                    let done_block = self.builder.create_block();
+                    self.builder.append_block_param(loop_block, types::I64);
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    self.builder
+                        .ins()
+                        .jump(loop_block, &[BlockArg::Value(zero)]);
+                    self.builder.switch_to_block(loop_block);
+                    let index = self.builder.block_params(loop_block)[0];
+                    let condition = self.builder.ins().icmp_imm_u(
+                        IntCC::UnsignedLessThan,
+                        index,
+                        chunk_count as i64,
+                    );
+                    self.builder
+                        .ins()
+                        .brif(condition, body_block, &[], done_block, &[]);
+                    self.builder.switch_to_block(body_block);
+                    self.builder.seal_block(body_block);
+                    let offset = self.builder.ins().ishl_imm_u(index, 6);
+                    let source_pointer = self.builder.ins().iadd(source, offset);
+                    let source_chunk = self.load_bits(BitPointer::Bit(source_pointer), 64)?;
+                    let destination_pointer = self.builder.ins().iadd(destination, offset);
+                    self.store_bits(BitPointer::Bit(destination_pointer), source_chunk, 64)?;
+                    let next = self.builder.ins().iadd_imm_u(index, 1);
+                    self.builder
+                        .ins()
+                        .jump(loop_block, &[BlockArg::Value(next)]);
+                    self.builder.seal_block(loop_block);
+                    self.builder.switch_to_block(done_block);
+                    self.builder.seal_block(done_block);
+                }
+            }
         }
         if remainder > 0 {
-            let offset = (chunk_count * 64) as i64;
-            let source_pointer = self.builder.ins().iadd_imm_u(source, offset);
+            let offset = chunk_count * 64;
+            let source_pointer = self.pointer_offset(source, offset);
             let source_chunk = self.load_bits(source_pointer, remainder)?;
-            let destination_pointer = self.builder.ins().iadd_imm_u(destination, offset);
+            let destination_pointer = self.pointer_offset(destination, offset);
             self.store_bits(destination_pointer, source_chunk, remainder)?;
         }
         Ok(())
@@ -1195,9 +1563,46 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         }
     }
 
-    fn slot_bit_pointer(&mut self, slot: StackSlot) -> CraneliftValue {
-        let address = self.builder.ins().stack_addr(self.pointer_type, slot, 0);
-        self.builder.ins().ishl_imm_u(address, 3)
+    fn slot_pointer(&mut self, slot: StackSlot) -> BitPointer {
+        BitPointer::Byte {
+            address: self.builder.ins().stack_addr(self.pointer_type, slot, 0),
+            bit: 0,
+        }
+    }
+
+    fn pointer_offset(&mut self, pointer: BitPointer, bits: usize) -> BitPointer {
+        match pointer {
+            BitPointer::Byte { address, bit } => {
+                let total = usize::from(bit) + bits;
+                BitPointer::Byte {
+                    address: if total / 8 == 0 {
+                        address
+                    } else {
+                        self.builder.ins().iadd_imm_u(address, (total / 8) as i64)
+                    },
+                    bit: (total % 8) as u8,
+                }
+            }
+            BitPointer::Bit(value) => BitPointer::Bit(if bits == 0 {
+                value
+            } else {
+                self.builder.ins().iadd_imm_u(value, bits as i64)
+            }),
+        }
+    }
+
+    fn pointer_as_bit(&mut self, pointer: BitPointer) -> CraneliftValue {
+        match pointer {
+            BitPointer::Byte { address, bit } => {
+                let shifted = self.builder.ins().ishl_imm_u(address, 3);
+                if bit == 0 {
+                    shifted
+                } else {
+                    self.builder.ins().iadd_imm_u(shifted, i64::from(bit))
+                }
+            }
+            BitPointer::Bit(value) => value,
+        }
     }
 
     fn store_word(&mut self, slot: StackSlot, word: CraneliftValue) {
@@ -1246,10 +1651,19 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         match value {
             Value::Constant(bits) => Ok(flat_type(bits.width())),
             Value::Nand(left, _) => self.type_of(left),
-            Value::Intrinsic(_, arguments) => match arguments.first() {
-                Some(argument) => self.type_of(argument),
-                None => Err(CodegenError::new("an intrinsic has no arguments")),
-            },
+            Value::Intrinsic(intrinsic, arguments) => {
+                if *intrinsic == Intrinsic::DivMod {
+                    let operand = match arguments.first() {
+                        Some(argument) => self.type_of(argument)?,
+                        None => return Err(CodegenError::new("an intrinsic has no arguments")),
+                    };
+                    return Ok(Type::Collection(vec![operand.clone(), operand]));
+                }
+                match arguments.first() {
+                    Some(argument) => self.type_of(argument),
+                    None => Err(CodegenError::new("an intrinsic has no arguments")),
+                }
+            }
             Value::Collection(elements) => {
                 let mut types = Vec::new();
                 for element in elements {
@@ -1322,6 +1736,145 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
     }
 }
 
+fn substitute_parameters(value: &Value, bindings: &[InlineBinding]) -> Option<Value> {
+    match value {
+        Value::Constant(bits) => Some(Value::Constant(bits.clone())),
+        Value::Nand(left, right) => Some(Value::Nand(
+            Box::new(substitute_parameters(left, bindings)?),
+            Box::new(substitute_parameters(right, bindings)?),
+        )),
+        Value::Intrinsic(intrinsic, arguments) => Some(Value::Intrinsic(
+            *intrinsic,
+            substitute_arguments(arguments, bindings)?,
+        )),
+        Value::Collection(elements) => {
+            Some(Value::Collection(substitute_arguments(elements, bindings)?))
+        }
+        Value::Element { collection, index } => Some(Value::Element {
+            collection: Box::new(substitute_parameters(collection, bindings)?),
+            index: *index,
+        }),
+        Value::Reference { slot, bit_offset } => {
+            let binding = bindings.iter().find(|binding| binding.parameter == *slot)?;
+            if *bit_offset != 0 || !binding.parameter_type.is_reference() {
+                return None;
+            }
+            Some(binding.argument.clone())
+        }
+        Value::Load(reference) => {
+            if let Value::Reference { slot, bit_offset } = reference.as_ref() {
+                if let Some(binding) = bindings.iter().find(|binding| binding.parameter == *slot) {
+                    if *bit_offset != 0 {
+                        return None;
+                    }
+                    if binding.parameter_type.is_reference() {
+                        return Some(Value::Load(Box::new(binding.argument.clone())));
+                    }
+                    return Some(binding.argument.clone());
+                }
+            }
+            Some(Value::Load(Box::new(substitute_parameters(
+                reference, bindings,
+            )?)))
+        }
+        Value::Call(label, arguments) => Some(Value::Call(
+            label.clone(),
+            substitute_arguments(arguments, bindings)?,
+        )),
+        Value::Extern(operation, arguments) => Some(Value::Extern(
+            *operation,
+            substitute_arguments(arguments, bindings)?,
+        )),
+        Value::Branch(condition, then, otherwise) => Some(Value::Branch(
+            Box::new(substitute_parameters(condition, bindings)?),
+            substitute_block(then, bindings)?,
+            substitute_block(otherwise, bindings)?,
+        )),
+    }
+}
+
+fn substitute_arguments(arguments: &[Value], bindings: &[InlineBinding]) -> Option<Vec<Value>> {
+    arguments
+        .iter()
+        .map(|argument| substitute_parameters(argument, bindings))
+        .collect()
+}
+
+fn substitute_block(block: &Block, bindings: &[InlineBinding]) -> Option<Block> {
+    if !block.statements().is_empty() {
+        return None;
+    }
+    let result = match block.result() {
+        Some(result) => Some(Box::new(substitute_parameters(result, bindings)?)),
+        None => None,
+    };
+    Some(Block::new(Vec::new(), result))
+}
+
+fn value_is_inline_safe(value: &Value) -> bool {
+    match value {
+        Value::Constant(_) | Value::Reference { .. } => true,
+        Value::Nand(left, right) => value_is_inline_safe(left) && value_is_inline_safe(right),
+        Value::Intrinsic(_, arguments)
+        | Value::Call(_, arguments)
+        | Value::Extern(_, arguments) => arguments.iter().all(value_is_inline_safe),
+        Value::Collection(elements) => elements.iter().all(value_is_inline_safe),
+        Value::Element { collection, .. } => value_is_inline_safe(collection),
+        Value::Load(reference) => value_is_inline_safe(reference),
+        Value::Branch(condition, then, otherwise) => {
+            value_is_inline_safe(condition)
+                && block_is_inline_safe(then)
+                && block_is_inline_safe(otherwise)
+        }
+    }
+}
+
+fn block_is_inline_safe(block: &Block) -> bool {
+    block.statements().is_empty()
+        && block
+            .result()
+            .map_or(true, |result| value_is_inline_safe(result))
+}
+
+fn value_is_pure(value: &Value) -> bool {
+    match value {
+        Value::Constant(_) | Value::Reference { .. } => true,
+        Value::Nand(left, right) => value_is_pure(left) && value_is_pure(right),
+        Value::Intrinsic(_, arguments) => arguments.iter().all(value_is_pure),
+        Value::Collection(elements) => elements.iter().all(value_is_pure),
+        Value::Element { collection, .. } => value_is_pure(collection),
+        Value::Load(reference) => value_is_pure(reference),
+        Value::Branch(condition, then, otherwise) => {
+            value_is_pure(condition) && block_is_pure(then) && block_is_pure(otherwise)
+        }
+        Value::Call(_, _) | Value::Extern(_, _) => false,
+    }
+}
+
+fn block_is_pure(block: &Block) -> bool {
+    block.statements().is_empty() && block.result().map_or(true, |result| value_is_pure(result))
+}
+
+fn value_size(value: &Value) -> usize {
+    match value {
+        Value::Constant(_) | Value::Reference { .. } => 1,
+        Value::Nand(left, right) => 1 + value_size(left) + value_size(right),
+        Value::Intrinsic(_, arguments)
+        | Value::Call(_, arguments)
+        | Value::Extern(_, arguments) => 1 + arguments.iter().map(value_size).sum::<usize>(),
+        Value::Collection(elements) => 1 + elements.iter().map(value_size).sum::<usize>(),
+        Value::Element { collection, .. } => 1 + value_size(collection),
+        Value::Load(reference) => 1 + value_size(reference),
+        Value::Branch(condition, then, otherwise) => {
+            1 + value_size(condition) + block_size(then) + block_size(otherwise)
+        }
+    }
+}
+
+fn block_size(block: &Block) -> usize {
+    block.statements().len() + block.result().map_or(0, value_size)
+}
+
 fn element_at(type_: &Type, index: usize) -> Result<(usize, Type), CodegenError> {
     let elements = type_
         .elements()
@@ -1363,6 +1916,20 @@ fn mask_immediate(width: usize) -> i64 {
     } else {
         ((1u64 << width) - 1) as i64
     }
+}
+
+fn magic_division(divisor: u64) -> Option<(u64, u32)> {
+    if divisor <= 1 || divisor.is_power_of_two() {
+        return None;
+    }
+    let shift = divisor.ilog2();
+    let power = 1u128 << (64 + shift);
+    let divisor = u128::from(divisor);
+    let error = (divisor - power % divisor) % divisor;
+    if error > 1u128 << shift {
+        return None;
+    }
+    Some(((power / divisor + 1) as u64, shift))
 }
 
 fn bits_to_word(bits: &[bool], offset: usize, width: usize) -> i64 {
@@ -1578,6 +2145,17 @@ mod tests {
                     .zip(when_zero)
                     .map(|((flag, one), zero)| if *flag { *one } else { *zero })
                     .collect()
+            }
+            Intrinsic::DivMod => {
+                let divisor = value_of(right);
+                let (quotient, remainder) = if divisor == 0 {
+                    (0, 0)
+                } else {
+                    (value_of(left) / divisor, value_of(left) % divisor)
+                };
+                let mut result = bits_of_value(quotient, left.len());
+                result.extend(bits_of_value(remainder, left.len()));
+                result
             }
         }
     }
@@ -2863,6 +3441,384 @@ mod tests {
         let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nliblapc.bit.not = (a: BIT) BIT { NAND(a, a) }\nliblapc.bit.xor = (a: BIT, b: BIT) BIT { BIT.ZERO }\nliblapc.bit.or = (a: BIT, b: BIT) BIT { BIT.ZERO }\nliblapc.bit.and = (a: BIT, b: BIT) BIT { BIT.ZERO }\nliblapc.u8.sub = (a: U8, b: U8) U8 { [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO] }\nliblapc.u8.add = (a: U8, b: U8) U8 { [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO] }\nmain = () BIT { plain: BIT = liblapc.bit.and(liblapc.bit.not(BIT.ZERO), liblapc.bit.or(BIT.ZERO, liblapc.bit.xor(BIT.ONE, BIT.ZERO)))\n difference: U8 = liblapc.u8.sub([BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO], [BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO])\n [b0, b1, b2, b3, b4, b5, b6, b7] = difference\n NAND(plain, b7) }\n";
         let program = lapc_erase::erase_intrinsics(compile_source(source));
         assert_eq!(run_word(&program, "main"), 0);
+    }
+
+    #[test]
+    fn jit_runs_a_division_at_every_width_boundary() {
+        for width in [1usize, 4, 8, 9, 16, 32, 63, 64] {
+            for (value, divisor) in [
+                (7u128, 2u128),
+                (1000, 10),
+                (0, 5),
+                (5, 0),
+                (0, 0),
+                (255, 1),
+                (123456789, 1000000),
+            ] {
+                let value = value & mask_wide(width);
+                let divisor = divisor & mask_wide(width);
+                let intrinsic = Value::Intrinsic(
+                    Intrinsic::DivMod,
+                    vec![
+                        bits(&bits_of_value(value, width)),
+                        bits(&bits_of_value(divisor, width)),
+                    ],
+                );
+                let result_type = Type::Collection(vec![flat_type(width), flat_type(width)]);
+                let program = Program::new(vec![function(
+                    "divide",
+                    vec![],
+                    result_type,
+                    vec![],
+                    block(vec![], intrinsic),
+                )]);
+                let (module, identifiers) = compile_for_execution(&program);
+                let (quotient, remainder) = if width * 2 <= 64 {
+                    let divide: extern "C" fn() -> i64 =
+                        unsafe { std::mem::transmute(entry(&module, &identifiers, "divide")) };
+                    let word = divide() as u64;
+                    (
+                        u128::from(word & mask_wide(width) as u64),
+                        u128::from((word >> width) & mask_wide(width) as u64),
+                    )
+                } else {
+                    let output = run_wide(&program, "divide");
+                    let all: Vec<bool> = (0..2 * width)
+                        .map(|index| output[index / 8] >> (index % 8) & 1 == 1)
+                        .collect();
+                    (value_of(&all[..width]), value_of(&all[width..]))
+                };
+                let expected = if divisor == 0 {
+                    (0, 0)
+                } else {
+                    (value / divisor, value % divisor)
+                };
+                assert_eq!(
+                    (quotient, remainder),
+                    expected,
+                    "for width {width}, {value} divided by {divisor}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jit_runs_a_division_by_a_runtime_divisor() {
+        for width in [4usize, 8, 16, 32, 64] {
+            let operand_type = flat_type(width);
+            let divide = function(
+                "divide",
+                vec![Parameter::new(Slot::new(0)), Parameter::new(Slot::new(1))],
+                Type::Collection(vec![operand_type.clone(), operand_type.clone()]),
+                vec![operand_type.clone(), operand_type.clone()],
+                block(
+                    vec![],
+                    Value::Intrinsic(
+                        Intrinsic::DivMod,
+                        vec![
+                            Value::Load(Box::new(Value::Reference {
+                                slot: Slot::new(0),
+                                bit_offset: 0,
+                            })),
+                            Value::Load(Box::new(Value::Reference {
+                                slot: Slot::new(1),
+                                bit_offset: 0,
+                            })),
+                        ],
+                    ),
+                ),
+            );
+            let program = Program::new(vec![divide]);
+            let (module, identifiers) = compile_for_execution(&program);
+            for (value, divisor) in [
+                (0u64, 0u64),
+                (1, 0),
+                (7, 2),
+                (255, 10),
+                (12345, 67),
+                (1 << 63, 3),
+            ] {
+                let value = u128::from(value) & mask_wide(width);
+                let divisor = u128::from(divisor) & mask_wide(width);
+                let (quotient, remainder) = if width * 2 <= 64 {
+                    let divide: extern "C" fn(i64, i64) -> i64 =
+                        unsafe { std::mem::transmute(entry(&module, &identifiers, "divide")) };
+                    let word = divide(value as i64, divisor as i64) as u64;
+                    (
+                        u128::from(word & mask_wide(width) as u64),
+                        u128::from((word >> width) & mask_wide(width) as u64),
+                    )
+                } else {
+                    let divide: extern "C" fn(*mut u8, i64, i64) =
+                        unsafe { std::mem::transmute(entry(&module, &identifiers, "divide")) };
+                    let mut buffer = [0u8; WIDE_BUFFER_BYTES];
+                    divide(buffer.as_mut_ptr(), value as i64, divisor as i64);
+                    let all: Vec<bool> = (0..2 * width)
+                        .map(|index| buffer[index / 8] >> (index % 8) & 1 == 1)
+                        .collect();
+                    (value_of(&all[..width]), value_of(&all[width..]))
+                };
+                let expected = if divisor == 0 {
+                    (0, 0)
+                } else {
+                    (value / divisor, value % divisor)
+                };
+                assert_eq!(
+                    (quotient, remainder),
+                    expected,
+                    "for width {width}, {value} divided by {divisor}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jit_runs_an_erased_division() {
+        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nliblapc.u8.div.mod = (value: U8, divisor: U8) [U8, U8] { [[BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO], [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO]] }\nmain = () BIT { [quotient, remainder] = liblapc.u8.div.mod([BIT.ZERO, BIT.ONE, BIT.ZERO, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ZERO, BIT.ONE], [BIT.ZERO, BIT.ONE, BIT.ZERO, BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO])\n [q0, q1, q2, q3, q4, q5, q6, q7] = quotient\n [r0, r1, r2, r3, r4, r5, r6, r7] = remainder\n NAND(NAND(q4, r1), NAND(q4, r1)) }\n";
+        let program = lapc_erase::erase_intrinsics(compile_source(source));
+        assert_eq!(run_word(&program, "main"), 1);
+    }
+
+    #[test]
+    fn magic_division_is_exact() {
+        let mut divisors: Vec<u64> = (2..2000).collect();
+        divisors.extend([
+            10,
+            1000000,
+            123456789,
+            u64::from(u32::MAX),
+            (1 << 32) + 1,
+            (1 << 63) - 1,
+            (1 << 63) + 1,
+            u64::MAX,
+            u64::MAX - 1,
+            (1 << 62) + 12345,
+        ]);
+        for divisor in divisors {
+            let magic = magic_division(divisor);
+            let mut samples: Vec<u64> = vec![
+                0,
+                1,
+                divisor - 1,
+                divisor,
+                divisor.saturating_add(1),
+                u64::MAX,
+                u64::MAX - 1,
+                1 << 63,
+            ];
+            let mut state = divisor | 1;
+            for _ in 0..2000 {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                samples.push(state);
+            }
+            for sample in samples {
+                let expected = u128::from(sample) / u128::from(divisor);
+                if let Some((m, shift)) = magic {
+                    let computed = (u128::from(sample) * u128::from(m)) >> (64 + shift);
+                    assert_eq!(
+                        computed, expected,
+                        "for divisor {divisor} and sample {sample}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_value_parameter_is_substituted_for_its_load() {
+        let bindings = vec![InlineBinding {
+            parameter: Slot::new(0),
+            parameter_type: flat_type(8),
+            argument: bits(&[true, false, false, false, false, false, false, false]),
+        }];
+        let load = Value::Load(Box::new(Value::Reference {
+            slot: Slot::new(0),
+            bit_offset: 0,
+        }));
+        assert_eq!(
+            substitute_parameters(&load, &bindings),
+            Some(bits(&[
+                true, false, false, false, false, false, false, false
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_reference_parameter_is_dereferenced_when_substituted() {
+        let bindings = vec![InlineBinding {
+            parameter: Slot::new(0),
+            parameter_type: Type::Reference(Box::new(Type::Bit)),
+            argument: Value::Reference {
+                slot: Slot::new(3),
+                bit_offset: 0,
+            },
+        }];
+        let load = Value::Load(Box::new(Value::Reference {
+            slot: Slot::new(0),
+            bit_offset: 0,
+        }));
+        assert_eq!(
+            substitute_parameters(&load, &bindings),
+            Some(Value::Load(Box::new(Value::Reference {
+                slot: Slot::new(3),
+                bit_offset: 0
+            })))
+        );
+    }
+
+    #[test]
+    fn a_reference_to_a_value_parameter_is_not_substitutable() {
+        let bindings = vec![InlineBinding {
+            parameter: Slot::new(0),
+            parameter_type: flat_type(8),
+            argument: bit(true),
+        }];
+        let reference = Value::Reference {
+            slot: Slot::new(0),
+            bit_offset: 0,
+        };
+        assert_eq!(substitute_parameters(&reference, &bindings), None);
+    }
+
+    #[test]
+    fn only_a_pure_argument_is_inlinable() {
+        assert!(!value_is_pure(&Value::Call(Label::new("callee"), vec![])));
+        assert!(!value_is_pure(&Value::Extern(
+            Operation::new(0x0400),
+            vec![]
+        )));
+        assert!(value_is_pure(&Value::Load(Box::new(Value::Reference {
+            slot: Slot::new(0),
+            bit_offset: 0,
+        }))));
+    }
+
+    #[test]
+    fn a_block_with_statements_is_not_inline_safe() {
+        let branch = Value::Branch(
+            Box::new(bit(true)),
+            Block::new(
+                vec![Statement::Bind {
+                    slot: Slot::new(1),
+                    value: bit(false),
+                }],
+                Some(Box::new(bit(true))),
+            ),
+            empty_block(vec![]),
+        );
+        assert!(!value_is_inline_safe(&branch));
+    }
+
+    #[test]
+    fn jit_inlines_a_reference_parameter() {
+        let read = function(
+            "read",
+            vec![Parameter::new(Slot::new(0))],
+            Type::Bit,
+            vec![Type::Reference(Box::new(Type::Bit))],
+            block(
+                vec![],
+                Value::Load(Box::new(Value::Reference {
+                    slot: Slot::new(0),
+                    bit_offset: 0,
+                })),
+            ),
+        );
+        let main = function(
+            "main",
+            vec![],
+            Type::Bit,
+            vec![Type::Bit],
+            block(
+                vec![Statement::Bind {
+                    slot: Slot::new(0),
+                    value: bit(true),
+                }],
+                Value::Call(
+                    Label::new("read"),
+                    vec![Value::Reference {
+                        slot: Slot::new(0),
+                        bit_offset: 0,
+                    }],
+                ),
+            ),
+        );
+        let program = Program::new(vec![read, main]);
+        assert_eq!(run_word(&program, "main"), 1);
+    }
+
+    #[test]
+    fn jit_calls_a_division_with_an_impure_argument() {
+        let operand_type = flat_type(64);
+        let divisor = function(
+            "divisor",
+            vec![],
+            operand_type.clone(),
+            vec![operand_type.clone()],
+            block(
+                vec![Statement::Bind {
+                    slot: Slot::new(0),
+                    value: bits(&bits_of_value(53, 64)),
+                }],
+                Value::Load(Box::new(Value::Reference {
+                    slot: Slot::new(0),
+                    bit_offset: 0,
+                })),
+            ),
+        );
+        let divide = function(
+            "divide",
+            vec![Parameter::new(Slot::new(0)), Parameter::new(Slot::new(1))],
+            Type::Collection(vec![operand_type.clone(), operand_type.clone()]),
+            vec![operand_type.clone(), operand_type.clone()],
+            block(
+                vec![],
+                Value::Intrinsic(
+                    Intrinsic::DivMod,
+                    vec![
+                        Value::Load(Box::new(Value::Reference {
+                            slot: Slot::new(0),
+                            bit_offset: 0,
+                        })),
+                        Value::Call(Label::new("divisor"), vec![]),
+                    ],
+                ),
+            ),
+        );
+        let program = Program::new(vec![divisor, divide]);
+        let (module, identifiers) = compile_for_execution(&program);
+        let divide: extern "C" fn(*mut u8, i64) =
+            unsafe { std::mem::transmute(entry(&module, &identifiers, "divide")) };
+        let mut buffer = [0u8; WIDE_BUFFER_BYTES];
+        divide(buffer.as_mut_ptr(), 100);
+        let all: Vec<bool> = (0..128)
+            .map(|index| buffer[index / 8] >> (index % 8) & 1 == 1)
+            .collect();
+        let quotient = value_of(&all[..64]);
+        let remainder = value_of(&all[64..]);
+        assert_eq!((quotient, remainder), (100 / 53, 100 % 53));
+    }
+
+    #[test]
+    fn emit_object_handles_a_statement_free_cycle() {
+        let first = function(
+            "first",
+            vec![],
+            Type::Bit,
+            vec![],
+            block(vec![], Value::Call(Label::new("second"), vec![])),
+        );
+        let second = function(
+            "second",
+            vec![],
+            Type::Bit,
+            vec![],
+            block(vec![], Value::Call(Label::new("first"), vec![])),
+        );
+        let program = Program::new(vec![first, second]);
+        assert!(emit_object(&program).is_ok());
     }
 
     #[test]

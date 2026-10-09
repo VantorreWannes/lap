@@ -1,4 +1,4 @@
-use lapc_ir::{Block, Function, Intrinsic, Program, Value};
+use lapc_ir::{Block, Function, Intrinsic, Program, Type, Value};
 
 pub fn erase_intrinsics(program: Program) -> Program {
     let functions = program.functions().iter().map(erase_function).collect();
@@ -31,6 +31,11 @@ fn erase_function(function: &Function) -> Function {
     }
     if intrinsic.is_comparison() {
         if !result.is_bit() {
+            return function.clone();
+        }
+    } else if intrinsic == Intrinsic::DivMod {
+        let paired = Type::Collection(vec![operand.clone(), operand.clone()]);
+        if result != paired {
             return function.clone();
         }
     } else if result != operand {
@@ -86,6 +91,7 @@ const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("liblapc.u4.eq", Intrinsic::Eq),
     ("liblapc.u4.lt", Intrinsic::Lt),
     ("liblapc.u4.is.zero", Intrinsic::IsZero),
+    ("liblapc.u4.div.mod", Intrinsic::DivMod),
     ("liblapc.u8.add", Intrinsic::Add),
     ("liblapc.u8.sub", Intrinsic::Sub),
     ("liblapc.u8.mul", Intrinsic::Mul),
@@ -100,6 +106,7 @@ const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("liblapc.u8.eq", Intrinsic::Eq),
     ("liblapc.u8.lt", Intrinsic::Lt),
     ("liblapc.u8.is.zero", Intrinsic::IsZero),
+    ("liblapc.u8.div.mod", Intrinsic::DivMod),
     ("liblapc.u16.add", Intrinsic::Add),
     ("liblapc.u16.sub", Intrinsic::Sub),
     ("liblapc.u16.mul", Intrinsic::Mul),
@@ -114,6 +121,7 @@ const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("liblapc.u16.eq", Intrinsic::Eq),
     ("liblapc.u16.lt", Intrinsic::Lt),
     ("liblapc.u16.is.zero", Intrinsic::IsZero),
+    ("liblapc.u16.div.mod", Intrinsic::DivMod),
     ("liblapc.u32.add", Intrinsic::Add),
     ("liblapc.u32.sub", Intrinsic::Sub),
     ("liblapc.u32.mul", Intrinsic::Mul),
@@ -128,6 +136,7 @@ const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("liblapc.u32.eq", Intrinsic::Eq),
     ("liblapc.u32.lt", Intrinsic::Lt),
     ("liblapc.u32.is.zero", Intrinsic::IsZero),
+    ("liblapc.u32.div.mod", Intrinsic::DivMod),
     ("liblapc.u64.add", Intrinsic::Add),
     ("liblapc.u64.sub", Intrinsic::Sub),
     ("liblapc.u64.mul", Intrinsic::Mul),
@@ -142,6 +151,7 @@ const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("liblapc.u64.eq", Intrinsic::Eq),
     ("liblapc.u64.lt", Intrinsic::Lt),
     ("liblapc.u64.is.zero", Intrinsic::IsZero),
+    ("liblapc.u64.div.mod", Intrinsic::DivMod),
 ];
 
 #[cfg(test)]
@@ -213,6 +223,45 @@ mod tests {
             erased.body().result(),
             Some(Value::Intrinsic(Intrinsic::Eq, arguments)) if arguments.len() == 2
         ));
+    }
+
+    #[test]
+    fn a_division_is_erased_to_a_pair() {
+        let function = Function::new(
+            Label::new("liblapc.u64.div.mod"),
+            vec![Parameter::new(Slot::new(0)), Parameter::new(Slot::new(1))],
+            Type::Collection(vec![
+                Type::Collection(vec![Type::Bit; 64]),
+                Type::Collection(vec![Type::Bit; 64]),
+            ]),
+            vec![Type::Collection(vec![Type::Bit; 64]); 2],
+            Block::new(
+                vec![],
+                Some(Box::new(Value::Constant(BitVector::new(vec![false; 128])))),
+            ),
+        );
+        let program = erase_intrinsics(Program::new(vec![function]));
+        let erased = &program.functions()[0];
+        assert!(matches!(
+            erased.body().result(),
+            Some(Value::Intrinsic(Intrinsic::DivMod, arguments)) if arguments.len() == 2
+        ));
+    }
+
+    #[test]
+    fn a_division_with_an_unpaired_result_is_untouched() {
+        let function = Function::new(
+            Label::new("liblapc.u64.div.mod"),
+            vec![Parameter::new(Slot::new(0)), Parameter::new(Slot::new(1))],
+            Type::Collection(vec![Type::Bit; 64]),
+            vec![Type::Collection(vec![Type::Bit; 64]); 2],
+            Block::new(
+                vec![],
+                Some(Box::new(Value::Constant(BitVector::new(vec![false; 64])))),
+            ),
+        );
+        let program = erase_intrinsics(Program::new(vec![function.clone()]));
+        assert_eq!(program.functions()[0], function);
     }
 
     #[test]

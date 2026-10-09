@@ -82,6 +82,7 @@ pub enum Intrinsic {
     Lt,
     IsZero,
     Select,
+    DivMod,
 }
 
 impl Intrinsic {
@@ -100,7 +101,8 @@ impl Intrinsic {
             | Intrinsic::Sub
             | Intrinsic::Mul
             | Intrinsic::Eq
-            | Intrinsic::Lt => 2,
+            | Intrinsic::Lt
+            | Intrinsic::DivMod => 2,
             Intrinsic::Select => 3,
         }
     }
@@ -269,6 +271,7 @@ mod tests {
         assert_eq!(Intrinsic::Not.arity(), 1);
         assert_eq!(Intrinsic::Add.arity(), 2);
         assert_eq!(Intrinsic::Select.arity(), 3);
+        assert_eq!(Intrinsic::DivMod.arity(), 2);
     }
 
     #[test]
@@ -346,6 +349,7 @@ mod tests {
             Intrinsic::Lt,
             Intrinsic::IsZero,
             Intrinsic::Select,
+            Intrinsic::DivMod,
         ] {
             assert!(intrinsic.arity() >= 1);
         }

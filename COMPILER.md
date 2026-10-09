@@ -49,6 +49,7 @@ An intrinsic is a first-class IR node, not an `EXTERN` call, so later passes sti
 - A miss is never an error. The `NAND` tree is correct, only slower.
 - Erasure applies to values of 64 bits or fewer. A wider function is left as a `NAND` tree.
 - A comparison (`eq`, `lt`, `is.zero`) takes operands of one type and yields a `BIT`. Every other intrinsic yields its operand type.
+- A division (`div.mod`) takes two operands of one type and yields their quotient and remainder as a pair, quotient first. A zero divisor yields two zeroes.
 
 ### Adding an entry
 
@@ -60,6 +61,8 @@ An intrinsic is a first-class IR node, not an `EXTERN` call, so later passes sti
 `lapc` lowers to Cranelift IR and emits an object file. The runtime is C, linked by the system linker. An intrinsic's lowering is a Cranelift IR sequence.
 
 A value of 64 bits or fewer is a word. A wider value is a stack slot. A reference is a pointer to a slot. `NAND` is `and` then `xor`, plus a mask when the width is under 64.
+
+A call whose arguments contain no call and no `EXTERN` is lowered inline when the callee's body is one expression and every block in it holds no statements. A division lowers to a zero-checked divide; a constant divisor lowers to a shift or to a multiply and a shift instead when one exists.
 
 ## Runtime interface
 
