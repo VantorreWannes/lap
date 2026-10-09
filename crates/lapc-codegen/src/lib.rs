@@ -19,7 +19,6 @@ const STACK_SLOT_SLACK: usize = 8;
 const STACK_SLOT_ALIGNMENT_SHIFT: u8 = 3;
 const EXTERN_OUTPUT_SIZE: usize = 2 * STACK_SLOT_SLACK;
 const INLINE_BUDGET: usize = 4096;
-const INLINE_DEPTH_LIMIT: usize = 32;
 const INLINE_SIZE_LIMIT: usize = 64;
 
 pub fn emit_object(program: &Program) -> Result<Vec<u8>, CodegenError> {
@@ -27,7 +26,8 @@ pub fn emit_object(program: &Program) -> Result<Vec<u8>, CodegenError> {
     let builder = ObjectBuilder::new(instruction_set, "lap", default_libcall_names())
         .map_err(|error| CodegenError::new(error.to_string()))?;
     let mut module = ObjectModule::new(builder);
-    lower_selected(&mut module, program, &emitted_labels(program))?;
+    let program = inline_program(program);
+    lower_selected(&mut module, &program, &emitted_labels(&program))?;
     module
         .finish()
         .emit()
@@ -188,6 +188,163 @@ fn lower_function<M: Module>(
     Ok(())
 }
 
+fn inline_program(program: &Program) -> Program {
+    Program::new(
+        program
+            .functions()
+            .iter()
+            .map(|function| inline_function(program, function))
+            .collect(),
+    )
+}
+
+fn inline_function(program: &Program, function: &Function) -> Function {
+    let mut budget = INLINE_BUDGET;
+    let mut expanding = vec![function.label().text().to_string()];
+    let body = inline_block(program, function.body(), &mut expanding, &mut budget);
+    Function::new(
+        function.label().clone(),
+        function.parameters().to_vec(),
+        function.result().clone(),
+        function.slots().to_vec(),
+        body,
+    )
+}
+
+fn inline_block(
+    program: &Program,
+    block: &Block,
+    expanding: &mut Vec<String>,
+    budget: &mut usize,
+) -> Block {
+    let statements = block
+        .statements()
+        .iter()
+        .map(|statement| match statement {
+            Statement::Bind { slot, value } => Statement::Bind {
+                slot: *slot,
+                value: inline_value(program, value, expanding, budget),
+            },
+            Statement::Store { reference, value } => Statement::Store {
+                reference: inline_value(program, reference, expanding, budget),
+                value: inline_value(program, value, expanding, budget),
+            },
+            Statement::Evaluate { value } => Statement::Evaluate {
+                value: inline_value(program, value, expanding, budget),
+            },
+        })
+        .collect();
+    let result = block
+        .result()
+        .map(|result| Box::new(inline_value(program, result, expanding, budget)));
+    Block::new(statements, result)
+}
+
+fn inline_value(
+    program: &Program,
+    value: &Value,
+    expanding: &mut Vec<String>,
+    budget: &mut usize,
+) -> Value {
+    match value {
+        Value::Call(label, arguments) => {
+            let arguments: Vec<Value> = arguments
+                .iter()
+                .map(|argument| inline_value(program, argument, expanding, budget))
+                .collect();
+            let name = label.text();
+            if !expanding.iter().any(|active| active == name) {
+                if let Some(inlined) = inline_call_value(program, name, &arguments, budget) {
+                    expanding.push(name.to_string());
+                    let rewritten = inline_value(program, &inlined, expanding, budget);
+                    expanding.pop();
+                    return rewritten;
+                }
+            }
+            Value::Call(label.clone(), arguments)
+        }
+        Value::Constant(bits) => Value::Constant(bits.clone()),
+        Value::Nand(left, right) => Value::Nand(
+            Box::new(inline_value(program, left, expanding, budget)),
+            Box::new(inline_value(program, right, expanding, budget)),
+        ),
+        Value::Intrinsic(intrinsic, arguments) => Value::Intrinsic(
+            *intrinsic,
+            arguments
+                .iter()
+                .map(|argument| inline_value(program, argument, expanding, budget))
+                .collect(),
+        ),
+        Value::Collection(elements) => Value::Collection(
+            elements
+                .iter()
+                .map(|element| inline_value(program, element, expanding, budget))
+                .collect(),
+        ),
+        Value::Element { collection, index } => Value::Element {
+            collection: Box::new(inline_value(program, collection, expanding, budget)),
+            index: *index,
+        },
+        Value::Reference { .. } => value.clone(),
+        Value::Load(reference) => Value::Load(Box::new(inline_value(
+            program, reference, expanding, budget,
+        ))),
+        Value::Extern(operation, arguments) => Value::Extern(
+            *operation,
+            arguments
+                .iter()
+                .map(|argument| inline_value(program, argument, expanding, budget))
+                .collect(),
+        ),
+        Value::Branch(condition, then, otherwise) => Value::Branch(
+            Box::new(inline_value(program, condition, expanding, budget)),
+            inline_block(program, then, expanding, budget),
+            inline_block(program, otherwise, expanding, budget),
+        ),
+    }
+}
+
+fn inline_call_value(
+    program: &Program,
+    label: &str,
+    arguments: &[Value],
+    budget: &mut usize,
+) -> Option<Value> {
+    let callee = program
+        .functions()
+        .iter()
+        .find(|function| function.label().text() == label)?;
+    if callee.parameters().len() != arguments.len() {
+        return None;
+    }
+    let body = callee.body();
+    if !body.statements().is_empty() {
+        return None;
+    }
+    let result = body.result()?;
+    if !value_is_inline_safe(result) {
+        return None;
+    }
+    let size = value_size(result);
+    if size > INLINE_SIZE_LIMIT || size > *budget {
+        return None;
+    }
+    if arguments.iter().any(|argument| !value_is_pure(argument)) {
+        return None;
+    }
+    let mut bindings = Vec::new();
+    for (parameter, argument) in callee.parameters().iter().zip(arguments) {
+        bindings.push(InlineBinding {
+            parameter: parameter.slot(),
+            parameter_type: callee.slots().get(parameter.slot().index())?.clone(),
+            argument: argument.clone(),
+        });
+    }
+    let substituted = substitute_parameters(result, &bindings)?;
+    *budget -= size;
+    Some(substituted)
+}
+
 fn emitted_labels(program: &Program) -> HashSet<&str> {
     if !program
         .functions()
@@ -271,6 +428,74 @@ fn collect_block_calls<'program>(block: &'program Block, calls: &mut Vec<&'progr
     }
 }
 
+fn promotable_parameters(function: &Function) -> Vec<Slot> {
+    let mut taken = Vec::new();
+    let mut bound = Vec::new();
+    collect_block_targets(function.body(), &mut taken, &mut bound);
+    function
+        .parameters()
+        .iter()
+        .map(|parameter| parameter.slot())
+        .filter(|slot| {
+            function.slots().get(slot.index()).is_some_and(|type_| {
+                !type_.is_reference()
+                    && type_.width() <= 64
+                    && !taken.contains(slot)
+                    && !bound.contains(slot)
+            })
+        })
+        .collect()
+}
+
+fn collect_value_targets(value: &Value, taken: &mut Vec<Slot>, bound: &mut Vec<Slot>) {
+    match value {
+        Value::Load(reference) => {
+            if !matches!(reference.as_ref(), Value::Reference { .. }) {
+                collect_value_targets(reference, taken, bound);
+            }
+        }
+        Value::Reference { slot, .. } => taken.push(*slot),
+        Value::Nand(left, right) => {
+            collect_value_targets(left, taken, bound);
+            collect_value_targets(right, taken, bound);
+        }
+        Value::Intrinsic(_, arguments)
+        | Value::Call(_, arguments)
+        | Value::Extern(_, arguments)
+        | Value::Collection(arguments) => {
+            for argument in arguments {
+                collect_value_targets(argument, taken, bound);
+            }
+        }
+        Value::Element { collection, .. } => collect_value_targets(collection, taken, bound),
+        Value::Branch(condition, then, otherwise) => {
+            collect_value_targets(condition, taken, bound);
+            collect_block_targets(then, taken, bound);
+            collect_block_targets(otherwise, taken, bound);
+        }
+        Value::Constant(_) => {}
+    }
+}
+
+fn collect_block_targets(block: &Block, taken: &mut Vec<Slot>, bound: &mut Vec<Slot>) {
+    for statement in block.statements() {
+        match statement {
+            Statement::Bind { slot, value } => {
+                bound.push(*slot);
+                collect_value_targets(value, taken, bound);
+            }
+            Statement::Store { reference, value } => {
+                collect_value_targets(reference, taken, bound);
+                collect_value_targets(value, taken, bound);
+            }
+            Statement::Evaluate { value } => collect_value_targets(value, taken, bound),
+        }
+    }
+    if let Some(result) = block.result() {
+        collect_value_targets(result, taken, bound);
+    }
+}
+
 struct ProgramSymbols<'program> {
     functions: HashMap<&'program str, FunctionSymbol<'program>>,
     extern_identifier: FuncId,
@@ -321,8 +546,7 @@ struct Lowering<'builder, 'function, 'program, M: Module> {
     output_pointer: Option<CraneliftValue>,
     pointer_type: CraneliftType,
     body_block: Option<CraneliftBlock>,
-    inline_depth: usize,
-    inline_budget: usize,
+    promoted_values: Vec<Option<CraneliftValue>>,
 }
 
 impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'program, M> {
@@ -362,14 +586,15 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
             output_pointer,
             pointer_type,
             body_block: None,
-            inline_depth: 0,
-            inline_budget: INLINE_BUDGET,
+            promoted_values: vec![None; function.slots().len()],
         })
     }
 
     fn lower_body(&mut self) -> Result<(), CodegenError> {
         let function = self.function;
         let parameters = function.parameters().to_vec();
+        let promoted = promotable_parameters(function);
+        let mut initial_arguments = Vec::new();
         for (index, parameter) in parameters.iter().enumerate() {
             let parameter_type = function
                 .slots()
@@ -388,7 +613,11 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
                 } else {
                     self.mask(incoming, parameter_type.width())
                 };
-                self.store_word(storage, word);
+                if promoted.contains(&parameter.slot()) {
+                    initial_arguments.push(BlockArg::Value(word));
+                } else {
+                    self.store_word(storage, word);
+                }
             } else {
                 let destination = self.slot_pointer(storage);
                 let source = BitPointer::Byte {
@@ -400,7 +629,14 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         }
         let result_type = function.result().clone();
         let body_block = self.builder.create_block();
-        self.builder.ins().jump(body_block, &[]);
+        for _ in &promoted {
+            self.builder.append_block_param(body_block, types::I64);
+        }
+        let promoted_block_values = self.builder.block_params(body_block).to_vec();
+        for (slot, value) in promoted.iter().zip(&promoted_block_values) {
+            self.promoted_values[slot.index()] = Some(*value);
+        }
+        self.builder.ins().jump(body_block, &initial_arguments);
         self.builder.switch_to_block(body_block);
         self.body_block = Some(body_block);
         let result = self.lower_block(function.body(), &result_type, true)?;
@@ -943,9 +1179,11 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         }
         if width <= 64 {
             if let Value::Load(reference) = operand {
-                let pointer = self.lower_pointer(reference)?;
-                let pointer = self.pointer_offset(pointer, offset);
-                return Ok(Lowered::Word(self.load_bits(pointer, width)?));
+                if !self.is_promoted_reference(reference) {
+                    let pointer = self.lower_pointer(reference)?;
+                    let pointer = self.pointer_offset(pointer, offset);
+                    return Ok(Lowered::Word(self.load_bits(pointer, width)?));
+                }
             }
         }
         let lowered = self.lower_value(operand, &operand_type)?;
@@ -1005,6 +1243,13 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         if inner.width() != expected.width() {
             return Err(CodegenError::new("a load has the wrong width"));
         }
+        if let Value::Reference { slot, bit_offset } = reference {
+            if *bit_offset == 0 {
+                if let Some(value) = self.promoted_values.get(slot.index()).copied().flatten() {
+                    return Ok(Lowered::Word(value));
+                }
+            }
+        }
         let pointer = self.lower_pointer(reference)?;
         if inner.width() <= 64 {
             Ok(Lowered::Word(self.load_bits(pointer, inner.width())?))
@@ -1026,14 +1271,6 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         arguments: &[Value],
         expected: &Type,
     ) -> Result<Lowered, CodegenError> {
-        if self.inline_depth < INLINE_DEPTH_LIMIT {
-            if let Some(substituted) = self.inline_call(label, arguments)? {
-                self.inline_depth += 1;
-                let lowered = self.lower_value(&substituted, expected);
-                self.inline_depth -= 1;
-                return lowered;
-            }
-        }
         let symbol = self
             .symbols
             .functions
@@ -1097,60 +1334,6 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         }
     }
 
-    fn inline_call(
-        &mut self,
-        label: &str,
-        arguments: &[Value],
-    ) -> Result<Option<Value>, CodegenError> {
-        let symbol = match self.symbols.functions.get(label) {
-            Some(symbol) => symbol,
-            None => return Ok(None),
-        };
-        let callee = symbol.function;
-        if callee.label().text() == self.function.label().text() {
-            return Ok(None);
-        }
-        if callee.parameters().len() != arguments.len() {
-            return Ok(None);
-        }
-        let body = callee.body();
-        if !body.statements().is_empty() {
-            return Ok(None);
-        }
-        let result = match body.result() {
-            Some(result) => result,
-            None => return Ok(None),
-        };
-        if !value_is_inline_safe(result) {
-            return Ok(None);
-        }
-        let size = value_size(result);
-        if size > INLINE_SIZE_LIMIT || size > self.inline_budget {
-            return Ok(None);
-        }
-        if arguments.iter().any(|argument| !value_is_pure(argument)) {
-            return Ok(None);
-        }
-        let mut bindings = Vec::new();
-        for (parameter, argument) in callee.parameters().iter().zip(arguments) {
-            let parameter_type = match callee.slots().get(parameter.slot().index()) {
-                Some(parameter_type) => parameter_type.clone(),
-                None => return Ok(None),
-            };
-            bindings.push(InlineBinding {
-                parameter: parameter.slot(),
-                parameter_type,
-                argument: argument.clone(),
-            });
-        }
-        let substituted = match substitute_parameters(result, &bindings) {
-            Some(substituted) => substituted,
-            None => return Ok(None),
-        };
-        self.inline_budget -= size;
-        Ok(Some(substituted))
-    }
-
     fn lower_self_tail_call(
         &mut self,
         label: &str,
@@ -1180,17 +1363,43 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         for (argument, parameter_type) in arguments.iter().zip(&parameter_types) {
             lowered.push(self.lower_value(argument, parameter_type)?);
         }
+        let mut block_arguments = Vec::new();
         for (parameter, (value, parameter_type)) in
             parameters.iter().zip(lowered.iter().zip(&parameter_types))
         {
-            let storage = self.storage(parameter.slot())?;
-            self.write_slot(storage, *value, parameter_type.width())?;
+            if self.is_promoted_slot(parameter.slot()) {
+                match value {
+                    Lowered::Word(word) => block_arguments
+                        .push(BlockArg::Value(self.mask(*word, parameter_type.width()))),
+                    Lowered::Slot(_) => {
+                        return Err(CodegenError::new("a promoted parameter needs a word"));
+                    }
+                }
+            } else {
+                let storage = self.storage(parameter.slot())?;
+                self.write_slot(storage, *value, parameter_type.width())?;
+            }
         }
         let body_block = self
             .body_block
             .ok_or_else(|| CodegenError::new("a tail call needs a body"))?;
-        self.builder.ins().jump(body_block, &[]);
+        self.builder.ins().jump(body_block, &block_arguments);
         Ok(true)
+    }
+
+    fn is_promoted_slot(&self, slot: Slot) -> bool {
+        self.promoted_values
+            .get(slot.index())
+            .copied()
+            .flatten()
+            .is_some()
+    }
+
+    fn is_promoted_reference(&self, value: &Value) -> bool {
+        match value {
+            Value::Reference { slot, .. } => self.is_promoted_slot(*slot),
+            _ => false,
+        }
     }
 
     fn tail_argument_is_safe(&self, argument: &Value) -> bool {
@@ -1761,6 +1970,9 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
                         None => return Err(CodegenError::new("an intrinsic has no arguments")),
                     };
                     return Ok(Type::Collection(vec![operand.clone(), operand]));
+                }
+                if intrinsic.is_comparison() {
+                    return Ok(Type::Bit);
                 }
                 match arguments.first() {
                     Some(argument) => self.type_of(argument),
@@ -3987,6 +4199,72 @@ mod tests {
         let program = Program::new(vec![first, second]);
         let expected: HashSet<&str> = ["first", "second"].into_iter().collect();
         assert_eq!(emitted_labels(&program), expected);
+    }
+
+    #[test]
+    fn inlining_removes_a_wrapper_from_the_call_graph() {
+        let wrapper = function(
+            "wrapper",
+            vec![Parameter::new(Slot::new(0))],
+            Type::Bit,
+            vec![Type::Bit],
+            block(
+                vec![],
+                Value::Intrinsic(
+                    Intrinsic::Not,
+                    vec![Value::Load(Box::new(Value::Reference {
+                        slot: Slot::new(0),
+                        bit_offset: 0,
+                    }))],
+                ),
+            ),
+        );
+        let main = function(
+            "main",
+            vec![],
+            Type::Bit,
+            vec![],
+            block(vec![], Value::Call(Label::new("wrapper"), vec![bit(false)])),
+        );
+        let program = Program::new(vec![wrapper, main]);
+        let rewritten = inline_program(&program);
+        let expected: HashSet<&str> = ["main"].into_iter().collect();
+        assert_eq!(emitted_labels(&rewritten), expected);
+    }
+
+    #[test]
+    fn an_impure_argument_keeps_its_callee() {
+        let operand_type = Type::Collection(vec![Type::Bit, Type::Collection(vec![Type::Bit; 8])]);
+        let wrapper = function(
+            "wrapper",
+            vec![Parameter::new(Slot::new(0))],
+            operand_type.clone(),
+            vec![operand_type.clone()],
+            block(
+                vec![],
+                Value::Load(Box::new(Value::Reference {
+                    slot: Slot::new(0),
+                    bit_offset: 0,
+                })),
+            ),
+        );
+        let main = function(
+            "main",
+            vec![],
+            operand_type,
+            vec![],
+            block(
+                vec![],
+                Value::Call(
+                    Label::new("wrapper"),
+                    vec![Value::Extern(Operation::new(0x0400), vec![])],
+                ),
+            ),
+        );
+        let program = Program::new(vec![wrapper, main]);
+        let rewritten = inline_program(&program);
+        let expected: HashSet<&str> = ["main", "wrapper"].into_iter().collect();
+        assert_eq!(emitted_labels(&rewritten), expected);
     }
 
     #[test]
