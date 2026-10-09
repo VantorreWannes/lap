@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/lapc-ast",
+    "crates/lapc-parse",
+    "crates/lapc-ir",
+    "crates/lapc-extern",
+    "crates/lapc-check",
+    "crates/lapc-erase",
+    "crates/lapc-codegen",
+    "crates/lapc-driver",
+]

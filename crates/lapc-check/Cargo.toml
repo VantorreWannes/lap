@@ -1,0 +1,12 @@
+[package]
+name = "lapc-check"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lapc-ast = { path = "../lapc-ast" }
+lapc-ir = { path = "../lapc-ir" }
+lapc-extern = { path = "../lapc-extern" }
+
+[dev-dependencies]
+lapc-parse = { path = "../lapc-parse" }

@@ -12,6 +12,12 @@
 
 `lapc` takes one or more files and appends them in the order given, top to bottom. The result is one program.
 
+`lapc check` checks a program. `lapc build` emits an object and links it with the runtime using `cc`, or `CC` when set. On Linux the link passes `-no-pie`, because the object reaches `lap_extern` through an absolute address.
+
+## Structure
+
+`lapc` is a workspace of libraries and one binary. Each stage is a crate: `lapc-ast`, `lapc-parse`, `lapc-ir`, `lapc-check`, `lapc-erase`, `lapc-codegen`, and `lapc-driver`. A stage is swapped by swapping its crate, not by replacing a binary.
+
 ## Operation erasure
 
 Every operation in Lap is a `NAND` tree, so arithmetic written as a library is slow unless the compiler recognizes it. Erasure is that recognition: a function whose label is in the table is replaced by a native operation.
@@ -51,15 +57,23 @@ An intrinsic is a first-class IR node, not an `EXTERN` call, so later passes sti
 
 `lapc` lowers to Cranelift IR and emits an object file. The runtime is C, linked by the system linker. An intrinsic's lowering is a Cranelift IR sequence.
 
+A value of 64 bits or fewer is a word. A wider value is a stack slot. A reference is a pointer to a slot. `NAND` is `and` then `xor`, plus a mask when the width is under 64.
+
 ## Runtime interface
 
-The runtime provides the operations in [EXTERN.md](EXTERN.md) and the program's entry and exit. It is C: it calls the exported `lap_main` and provides `lap_extern`.
+The runtime provides the operations in [EXTERN.md](EXTERN.md) and the program's entry and exit. It is C: it calls the exported `lap_main` and provides `lap_extern`, which takes the operation, up to four words, and an out buffer.
 
 - `main` is the entry point. It takes no parameters and returns a determinate `BIT`: `BIT.ZERO` exits with status 0, `BIT.ONE` with status 1. `process.exit` overrides it.
-- The stack grows downward. A tail call may reuse the caller's frame only when no reference to a local of that frame is passed.
+- The stack grows downward. A self-tail-call is a jump to the body, so it does not grow the stack. It is a jump only when no argument is a reference to a local of that frame; a reference to a reference parameter is passed through.
 - The runtime owns the handle table, the stream buffers, the clocks, and the entropy source. [EXTERN.md](EXTERN.md) owns their contracts.
+
+## Limits
+
+`lapc` imposes no limit on the size of a type, a value, or a program beyond memory. The stack bounds a value wider than 64 bits and non-tail recursion.
 
 ## Diagnostics
 
 - A determinacy error must name the source: a bare `BIT`, an unwritten slot, or an unchecked `EXTERN` payload.
 - An `EXTERN` error must name the cause: an unknown operation, a wrong argument count, a width mismatch, or a result that does not match its context.
+
+A store through a reference must be determinate, because the target may be the caller's slot. A call with a reference argument leaves the target determinate but unknown.

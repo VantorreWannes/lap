@@ -1,0 +1,18 @@
+[package]
+name = "lapc-driver"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "lapc"
+path = "src/main.rs"
+
+[dependencies]
+lapc-ast = { path = "../lapc-ast" }
+lapc-parse = { path = "../lapc-parse" }
+lapc-ir = { path = "../lapc-ir" }
+lapc-extern = { path = "../lapc-extern" }
+lapc-check = { path = "../lapc-check" }
+lapc-erase = { path = "../lapc-erase" }
+lapc-codegen = { path = "../lapc-codegen" }
+clap = { version = "4.6.7", features = ["derive"] }

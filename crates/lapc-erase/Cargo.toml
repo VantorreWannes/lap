@@ -1,0 +1,10 @@
+[package]
+name = "lapc-erase"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lapc-ir = { path = "../lapc-ir" }
+
+[dev-dependencies]
+lapc-ast = { path = "../lapc-ast" }

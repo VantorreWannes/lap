@@ -1,0 +1,8 @@
+[package]
+name = "lapc-ir"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lapc-ast = { path = "../lapc-ast" }
+lapc-extern = { path = "../lapc-extern" }
