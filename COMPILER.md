@@ -62,11 +62,11 @@ An intrinsic is a first-class IR node, not an `EXTERN` call, so later passes sti
 
 A value of 64 bits or fewer is a word. A wider value is a stack slot. A reference is a pointer to a slot. `NAND` is `and` then `xor`, plus a mask when the width is under 64.
 
-A call whose arguments contain no call and no `EXTERN` is lowered inline when the callee's body is one expression and every block in it holds no statements. A word parameter whose address is never taken is carried across a self-tail call instead of its stack slot. A division lowers to a zero-checked divide; a constant divisor lowers to a shift or to a multiply and a shift instead when one exists. Only functions reachable from `main` are emitted; a program without `main` emits every function.
+A call whose arguments contain no call and no `EXTERN` is lowered inline when the callee's body is one expression and every block in it holds no statements. A word parameter whose address is never taken is carried across a self-tail call instead of its stack slot. A division lowers to a zero-checked divide; a constant divisor lowers to a shift or to a multiply and a shift instead when one exists. A multiply by a constant lowers to a short sequence of shifts and adds when one exists. Only functions reachable from `main` are emitted; a program without `main` emits every function.
 
 ## Runtime interface
 
-The runtime provides the operations in [EXTERN.md](EXTERN.md) and the program's entry and exit. It is C: it calls the exported `lap_main` and provides `lap_extern`, which takes the operation, up to four words, and an out buffer.
+The runtime provides the operations in [EXTERN.md](EXTERN.md) and the program's entry and exit. It is C: it calls the exported `lap_main` and provides one entry point per operation, named `lap_extern_` followed by the table label with dots replaced by underscores, such as `lap_extern_memory_acquire`. An entry point takes the operation's arguments followed by an out buffer, so a lowered call reaches its operation directly. `lap_extern` dispatches by value for callers that need it: it takes the operation, up to four words, and an out buffer.
 
 - `main` is the entry point. It takes no parameters and returns a determinate `BIT`: `BIT.ZERO` exits with status 0, `BIT.ONE` with status 1. `process.exit` overrides it.
 - The stack grows downward. A self-tail-call is a jump to the body, so it does not grow the stack. It is a jump only when no argument is a reference to a local of that frame; a reference to a reference parameter is passed through.

@@ -19,6 +19,12 @@
 extern void lap_extern(uint64_t operation, uint64_t argument0,
                        uint64_t argument1, uint64_t argument2,
                        uint64_t argument3, uint64_t *out);
+extern void lap_extern_stream_read_block(uint64_t handle, uint64_t block,
+                                         uint64_t offset, uint64_t length,
+                                         uint64_t *out);
+extern void lap_extern_stream_write_block(uint64_t handle, uint64_t block,
+                                          uint64_t offset, uint64_t length,
+                                          uint64_t *out);
 extern bool lap_runtime_start(int argument_count, char **argument_values);
 extern void lap_runtime_finish(void);
 
@@ -33,6 +39,8 @@ enum {
   OPERATION_STREAM_WRITE = 0x0202,
   OPERATION_STREAM_FLUSH = 0x0203,
   OPERATION_STREAM_CLOSE = 0x0204,
+  OPERATION_STREAM_READ_BLOCK = 0x0205,
+  OPERATION_STREAM_WRITE_BLOCK = 0x0206,
   OPERATION_CLOCK_MONOTONIC = 0x0300,
   OPERATION_CLOCK_REALTIME = 0x0301,
   OPERATION_RANDOM_BYTE = 0x0400,
@@ -127,6 +135,16 @@ static void flush_stream(uint64_t stream) {
 
 static void close_stream(uint64_t stream) {
   succeeds(OPERATION_STREAM_CLOSE, stream, 0, 0, 0);
+}
+
+static uint64_t read_stream_block(uint64_t stream, uint64_t block,
+                                  uint64_t offset, uint64_t length) {
+  return succeeds(OPERATION_STREAM_READ_BLOCK, stream, block, offset, length);
+}
+
+static void write_stream_block(uint64_t stream, uint64_t block,
+                               uint64_t offset, uint64_t length) {
+  succeeds(OPERATION_STREAM_WRITE_BLOCK, stream, block, offset, length);
 }
 
 static uint64_t path_block(const char *path) {
@@ -559,6 +577,87 @@ static void test_stream_refill_reading(void) {
   unlink(path);
 }
 
+static void test_stream_block_transfer(void) {
+  char path[PATH_CAPACITY];
+  temporary_path(path, sizeof path, "block");
+  uint64_t path_handle = path_block(path);
+  uint64_t path_length = (uint64_t)strlen(path);
+
+  static unsigned char content[REFILL_FILE_SIZE];
+  for (size_t index = 0; index < sizeof content; index++) {
+    content[index] = (unsigned char)(index * 31 + 5);
+  }
+  uint64_t block = acquire_block(sizeof content);
+  for (size_t index = 0; index < sizeof content; index++) {
+    write_block(block, index, content[index]);
+  }
+
+  uint64_t writer = open_stream(path_handle, 0, path_length, STREAM_MODE_WRITE);
+  fails(OPERATION_STREAM_WRITE_BLOCK, writer, block, sizeof content, 1);
+  fails(OPERATION_STREAM_WRITE_BLOCK, writer, block, 1, sizeof content);
+  fails(OPERATION_STREAM_WRITE_BLOCK, writer, UINT64_MAX, 0, 1);
+  fails(OPERATION_STREAM_WRITE_BLOCK, UINT64_MAX, block, 0, 1);
+  uint64_t payloads[2];
+  lap_extern_stream_write_block(writer, block, 0, 0, payloads);
+  assert(payloads[0] == 1);
+  write_stream_block(writer, block, 0, 100);
+  assert(file_size(path) == 0);
+  write_stream_block(writer, block, 100, sizeof content - 100);
+  flush_stream(writer);
+  assert(file_size(path) == REFILL_FILE_SIZE);
+  close_stream(writer);
+  fails(OPERATION_STREAM_WRITE_BLOCK, writer, block, 0, 0);
+
+  uint64_t reader = open_stream(path_handle, 0, path_length, STREAM_MODE_READ);
+  uint64_t destination = acquire_block(sizeof content + 1);
+  assert(read_stream(reader) == content[0]);
+  assert(read_stream(reader) == content[1]);
+  uint64_t count =
+      read_stream_block(reader, destination, 1, sizeof content - 2);
+  assert(count == sizeof content - 2);
+  for (size_t index = 2; index < sizeof content; index++) {
+    assert(read_block(destination, index - 1) == content[index]);
+  }
+  fails(OPERATION_STREAM_READ_BLOCK, reader, destination, 0, 1);
+  fails(OPERATION_STREAM_READ_BLOCK, reader, destination, 1, sizeof content + 1);
+  fails(OPERATION_STREAM_READ_BLOCK, reader, UINT64_MAX, 0, 1);
+  lap_extern_stream_read_block(reader, destination, 0, 0, payloads);
+  assert(payloads[0] == 1);
+  assert(payloads[1] == 0);
+  close_stream(reader);
+
+  reader = open_stream(path_handle, 0, path_length, STREAM_MODE_READ);
+  count = read_stream_block(reader, destination, 0, sizeof content + 1);
+  assert(count == REFILL_FILE_SIZE);
+  for (size_t index = 0; index < sizeof content; index++) {
+    assert(read_block(destination, index) == content[index]);
+  }
+  close_stream(reader);
+  unlink(path);
+
+  char error_path[PATH_CAPACITY];
+  temporary_path(error_path, sizeof error_path, "block-error");
+  int saved = dup(STREAM_STANDARD_ERROR);
+  assert(saved >= 0);
+  int descriptor =
+      open(error_path, binary_flags(O_WRONLY | O_CREAT | O_TRUNC), 0666);
+  assert(descriptor >= 0);
+  assert(dup2(descriptor, STREAM_STANDARD_ERROR) >= 0);
+  close(descriptor);
+  write_stream_block(STREAM_STANDARD_ERROR, block, 0, 16);
+  assert(file_size(error_path) == 16);
+  unsigned char bytes[16];
+  assert(read_file(error_path, bytes, sizeof bytes) == 16);
+  assert(memcmp(bytes, content, sizeof bytes) == 0);
+  assert(dup2(saved, STREAM_STANDARD_ERROR) >= 0);
+  close(saved);
+
+  release_block(destination);
+  release_block(block);
+  release_block(path_handle);
+  unlink(error_path);
+}
+
 static void test_clock_and_random(void) {
   uint64_t previous = succeeds(OPERATION_CLOCK_MONOTONIC, 0, 0, 0, 0);
   for (int index = 0; index < 32; index++) {
@@ -582,7 +681,7 @@ static void test_unknown_operations(void) {
   fails(0x0001, 0, 0, 0, 0);
   fails(0x0002, 0, 0, 0, 0);
   fails(0x0104, 0, 0, 0, 0);
-  fails(0x0205, 0, 0, 0, 0);
+  fails(0x0207, 0, 0, 0, 0);
   fails(0x0302, 0, 0, 0, 0);
   fails(0x0401, 0, 0, 0, 0);
   fails(0x8000, 0, 0, 0, 0);
@@ -655,6 +754,7 @@ int main(int argument_count, char **argument_values) {
   test_independent_stream_buffers();
   test_stream_table_growth();
   test_stream_refill_reading();
+  test_stream_block_transfer();
 #ifndef _WIN32
   test_flush_failure_discards_buffer();
 #endif

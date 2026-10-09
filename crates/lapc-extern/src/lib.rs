@@ -103,6 +103,18 @@ pub const OPERATIONS: &[OperationSpecification] = &[
         payload_widths: &[],
     },
     OperationSpecification {
+        operation: Operation(0x0205),
+        name: "stream.read.block",
+        argument_widths: &[64, 64, 64, 64],
+        payload_widths: &[64],
+    },
+    OperationSpecification {
+        operation: Operation(0x0206),
+        name: "stream.write.block",
+        argument_widths: &[64, 64, 64, 64],
+        payload_widths: &[],
+    },
+    OperationSpecification {
         operation: Operation(0x0300),
         name: "clock.monotonic",
         argument_widths: &[],

@@ -28,6 +28,8 @@ enum {
   OPERATION_STREAM_WRITE = 0x0202,
   OPERATION_STREAM_FLUSH = 0x0203,
   OPERATION_STREAM_CLOSE = 0x0204,
+  OPERATION_STREAM_READ_BLOCK = 0x0205,
+  OPERATION_STREAM_WRITE_BLOCK = 0x0206,
   OPERATION_CLOCK_MONOTONIC = 0x0300,
   OPERATION_CLOCK_REALTIME = 0x0301,
   OPERATION_RANDOM_BYTE = 0x0400,
@@ -259,6 +261,79 @@ static bool stream_read_byte(struct stream_entry *stream, unsigned char *byte) {
   stream->read_length = (uint64_t)result;
   *byte = stream->read_bytes[stream->read_offset];
   stream->read_offset++;
+  return true;
+}
+
+static bool stream_read_block(struct stream_entry *stream, uint64_t handle,
+                              uint64_t offset, uint64_t length,
+                              uint64_t *count) {
+  struct memory_entry *block = memory_entry_for_handle(handle);
+  if (block == NULL || offset > block->length ||
+      length > block->length - offset) {
+    return false;
+  }
+  uint64_t total = 0;
+  while (total < length) {
+    if (stream->read_offset < stream->read_length) {
+      uint64_t available = stream->read_length - stream->read_offset;
+      uint64_t wanted = length - total;
+      uint64_t taken = available < wanted ? available : wanted;
+      memcpy(block->bytes + offset + total,
+             stream->read_bytes + stream->read_offset, taken);
+      stream->read_offset += taken;
+      total += taken;
+      continue;
+    }
+    if (stream->descriptor < 0) {
+      break;
+    }
+    ssize_t result;
+    do {
+      result = read(stream->descriptor, block->bytes + offset + total,
+                    length - total);
+    } while (result < 0 && errno == EINTR);
+    if (result <= 0) {
+      break;
+    }
+    total += (uint64_t)result;
+  }
+  *count = total;
+  return total > 0 || length == 0;
+}
+
+static bool stream_write_block(struct stream_entry *stream, uint64_t handle,
+                               uint64_t offset, uint64_t length) {
+  struct memory_entry *block = memory_entry_for_handle(handle);
+  if (block == NULL || offset > block->length ||
+      length > block->length - offset) {
+    return false;
+  }
+  const unsigned char *source = block->bytes + offset;
+  uint64_t written = 0;
+  while (written < length) {
+    if (stream->unbuffered) {
+      ssize_t result;
+      do {
+        result = write(stream->descriptor, source + written, length - written);
+      } while (result < 0 && errno == EINTR);
+      if (result <= 0) {
+        return false;
+      }
+      written += (uint64_t)result;
+      continue;
+    }
+    if (stream->write_length == stream->write_capacity) {
+      if (!stream_flush(stream)) {
+        return false;
+      }
+    }
+    uint64_t space = stream->write_capacity - stream->write_length;
+    uint64_t wanted = length - written;
+    uint64_t moved = space < wanted ? space : wanted;
+    memcpy(stream->write_bytes + stream->write_length, source + written, moved);
+    stream->write_length += moved;
+    written += moved;
+  }
   return true;
 }
 
@@ -498,101 +573,200 @@ bool lap_runtime_start(int argument_count, char **argument_values) {
 
 void lap_runtime_finish(void) { flush_all_streams(); }
 
-void lap_extern(uint64_t operation, uint64_t argument0, uint64_t argument1,
-                uint64_t argument2, uint64_t argument3, uint64_t *out) {
+void lap_extern_process_exit(uint64_t status, uint64_t *out) {
   out[0] = 0;
   out[1] = 0;
+  flush_all_streams();
+  exit((int)(status & 0xFF));
+}
+
+void lap_extern_memory_acquire(uint64_t length, uint64_t *out) {
+  out[0] = 0;
+  out[1] = 0;
+  uint64_t handle;
+  if (memory_acquire(length, &handle)) {
+    report_success(out, handle);
+  }
+}
+
+void lap_extern_memory_release(uint64_t handle, uint64_t *out) {
+  out[0] = 0;
+  out[1] = 0;
+  if (memory_release(handle)) {
+    report_success(out, 0);
+  }
+}
+
+void lap_extern_memory_read(uint64_t handle, uint64_t offset, uint64_t *out) {
+  out[0] = 0;
+  out[1] = 0;
+  unsigned char byte;
+  if (memory_read(handle, offset, &byte)) {
+    report_success(out, (uint64_t)byte);
+  }
+}
+
+void lap_extern_memory_write(uint64_t handle, uint64_t offset, uint64_t byte,
+                             uint64_t *out) {
+  out[0] = 0;
+  out[1] = 0;
+  if (memory_write(handle, offset, (unsigned char)(byte & 0xFF))) {
+    report_success(out, 0);
+  }
+}
+
+void lap_extern_stream_open(uint64_t path_handle, uint64_t path_offset,
+                            uint64_t path_length, uint64_t mode,
+                            uint64_t *out) {
+  out[0] = 0;
+  out[1] = 0;
+  uint64_t handle;
+  if (stream_open(path_handle, path_offset, path_length, mode, &handle)) {
+    report_success(out, handle);
+  }
+}
+
+void lap_extern_stream_read(uint64_t handle, uint64_t *out) {
+  out[0] = 0;
+  out[1] = 0;
+  struct stream_entry *stream = stream_entry_for_handle(handle);
+  unsigned char byte;
+  if (stream != NULL && stream->readable && stream_read_byte(stream, &byte)) {
+    report_success(out, (uint64_t)byte);
+  }
+}
+
+void lap_extern_stream_write(uint64_t handle, uint64_t byte, uint64_t *out) {
+  out[0] = 0;
+  out[1] = 0;
+  struct stream_entry *stream = stream_entry_for_handle(handle);
+  if (stream != NULL && stream->writable &&
+      stream_write_byte(stream, (unsigned char)(byte & 0xFF))) {
+    report_success(out, 0);
+  }
+}
+
+void lap_extern_stream_flush(uint64_t handle, uint64_t *out) {
+  out[0] = 0;
+  out[1] = 0;
+  struct stream_entry *stream = stream_entry_for_handle(handle);
+  if (stream != NULL && stream_flush(stream)) {
+    report_success(out, 0);
+  }
+}
+
+void lap_extern_stream_close(uint64_t handle, uint64_t *out) {
+  out[0] = 0;
+  out[1] = 0;
+  struct stream_entry *stream = stream_entry_for_handle(handle);
+  if (stream != NULL && stream_close(stream)) {
+    report_success(out, 0);
+  }
+}
+
+void lap_extern_stream_read_block(uint64_t handle, uint64_t block_handle,
+                                  uint64_t offset, uint64_t length,
+                                  uint64_t *out) {
+  out[0] = 0;
+  out[1] = 0;
+  struct stream_entry *stream = stream_entry_for_handle(handle);
+  uint64_t count;
+  if (stream != NULL && stream->readable &&
+      stream_read_block(stream, block_handle, offset, length, &count)) {
+    report_success(out, count);
+  }
+}
+
+void lap_extern_stream_write_block(uint64_t handle, uint64_t block_handle,
+                                   uint64_t offset, uint64_t length,
+                                   uint64_t *out) {
+  out[0] = 0;
+  out[1] = 0;
+  struct stream_entry *stream = stream_entry_for_handle(handle);
+  if (stream != NULL && stream->writable &&
+      stream_write_block(stream, block_handle, offset, length)) {
+    report_success(out, 0);
+  }
+}
+
+void lap_extern_clock_monotonic(uint64_t *out) {
+  out[0] = 0;
+  out[1] = 0;
+  uint64_t nanoseconds;
+  if (clock_monotonic(&nanoseconds)) {
+    report_success(out, nanoseconds);
+  }
+}
+
+void lap_extern_clock_realtime(uint64_t *out) {
+  out[0] = 0;
+  out[1] = 0;
+  uint64_t nanoseconds;
+  if (clock_realtime(&nanoseconds)) {
+    report_success(out, nanoseconds);
+  }
+}
+
+void lap_extern_random_byte(uint64_t *out) {
+  out[0] = 0;
+  out[1] = 0;
+  unsigned char byte;
+  if (random_byte(&byte)) {
+    report_success(out, (uint64_t)byte);
+  }
+}
+
+void lap_extern(uint64_t operation, uint64_t argument0, uint64_t argument1,
+                uint64_t argument2, uint64_t argument3, uint64_t *out) {
   switch (operation) {
-  case OPERATION_PROCESS_EXIT: {
-    flush_all_streams();
-    exit((int)(argument0 & 0xFF));
-  }
-  case OPERATION_MEMORY_ACQUIRE: {
-    uint64_t handle;
-    if (memory_acquire(argument0, &handle)) {
-      report_success(out, handle);
-    }
+  case OPERATION_PROCESS_EXIT:
+    lap_extern_process_exit(argument0, out);
     break;
-  }
-  case OPERATION_MEMORY_RELEASE: {
-    if (memory_release(argument0)) {
-      report_success(out, 0);
-    }
+  case OPERATION_MEMORY_ACQUIRE:
+    lap_extern_memory_acquire(argument0, out);
     break;
-  }
-  case OPERATION_MEMORY_READ: {
-    unsigned char byte;
-    if (memory_read(argument0, argument1, &byte)) {
-      report_success(out, (uint64_t)byte);
-    }
+  case OPERATION_MEMORY_RELEASE:
+    lap_extern_memory_release(argument0, out);
     break;
-  }
-  case OPERATION_MEMORY_WRITE: {
-    if (memory_write(argument0, argument1, (unsigned char)(argument2 & 0xFF))) {
-      report_success(out, 0);
-    }
+  case OPERATION_MEMORY_READ:
+    lap_extern_memory_read(argument0, argument1, out);
     break;
-  }
-  case OPERATION_STREAM_OPEN: {
-    uint64_t handle;
-    if (stream_open(argument0, argument1, argument2, argument3, &handle)) {
-      report_success(out, handle);
-    }
+  case OPERATION_MEMORY_WRITE:
+    lap_extern_memory_write(argument0, argument1, argument2, out);
     break;
-  }
-  case OPERATION_STREAM_READ: {
-    struct stream_entry *stream = stream_entry_for_handle(argument0);
-    unsigned char byte;
-    if (stream != NULL && stream->readable && stream_read_byte(stream, &byte)) {
-      report_success(out, (uint64_t)byte);
-    }
+  case OPERATION_STREAM_OPEN:
+    lap_extern_stream_open(argument0, argument1, argument2, argument3, out);
     break;
-  }
-  case OPERATION_STREAM_WRITE: {
-    struct stream_entry *stream = stream_entry_for_handle(argument0);
-    if (stream != NULL && stream->writable &&
-        stream_write_byte(stream, (unsigned char)(argument1 & 0xFF))) {
-      report_success(out, 0);
-    }
+  case OPERATION_STREAM_READ:
+    lap_extern_stream_read(argument0, out);
     break;
-  }
-  case OPERATION_STREAM_FLUSH: {
-    struct stream_entry *stream = stream_entry_for_handle(argument0);
-    if (stream != NULL && stream_flush(stream)) {
-      report_success(out, 0);
-    }
+  case OPERATION_STREAM_WRITE:
+    lap_extern_stream_write(argument0, argument1, out);
     break;
-  }
-  case OPERATION_STREAM_CLOSE: {
-    struct stream_entry *stream = stream_entry_for_handle(argument0);
-    if (stream != NULL && stream_close(stream)) {
-      report_success(out, 0);
-    }
+  case OPERATION_STREAM_FLUSH:
+    lap_extern_stream_flush(argument0, out);
     break;
-  }
-  case OPERATION_CLOCK_MONOTONIC: {
-    uint64_t nanoseconds;
-    if (clock_monotonic(&nanoseconds)) {
-      report_success(out, nanoseconds);
-    }
+  case OPERATION_STREAM_CLOSE:
+    lap_extern_stream_close(argument0, out);
     break;
-  }
-  case OPERATION_CLOCK_REALTIME: {
-    uint64_t nanoseconds;
-    if (clock_realtime(&nanoseconds)) {
-      report_success(out, nanoseconds);
-    }
+  case OPERATION_STREAM_READ_BLOCK:
+    lap_extern_stream_read_block(argument0, argument1, argument2, argument3, out);
     break;
-  }
-  case OPERATION_RANDOM_BYTE: {
-    unsigned char byte;
-    if (random_byte(&byte)) {
-      report_success(out, (uint64_t)byte);
-    }
+  case OPERATION_STREAM_WRITE_BLOCK:
+    lap_extern_stream_write_block(argument0, argument1, argument2, argument3, out);
     break;
-  }
-  default: {
+  case OPERATION_CLOCK_MONOTONIC:
+    lap_extern_clock_monotonic(out);
     break;
-  }
+  case OPERATION_CLOCK_REALTIME:
+    lap_extern_clock_realtime(out);
+    break;
+  case OPERATION_RANDOM_BYTE:
+    lap_extern_random_byte(out);
+    break;
+  default:
+    out[0] = 0;
+    out[1] = 0;
+    break;
   }
 }

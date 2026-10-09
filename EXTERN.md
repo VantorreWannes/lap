@@ -8,7 +8,7 @@ This document owns the set of `EXTERN` operations `lapc` supports, and the contr
 
 `EXTERN` is the only exit from the language, so this table is the whole of what a Lap program can observe or affect.
 
-An operation earns a place in the table only when Lap cannot express it. Everything a program can build from the table belongs in a library.
+An operation earns a place in the table when Lap cannot express it, or when a loop that expresses it moves one byte per call and the call is the cost the program pays. Everything else a program can build from the table belongs in a library.
 
 ## Call shape
 
@@ -52,17 +52,15 @@ An invalid handle, a released handle, or an out-of-range access is a failure, ne
 
 ## Granularity
 
-An operation transfers one byte. A bulk form is a library loop over the single-byte form.
+A byte is the floor: the runtime's memory and streams are byte-addressed, and a bit-level operation would be a read, a mask, and a write, which is library code with no runtime meaning.
 
-Byte is the floor because the runtime's memory and streams are byte-addressed. A bit-level operation would be a read, a mask, and a write, which is library code with no runtime meaning.
-
-A transfer of N bytes is N calls. The ordering rule forbids a compiler from merging them, so the runtime is what makes a call cheap. See [Buffering](#buffering).
+`stream.read.block` and `stream.write.block` move a byte range between a stream and a block. The per-byte loop that expresses the same transfer pays one call per byte, and the ordering rule forbids a compiler from merging those calls, so the table carries the bulk form and the byte stays the unit of every primitive. See [Buffering](#buffering).
 
 ## Buffering
 
-A call is not a syscall. A memory operation reads or writes a runtime-owned block directly. A stream operation moves one byte between the program and a runtime-owned buffer, and only a full buffer, a flush, or a close reaches the operating system.
+A call is not a syscall. A memory operation reads or writes a runtime-owned block directly. A stream operation moves one byte between the program and a runtime-owned buffer, and only a full buffer, a flush, or a close reaches the operating system. A block operation moves its whole range through the same buffer.
 
-A library loop that writes N bytes therefore costs N calls and N divided by buffer size syscalls.
+A library loop that writes N bytes therefore costs N calls and N divided by buffer size syscalls. One `stream.write.block` costs one call.
 
 Buffering is a property of the runtime, not a compiler transformation. Every call the program writes is still executed, in order. The ordering rule is unaffected.
 
@@ -70,7 +68,7 @@ Buffer size is unspecified and at least one byte. A program cannot observe it ex
 
 ### Write durability
 
-Success from `stream.write` means the byte is buffered. Only success from `stream.flush` means the buffered bytes reached the operating system.
+Success from `stream.write` or `stream.write.block` means the bytes are buffered. Only success from `stream.flush` means the buffered bytes reached the operating system.
 
 A device failure can therefore surface at a later `stream.write` or at `stream.flush`, not at the call that supplied the byte. A program that needs to know a byte landed must flush.
 
@@ -92,7 +90,7 @@ Across two streams, relative order is guaranteed only at a flush. Interleaved wr
 
 ### Reading
 
-The runtime reads ahead into a buffer and `stream.read` takes one byte from it. A refill returns whatever is available and never waits for a full buffer, so an interactive stream stays responsive.
+The runtime reads ahead into a buffer and `stream.read` takes one byte from it. A refill returns whatever is available and never waits for a full buffer, so an interactive stream stays responsive. `stream.read.block` drains the buffer first and then reads directly into the block, requesting no more than the block range holds.
 
 Read-ahead consumes bytes from the operating system before the program asks for them. A stream handed to another program after a partial read is a non-goal.
 
@@ -129,6 +127,8 @@ Widths are in bits. Every result begins with the status bit, so only payload fie
 | `stream.write`    | `0x0202` | stream 64, byte 8                           | none           |
 | `stream.flush`    | `0x0203` | stream 64                                   | none           |
 | `stream.close`    | `0x0204` | stream 64                                   | none           |
+| `stream.read.block` | `0x0205` | stream 64, block 64, offset 64, length 64 | count 64       |
+| `stream.write.block` | `0x0206` | stream 64, block 64, offset 64, length 64 | none           |
 | `clock.monotonic` | `0x0300` | none                                        | nanoseconds 64 |
 | `clock.realtime`  | `0x0301` | none                                        | nanoseconds 64 |
 | `random.byte`     | `0x0400` | none                                        | byte 8         |
@@ -141,7 +141,9 @@ A path is a byte range in a block, so the table needs no string type. Mode 0 is 
 
 Streams 0, 1, 2, and 3 are open at entry. The first three are standard input, output, and error. Stream 3 is read-only and carries the program's arguments, each terminated by a zero byte.
 
-`stream.read` fails at end of stream. Failure carries no detail, so end of stream and a device error are the same observation.
+`stream.read` fails at end of stream. Failure carries no detail, so end of stream and a device error are the same observation. `stream.read.block` fails only when no byte is available and `length` is not zero; a range it only partly fills succeeds with the count it took. `stream.write.block` buffers every byte of its range.
+
+A block transfer fails on an invalid stream, an invalid block, or a range outside the block, and it leaves the block unchanged on failure.
 
 `stream.flush` on a read-only stream succeeds and does nothing. `stream.close` flushes, and reports a flush failure as its own failure.
 
@@ -156,8 +158,7 @@ These have no table entry because a program can build them.
 | block length              | the length passed to `memory.acquire`        |
 | block copy, fill, compare | `memory.read` and `memory.write`             |
 | block resize              | `memory.acquire`, copy, `memory.release`     |
-| bulk stream transfer      | `stream.read` and `stream.write`             |
-| buffered print            | `stream.write` per byte, `stream.flush` once |
+| buffered print            | `stream.write.block`, `stream.flush` once    |
 | unbuffered write          | `stream.write` then `stream.flush`           |
 | line buffering            | `stream.flush` after a newline byte          |
 | argument count and text   | stream 3                                     |

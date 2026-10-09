@@ -106,14 +106,7 @@ fn lower_selected<M: Module>(
             },
         );
     }
-    let extern_signature = extern_signature(module);
-    let extern_identifier = module
-        .declare_function("lap_extern", Linkage::Import, &extern_signature)
-        .map_err(|error| CodegenError::new(error.to_string()))?;
-    let symbols = ProgramSymbols {
-        functions,
-        extern_identifier,
-    };
+    let symbols = ProgramSymbols { functions };
     let mut context = module.make_context();
     let mut builder_context = FunctionBuilderContext::new();
     for function in program.functions() {
@@ -158,12 +151,16 @@ fn function_signature<M: Module>(module: &M, function: &Function) -> Signature {
     signature
 }
 
-fn extern_signature<M: Module>(module: &M) -> Signature {
+fn operation_signature<M: Module>(module: &M, specification: &OperationSpecification) -> Signature {
     let mut signature = module.make_signature();
-    for _ in 0..6 {
+    for _ in 0..specification.argument_widths().len() + 1 {
         signature.params.push(AbiParam::new(types::I64));
     }
     signature
+}
+
+fn operation_symbol(specification: &OperationSpecification) -> String {
+    format!("lap_extern_{}", specification.name().replace('.', "_"))
 }
 
 fn lower_function<M: Module>(
@@ -498,7 +495,6 @@ fn collect_block_targets(block: &Block, taken: &mut Vec<Slot>, bound: &mut Vec<S
 
 struct ProgramSymbols<'program> {
     functions: HashMap<&'program str, FunctionSymbol<'program>>,
-    extern_identifier: FuncId,
 }
 
 struct FunctionSymbol<'program> {
@@ -860,7 +856,7 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
                 Intrinsic::Xor => self.builder.ins().bxor(words[0], words[1]),
                 Intrinsic::Add => self.builder.ins().iadd(words[0], words[1]),
                 Intrinsic::Sub => self.builder.ins().isub(words[0], words[1]),
-                Intrinsic::Mul => self.builder.ins().imul(words[0], words[1]),
+                Intrinsic::Mul => self.lower_multiply(words[0], words[1], arguments),
                 Intrinsic::Inc => self.builder.ins().iadd_imm_u(words[0], 1),
                 Intrinsic::Dec => {
                     let one = self.builder.ins().iconst(types::I64, 1);
@@ -912,6 +908,58 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
             };
             self.lower_wide_operation(operation, &values, operand_width)
         }
+    }
+
+    fn lower_multiply(
+        &mut self,
+        left: CraneliftValue,
+        right: CraneliftValue,
+        arguments: &[Value],
+    ) -> CraneliftValue {
+        let Some((constant, value)) = constant_operand(arguments, left, right) else {
+            return self.builder.ins().imul(left, right);
+        };
+        if constant == 0 {
+            return self.builder.ins().iconst(types::I64, 0);
+        }
+        let Some(plan) = multiply_plan(constant) else {
+            return self.builder.ins().imul(left, right);
+        };
+        let mut positive: Option<CraneliftValue> = None;
+        let mut negative: Option<CraneliftValue> = None;
+        for term in &plan.terms {
+            let (is_negative, shift) = match term {
+                MultiplyTerm::Add(shift) => (false, *shift),
+                MultiplyTerm::Subtract(shift) => (true, *shift),
+            };
+            let shifted = if shift == 0 {
+                value
+            } else {
+                self.builder.ins().ishl_imm_u(value, i64::from(shift))
+            };
+            let accumulator = if is_negative {
+                &mut negative
+            } else {
+                &mut positive
+            };
+            *accumulator = Some(match *accumulator {
+                Some(current) => self.builder.ins().iadd(current, shifted),
+                None => shifted,
+            });
+        }
+        let mut result = match (positive, negative) {
+            (Some(positive), Some(negative)) => self.builder.ins().isub(positive, negative),
+            (Some(positive), None) => positive,
+            (None, Some(negative)) => {
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                self.builder.ins().isub(zero, negative)
+            }
+            (None, None) => value,
+        };
+        if plan.shift > 0 {
+            result = self.builder.ins().ishl_imm_u(result, i64::from(plan.shift));
+        }
+        result
     }
 
     fn lower_wide_argument(
@@ -1443,32 +1491,25 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         for (argument, width) in arguments.iter().zip(specification.argument_widths()) {
             words.push(self.lower_word(argument, *width)?);
         }
-        while words.len() < 4 {
-            words.push(self.builder.ins().iconst(types::I64, 0));
-        }
         let output_slot = self.allocate_stack_slot(EXTERN_OUTPUT_SIZE)?;
         let output_address = self
             .builder
             .ins()
             .stack_addr(self.pointer_type, output_slot, 0);
-        let operation_word = self
-            .builder
-            .ins()
-            .iconst(types::I64, i64::from(operation.code()));
+        let signature = operation_signature(self.module, specification);
+        let identifier = self
+            .module
+            .declare_function(
+                &operation_symbol(specification),
+                Linkage::Import,
+                &signature,
+            )
+            .map_err(|error| CodegenError::new(error.to_string()))?;
         let function_reference = self
             .module
-            .declare_func_in_func(self.symbols.extern_identifier, self.builder.func);
-        self.builder.ins().call(
-            function_reference,
-            &[
-                operation_word,
-                words[0],
-                words[1],
-                words[2],
-                words[3],
-                output_address,
-            ],
-        );
+            .declare_func_in_func(identifier, self.builder.func);
+        words.push(output_address);
+        self.builder.ins().call(function_reference, &words);
         let status = self
             .builder
             .ins()
@@ -2247,6 +2288,70 @@ fn magic_division(divisor: u64) -> Option<(u64, u32)> {
     Some(((power / divisor + 1) as u64, shift))
 }
 
+const MAXIMUM_MULTIPLY_TERMS: usize = 4;
+
+enum MultiplyTerm {
+    Add(u32),
+    Subtract(u32),
+}
+
+struct MultiplyPlan {
+    terms: Vec<MultiplyTerm>,
+    shift: u32,
+}
+
+fn constant_operand(
+    arguments: &[Value],
+    left: CraneliftValue,
+    right: CraneliftValue,
+) -> Option<(u64, CraneliftValue)> {
+    match (&arguments[0], &arguments[1]) {
+        (Value::Constant(bits), _) => {
+            Some((bits_to_word(bits.bits(), 0, bits.width()) as u64, right))
+        }
+        (_, Value::Constant(bits)) => {
+            Some((bits_to_word(bits.bits(), 0, bits.width()) as u64, left))
+        }
+        _ => None,
+    }
+}
+
+fn multiply_plan(constant: u64) -> Option<MultiplyPlan> {
+    if constant == 0 {
+        return None;
+    }
+    let shift = constant.trailing_zeros();
+    let odd = constant >> shift;
+    let mut terms = Vec::new();
+    if odd == 1 {
+        terms.push(MultiplyTerm::Add(0));
+    } else {
+        let mut position = 0u32;
+        while position < 64 {
+            let zeros = (odd >> position).trailing_zeros();
+            position += zeros;
+            if position >= 64 {
+                break;
+            }
+            let ones = (odd >> position).trailing_ones();
+            let high = position + ones;
+            if ones == 1 {
+                terms.push(MultiplyTerm::Add(position));
+            } else {
+                if high < 64 {
+                    terms.push(MultiplyTerm::Add(high));
+                }
+                terms.push(MultiplyTerm::Subtract(position));
+            }
+            position = high;
+        }
+        if terms.len() > MAXIMUM_MULTIPLY_TERMS {
+            return None;
+        }
+    }
+    Some(MultiplyPlan { terms, shift })
+}
+
 fn bits_to_word(bits: &[bool], offset: usize, width: usize) -> i64 {
     let mut word = 0u64;
     for index in 0..width {
@@ -2328,23 +2433,58 @@ mod tests {
         )])
     }
 
-    extern "C" fn test_extern(
-        _operation: u64,
+    extern "C" fn test_extern0(out: *mut u64) {
+        report_extern(out);
+    }
+
+    extern "C" fn test_extern1(_argument0: u64, out: *mut u64) {
+        report_extern(out);
+    }
+
+    extern "C" fn test_extern2(_argument0: u64, _argument1: u64, out: *mut u64) {
+        report_extern(out);
+    }
+
+    extern "C" fn test_extern3(_argument0: u64, _argument1: u64, _argument2: u64, out: *mut u64) {
+        report_extern(out);
+    }
+
+    extern "C" fn test_extern4(
         _argument0: u64,
         _argument1: u64,
         _argument2: u64,
         _argument3: u64,
         out: *mut u64,
     ) {
+        report_extern(out);
+    }
+
+    fn report_extern(out: *mut u64) {
         unsafe {
             *out = 1;
             *out.add(1) = 42;
         }
     }
 
+    fn test_extern(argument_count: usize) -> *const u8 {
+        match argument_count {
+            0 => test_extern0 as *const u8,
+            1 => test_extern1 as *const u8,
+            2 => test_extern2 as *const u8,
+            3 => test_extern3 as *const u8,
+            _ => test_extern4 as *const u8,
+        }
+    }
+
     fn compile_for_execution(program: &Program) -> (JITModule, HashMap<String, FuncId>) {
         let mut builder = JITBuilder::new(default_libcall_names()).expect("the host is supported");
-        builder.symbol("lap_extern", test_extern as *const u8);
+        for specification in lapc_extern::OPERATIONS {
+            let symbol = operation_symbol(specification);
+            builder.symbol(
+                symbol.as_str(),
+                test_extern(specification.argument_widths().len()),
+            );
+        }
         let mut module = JITModule::new(builder);
         let identifiers = lower_program(&mut module, program).expect("the program lowers");
         module
@@ -2622,7 +2762,22 @@ mod tests {
         assert_eq!(main(), 1);
     }
 
-    const ENTRY: &str = "unsafe extern \"C\" { fn lap_main() -> u64; }\n#[unsafe(no_mangle)]\npub extern \"C\" fn lap_extern(_operation: u64, _argument0: u64, _argument1: u64, _argument2: u64, _argument3: u64, out: *mut u64) {\n    unsafe { *out = 1; *out.add(1) = 42; }\n}\nfn main() { std::process::exit((unsafe { lap_main() } & 1) as i32); }\n";
+    fn entry_source() -> String {
+        let mut source = String::from("unsafe extern \"C\" { fn lap_main() -> u64; }\n");
+        for specification in lapc_extern::OPERATIONS {
+            let symbol = operation_symbol(specification);
+            let arguments: Vec<String> = (0..specification.argument_widths().len())
+                .map(|index| format!("_argument{index}: u64"))
+                .chain(std::iter::once(String::from("out: *mut u64")))
+                .collect();
+            source.push_str(&format!(
+                "#[unsafe(export_name = \"{symbol}\")]\npub extern \"C\" fn stub_{symbol}({}) {{\n    unsafe {{ *out = 1; *out.add(1) = 42; }}\n}}\n",
+                arguments.join(", "),
+            ));
+        }
+        source.push_str("fn main() { std::process::exit((unsafe { lap_main() } & 1) as i32); }\n");
+        source
+    }
 
     fn link_and_run(name: &str, object: &[u8], entry: &str) -> i32 {
         let directory =
@@ -2657,7 +2812,7 @@ mod tests {
 
     fn run_object(program: &Program, name: &str) -> i32 {
         let object = emit_object(program).expect("the object emits");
-        link_and_run(name, &object, ENTRY)
+        link_and_run(name, &object, &entry_source())
     }
 
     #[test]
@@ -3149,7 +3304,7 @@ mod tests {
         let program = Program::new(vec![helper, main]);
         let object = emit_object(&program).expect("the object emits");
         assert!(!object.is_empty());
-        assert_eq!(link_and_run("every-construct", &object, ENTRY), 1);
+        assert_eq!(link_and_run("every-construct", &object, &entry_source()), 1);
     }
 
     #[test]
@@ -3319,6 +3474,43 @@ mod tests {
                     "for {intrinsic:?} at width {width}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn jit_multiplies_by_a_constant() {
+        let constants = [0u128, 1, 2, 3, 5, 7, 9, 11, 25, 100, 255];
+        for width in [0usize, 1, 2, 4, 8, 16, 32, 63, 64] {
+            let left = pattern_bits(width, 2);
+            for constant in constants {
+                let right = bits_of_value(constant & mask_wide(width), width);
+                let program = Program::new(vec![constant_function(
+                    "multiply",
+                    flat_type(width),
+                    Value::Intrinsic(Intrinsic::Mul, vec![bits(&left), bits(&right)]),
+                )]);
+                let expected = mul_values(&left, &right);
+                assert_eq!(
+                    run_word(&program, "multiply"),
+                    bits_to_word(&expected, 0, width),
+                    "for constant {constant} at width {width}"
+                );
+            }
+        }
+        for constant in [3u128, 100, u64::MAX as u128] {
+            let left = bits_of_value(constant, 64);
+            let right = pattern_bits(64, 7);
+            let program = Program::new(vec![constant_function(
+                "multiply",
+                flat_type(64),
+                Value::Intrinsic(Intrinsic::Mul, vec![bits(&left), bits(&right)]),
+            )]);
+            let expected = mul_values(&left, &right);
+            assert_eq!(
+                run_word(&program, "multiply"),
+                bits_to_word(&expected, 0, 64),
+                "for constant {constant} on the left"
+            );
         }
     }
 
@@ -3938,6 +4130,39 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn constant_multiplication_plans_are_exact() {
+        let mut constants: Vec<u64> = (1..=1024).collect();
+        constants.extend([
+            u64::MAX,
+            u64::MAX - 1,
+            1 << 63,
+            (1 << 63) | 1,
+            0x0123_4567_89AB_CDEF,
+            0xAAAA_AAAA_AAAA_AAAA,
+            0x5555_5555_5555_5555,
+            0xFFFF_FFFF,
+            1 << 32,
+            (1 << 32) - 1,
+        ]);
+        for constant in constants {
+            let Some(plan) = multiply_plan(constant) else {
+                continue;
+            };
+            let mut sum = 0u64;
+            for term in &plan.terms {
+                match term {
+                    MultiplyTerm::Add(shift) => sum = sum.wrapping_add(1u64 << shift),
+                    MultiplyTerm::Subtract(shift) => sum = sum.wrapping_sub(1u64 << shift),
+                }
+            }
+            assert_eq!(sum << plan.shift, constant, "for constant {constant}");
+        }
+        for constant in [1u64, 2, 3, 5, 7, 9, 10, 11, 15, 17, 21, 25, 31, 100, 255] {
+            assert!(multiply_plan(constant).is_some(), "for constant {constant}");
         }
     }
 
@@ -4666,7 +4891,7 @@ mod tests {
         };
         let main = constant_function("main", Type::Bit, value);
         let object = emit_object(&Program::new(vec![main])).expect("the object emits");
-        assert_eq!(link_and_run("extern-wide", &object, ENTRY), 1);
+        assert_eq!(link_and_run("extern-wide", &object, &entry_source()), 1);
     }
 
     const COUNTING_PRELUDE: &str = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\n\
