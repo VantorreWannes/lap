@@ -1,3 +1,7 @@
+#ifdef _WIN32
+#define _CRT_RAND_S
+#endif
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
@@ -8,6 +12,10 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifdef _WIN32
+#include <io.h>
+#endif
 
 enum {
   OPERATION_PROCESS_EXIT = 0x0000,
@@ -69,7 +77,9 @@ static uint64_t stream_entry_capacity;
 static uint64_t monotonic_last;
 static bool monotonic_initialized;
 
+#ifndef _WIN32
 static int random_descriptor = -1;
+#endif
 static unsigned char random_bytes[RANDOM_BUFFER_CAPACITY];
 static uint64_t random_offset;
 static uint64_t random_length;
@@ -269,6 +279,9 @@ static bool stream_open(uint64_t path_handle, uint64_t path_offset,
   } else {
     return false;
   }
+#ifdef _WIN32
+  flags |= O_BINARY;
+#endif
   char *path = malloc(path_length + 1);
   if (path == NULL) {
     return false;
@@ -357,23 +370,42 @@ static bool clock_realtime(uint64_t *nanoseconds) {
   return true;
 }
 
+static uint64_t random_fill(unsigned char *bytes, size_t capacity) {
+#ifdef _WIN32
+  for (size_t index = 0; index < capacity; index++) {
+    unsigned int value;
+    if (rand_s(&value) != 0) {
+      return 0;
+    }
+    bytes[index] = (unsigned char)(value & 0xFF);
+  }
+  return (uint64_t)capacity;
+#else
+  if (random_descriptor < 0) {
+    random_descriptor = open("/dev/urandom", O_RDONLY);
+    if (random_descriptor < 0) {
+      return 0;
+    }
+  }
+  ssize_t result;
+  do {
+    result = read(random_descriptor, bytes, capacity);
+  } while (result < 0 && errno == EINTR);
+  if (result <= 0) {
+    return 0;
+  }
+  return (uint64_t)result;
+#endif
+}
+
 static bool random_byte(unsigned char *byte) {
   if (random_offset == random_length) {
-    if (random_descriptor < 0) {
-      random_descriptor = open("/dev/urandom", O_RDONLY);
-      if (random_descriptor < 0) {
-        return false;
-      }
-    }
-    ssize_t result;
-    do {
-      result = read(random_descriptor, random_bytes, sizeof random_bytes);
-    } while (result < 0 && errno == EINTR);
-    if (result <= 0) {
+    uint64_t length = random_fill(random_bytes, sizeof random_bytes);
+    if (length == 0) {
       return false;
     }
     random_offset = 0;
-    random_length = (uint64_t)result;
+    random_length = length;
   }
   *byte = random_bytes[random_offset];
   random_offset++;
@@ -444,6 +476,11 @@ static bool open_argument_stream(int argument_count, char **argument_values) {
 }
 
 bool lap_runtime_start(int argument_count, char **argument_values) {
+#ifdef _WIN32
+  _setmode(0, O_BINARY);
+  _setmode(1, O_BINARY);
+  _setmode(2, O_BINARY);
+#endif
   if (!open_standard_stream(0, true, false, false)) {
     return false;
   }

@@ -12,7 +12,7 @@
 
 `lapc` takes one or more files and appends them in the order given, top to bottom. The result is one program.
 
-`lapc check` checks a program. `lapc build` emits an object and links it with the runtime using `cc`, or `CC` when set. On Linux the link passes `-no-pie`, because the object reaches `lap_extern` through an absolute address.
+`lapc check` checks a program. `lapc build` emits an object and links it with the runtime using a C compiler. `CC` names the compiler when set; otherwise the driver tries `cc`, `gcc`, `clang`, and `zig cc`, in that order, and uses the first that can compile the runtime. The runtime needs a POSIX-style C compiler: on Windows, a MinGW-w64 toolchain such as zig or MSYS2, not MSVC. On Linux the link passes `-no-pie`, because the object reaches `lap_extern` through an absolute address.
 
 ## Structure
 

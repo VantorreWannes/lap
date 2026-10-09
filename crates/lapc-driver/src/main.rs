@@ -2,7 +2,8 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use clap::{Parser, Subcommand};
 
@@ -84,6 +85,85 @@ fn check(source: &str) -> Result<lapc_ir::Program, DriverError> {
     Ok(erase_intrinsics(program))
 }
 
+struct Compiler {
+    program: String,
+    prefix: Vec<String>,
+}
+
+impl Compiler {
+    fn new(program: &str, prefix: &[&str]) -> Self {
+        Compiler {
+            program: String::from(program),
+            prefix: prefix.iter().map(|word| String::from(*word)).collect(),
+        }
+    }
+
+    fn command(&self) -> ProcessCommand {
+        let mut command = ProcessCommand::new(&self.program);
+        command.args(&self.prefix);
+        command
+    }
+
+    fn name(&self) -> String {
+        let mut words = vec![self.program.clone()];
+        words.extend(self.prefix.iter().cloned());
+        words.join(" ")
+    }
+}
+
+fn compiler_candidates() -> Vec<Compiler> {
+    vec![
+        Compiler::new("cc", &[]),
+        Compiler::new("gcc", &[]),
+        Compiler::new("clang", &[]),
+        Compiler::new("zig", &["cc"]),
+    ]
+}
+
+static PROBE_NUMBER: AtomicUsize = AtomicUsize::new(0);
+
+fn compiler_builds_runtime(compiler: &Compiler) -> bool {
+    let number = PROBE_NUMBER.fetch_add(1, Ordering::Relaxed);
+    let source = env::temp_dir().join(format!("lapc-probe-{}-{number}.c", std::process::id()));
+    let object = source.with_extension("o");
+    if fs::write(&source, RUNTIME_SOURCE).is_err() {
+        return false;
+    }
+    let status = compiler
+        .command()
+        .arg("-std=c17")
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(&object)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = fs::remove_file(&source);
+    let _ = fs::remove_file(&object);
+    matches!(status, Ok(status) if status.success())
+}
+
+fn find_compiler() -> Result<Compiler, DriverError> {
+    if let Ok(configured) = env::var("CC") {
+        return Ok(Compiler::new(&configured, &[]));
+    }
+    let candidates = compiler_candidates();
+    let names = candidates
+        .iter()
+        .map(Compiler::name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    candidates
+        .into_iter()
+        .find(|compiler| compiler_builds_runtime(compiler))
+        .ok_or(DriverError::Compiler {
+            message: format!(
+                "no C compiler that can build the runtime was found (tried {names}); set CC to choose one"
+            ),
+        })
+}
+
 fn build(program: &lapc_ir::Program, output: &Path) -> Result<(), DriverError> {
     let object = emit_object(program).map_err(|error| DriverError::Codegen {
         message: format!("{error:?}"),
@@ -99,8 +179,8 @@ fn build(program: &lapc_ir::Program, output: &Path) -> Result<(), DriverError> {
     write(&object_path, &object)?;
     write(&runtime_path, RUNTIME_SOURCE.as_bytes())?;
     write(&entry_path, ENTRY_SOURCE.as_bytes())?;
-    let linker = env::var("CC").unwrap_or_else(|_| String::from("cc"));
-    let mut command = ProcessCommand::new(&linker);
+    let compiler = find_compiler()?;
+    let mut command = compiler.command();
     command.arg("-std=c17").arg("-O2");
     if cfg!(target_os = "linux") {
         command.arg("-no-pie");
@@ -137,6 +217,7 @@ enum DriverError {
     Parse { message: String },
     Check { message: String },
     Codegen { message: String },
+    Compiler { message: String },
     Link { message: String },
 }
 
@@ -152,6 +233,7 @@ impl fmt::Display for DriverError {
             DriverError::Parse { message } => write!(formatter, "parse error: {message}"),
             DriverError::Check { message } => write!(formatter, "check error: {message}"),
             DriverError::Codegen { message } => write!(formatter, "codegen error: {message}"),
+            DriverError::Compiler { message } => write!(formatter, "compiler error: {message}"),
             DriverError::Link { message } => write!(formatter, "link error: {message}"),
         }
     }
@@ -197,11 +279,7 @@ mod tests {
     }
 
     fn c_compiler_available() -> bool {
-        let linker = env::var("CC").unwrap_or_else(|_| String::from("cc"));
-        let available = ProcessCommand::new(linker)
-            .arg("--version")
-            .output()
-            .is_ok();
+        let available = find_compiler().is_ok();
         if !available {
             eprintln!("skipping: no C compiler is available");
         }
@@ -426,9 +504,11 @@ mod tests {
         if !c_compiler_available() {
             return;
         }
+        let compiler = find_compiler().expect("the compiler is found");
         let directory = test_directory("runtime");
         let binary = directory.join(format!("lap_runtime_test{}", std::env::consts::EXE_SUFFIX));
-        let status = ProcessCommand::new("cc")
+        let status = compiler
+            .command()
             .arg("-std=c17")
             .arg("-Wall")
             .arg("-Wextra")

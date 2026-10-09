@@ -6,9 +6,14 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifndef _WIN32
 #include <sys/wait.h>
+#else
+#include <process.h>
+#endif
 #include <unistd.h>
 
 extern void lap_extern(uint64_t operation, uint64_t argument0,
@@ -141,8 +146,17 @@ static uint64_t open_named_stream(const char *path, uint64_t mode) {
 }
 
 static void temporary_path(char *path, size_t capacity, const char *name) {
+#ifdef _WIN32
+  const char *directory = getenv("TEMP");
+  if (directory == NULL) {
+    directory = ".";
+  }
+  int count = snprintf(path, capacity, "%s\\lap_runtime_test_%d_%s", directory,
+                       (int)getpid(), name);
+#else
   int count = snprintf(path, capacity, "/tmp/lap_runtime_test_%d_%s",
                        (int)getpid(), name);
+#endif
   assert(count > 0);
   assert((size_t)count < capacity);
   unlink(path);
@@ -154,9 +168,17 @@ static off_t file_size(const char *path) {
   return status.st_size;
 }
 
+static int binary_flags(int flags) {
+#ifdef _WIN32
+  return flags | O_BINARY;
+#else
+  return flags;
+#endif
+}
+
 static size_t read_file(const char *path, unsigned char *bytes,
                         size_t capacity) {
-  int descriptor = open(path, O_RDONLY);
+  int descriptor = open(path, binary_flags(O_RDONLY));
   assert(descriptor >= 0);
   ssize_t count = read(descriptor, bytes, capacity);
   assert(count >= 0);
@@ -166,7 +188,8 @@ static size_t read_file(const char *path, unsigned char *bytes,
 
 static void write_file(const char *path, const unsigned char *bytes,
                        size_t length) {
-  int descriptor = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  int descriptor =
+      open(path, binary_flags(O_WRONLY | O_CREAT | O_TRUNC), 0666);
   assert(descriptor >= 0);
   ssize_t written = write(descriptor, bytes, length);
   assert(written == (ssize_t)length);
@@ -232,23 +255,24 @@ static void test_process_exit_flushes(void) {
   char path[PATH_CAPACITY];
   temporary_path(path, sizeof path, "exit");
 
+  char *child_arguments[] = {program_path, "exit-flush", path, NULL};
+#ifndef _WIN32
   pid_t child = fork();
   assert(child >= 0);
   if (child == 0) {
-    int descriptor = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    assert(descriptor >= 0);
-    assert(dup2(descriptor, STREAM_STANDARD_OUTPUT) == STREAM_STANDARD_OUTPUT);
-    close(descriptor);
-    write_stream(STREAM_STANDARD_OUTPUT, 'x');
-    uint64_t ignored[2] = {0, 0};
-    lap_extern(OPERATION_PROCESS_EXIT, 7, 0, 0, 0, ignored);
-    _exit(99);
+    execvp(program_path, child_arguments);
+    _exit(101);
   }
 
   int status = 0;
   assert(waitpid(child, &status, 0) == child);
   assert(WIFEXITED(status));
   assert(WEXITSTATUS(status) == 7);
+#else
+  intptr_t status =
+      _spawnv(_P_WAIT, program_path, (const char *const *)child_arguments);
+  assert(status == 7);
+#endif
 
   unsigned char bytes[4];
   assert(read_file(path, bytes, sizeof bytes) == 1);
@@ -259,24 +283,27 @@ static void test_process_exit_flushes(void) {
 static void test_standard_input(void) {
   char path[PATH_CAPACITY];
   temporary_path(path, sizeof path, "input");
-  const unsigned char content[] = {'x', 'y', 'z'};
+  const unsigned char content[] = {'x', 0x1A, '\r', '\n', 0x00, 'z'};
   write_file(path, content, sizeof content);
 
   int saved = dup(STREAM_STANDARD_INPUT);
   assert(saved >= 0);
-  int descriptor = open(path, O_RDONLY);
+  int descriptor = open(path, binary_flags(O_RDONLY));
   assert(descriptor >= 0);
-  assert(dup2(descriptor, STREAM_STANDARD_INPUT) == STREAM_STANDARD_INPUT);
+  assert(dup2(descriptor, STREAM_STANDARD_INPUT) >= 0);
   close(descriptor);
 
   assert(read_stream(STREAM_STANDARD_INPUT) == 'x');
-  assert(read_stream(STREAM_STANDARD_INPUT) == 'y');
+  assert(read_stream(STREAM_STANDARD_INPUT) == 0x1A);
+  assert(read_stream(STREAM_STANDARD_INPUT) == '\r');
+  assert(read_stream(STREAM_STANDARD_INPUT) == '\n');
+  assert(read_stream(STREAM_STANDARD_INPUT) == 0x00);
   assert(read_stream(STREAM_STANDARD_INPUT) == 'z');
   fails(OPERATION_STREAM_READ, STREAM_STANDARD_INPUT, 0, 0, 0);
   flush_stream(STREAM_STANDARD_INPUT);
   fails(OPERATION_STREAM_WRITE, STREAM_STANDARD_INPUT, 'q', 0, 0);
 
-  assert(dup2(saved, STREAM_STANDARD_INPUT) == STREAM_STANDARD_INPUT);
+  assert(dup2(saved, STREAM_STANDARD_INPUT) >= 0);
   close(saved);
   unlink(path);
 }
@@ -287,9 +314,10 @@ static void test_standard_output_buffering(void) {
 
   int saved = dup(STREAM_STANDARD_OUTPUT);
   assert(saved >= 0);
-  int descriptor = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  int descriptor =
+      open(path, binary_flags(O_WRONLY | O_CREAT | O_TRUNC), 0666);
   assert(descriptor >= 0);
-  assert(dup2(descriptor, STREAM_STANDARD_OUTPUT) == STREAM_STANDARD_OUTPUT);
+  assert(dup2(descriptor, STREAM_STANDARD_OUTPUT) >= 0);
   close(descriptor);
 
   uint64_t written = 0;
@@ -306,7 +334,7 @@ static void test_standard_output_buffering(void) {
     assert(probe_bytes[index] == (unsigned char)((uint64_t)index * 37 + 11));
   }
 
-  assert(dup2(saved, STREAM_STANDARD_OUTPUT) == STREAM_STANDARD_OUTPUT);
+  assert(dup2(saved, STREAM_STANDARD_OUTPUT) >= 0);
   close(saved);
   unlink(path);
 }
@@ -317,9 +345,10 @@ static void test_standard_error_unbuffered(void) {
 
   int saved = dup(STREAM_STANDARD_ERROR);
   assert(saved >= 0);
-  int descriptor = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  int descriptor =
+      open(path, binary_flags(O_WRONLY | O_CREAT | O_TRUNC), 0666);
   assert(descriptor >= 0);
-  assert(dup2(descriptor, STREAM_STANDARD_ERROR) == STREAM_STANDARD_ERROR);
+  assert(dup2(descriptor, STREAM_STANDARD_ERROR) >= 0);
   close(descriptor);
 
   write_stream(STREAM_STANDARD_ERROR, 'E');
@@ -330,7 +359,7 @@ static void test_standard_error_unbuffered(void) {
   flush_stream(STREAM_STANDARD_ERROR);
   fails(OPERATION_STREAM_READ, STREAM_STANDARD_ERROR, 0, 0, 0);
 
-  assert(dup2(saved, STREAM_STANDARD_ERROR) == STREAM_STANDARD_ERROR);
+  assert(dup2(saved, STREAM_STANDARD_ERROR) >= 0);
   close(saved);
   unlink(path);
 }
@@ -414,6 +443,7 @@ static void test_file_streams(void) {
   unlink(path);
 }
 
+#ifndef _WIN32
 static void test_flush_failure_discards_buffer(void) {
   uint64_t stream = open_named_stream("/dev/full", STREAM_MODE_WRITE);
   write_stream(stream, 'x');
@@ -434,6 +464,7 @@ static void test_flush_failure_discards_buffer(void) {
   fails(OPERATION_STREAM_FLUSH, stream, 0, 0, 0);
   fails(OPERATION_STREAM_CLOSE, stream, 0, 0, 0);
 }
+#endif
 
 static void test_stream_path_window(void) {
   char path[PATH_CAPACITY];
@@ -569,11 +600,11 @@ static void check_argument_stream(void) {
 }
 
 static void test_argument_stream(void) {
+  char *child_arguments[] = {program_path, "argument-stream", "expected", NULL};
+#ifndef _WIN32
   pid_t child = fork();
   assert(child >= 0);
   if (child == 0) {
-    char *child_arguments[] = {program_path, "argument-stream", "expected",
-                               NULL};
     execvp(program_path, child_arguments);
     _exit(101);
   }
@@ -581,6 +612,11 @@ static void test_argument_stream(void) {
   assert(waitpid(child, &status, 0) == child);
   assert(WIFEXITED(status));
   assert(WEXITSTATUS(status) == 0);
+#else
+  intptr_t status =
+      _spawnv(_P_WAIT, program_path, (const char *const *)child_arguments);
+  assert(status == 0);
+#endif
 }
 
 int main(int argument_count, char **argument_values) {
@@ -591,6 +627,19 @@ int main(int argument_count, char **argument_values) {
     check_argument_stream();
     lap_runtime_finish();
     return 0;
+  }
+
+  if (argument_count == 3 && strcmp(argument_values[1], "exit-flush") == 0) {
+    assert(lap_runtime_start(argument_count, argument_values));
+    int descriptor = open(argument_values[2],
+                          binary_flags(O_WRONLY | O_CREAT | O_TRUNC), 0666);
+    assert(descriptor >= 0);
+    assert(dup2(descriptor, STREAM_STANDARD_OUTPUT) >= 0);
+    close(descriptor);
+    write_stream(STREAM_STANDARD_OUTPUT, 'x');
+    uint64_t ignored[2] = {0, 0};
+    lap_extern(OPERATION_PROCESS_EXIT, 7, 0, 0, 0, ignored);
+    return 99;
   }
 
   program_path = argument_values[0];
@@ -606,7 +655,9 @@ int main(int argument_count, char **argument_values) {
   test_independent_stream_buffers();
   test_stream_table_growth();
   test_stream_refill_reading();
+#ifndef _WIN32
   test_flush_failure_discards_buffer();
+#endif
   test_clock_and_random();
   test_unknown_operations();
   test_argument_stream();
