@@ -1,154 +1,161 @@
 # Labels and Primitives
 
-Labels and Primitives (Lap) is a timeless, cross-paradigm, unchangeable programming language. Only the tooling and compiler implementations around it may change.
+Labels and Primitives (Lap) is a cross-paradigm programming language built from eight primitives.
 
-This document is the language definition. Compiler crates implement it; they do not extend or reinterpret it.
+## Scope
+
+Lap answers one question: what is the smallest set of primitives a whole language can emerge from?
+
+Lap provides no numbers, no arithmetic, no strings, and no standard library. Those are library code written in Lap. See [Emergence](#emergence).
 
 ## Primitives
 
-The language is built from eight primitives. Every other construct derives from them.
+| Primitive                         | Role                                                 |
+| --------------------------------- | ---------------------------------------------------- |
+| `BIT`                             | the indeterminate value                              |
+| `NAND`                            | the only operation                                   |
+| `BRANCH`                          | selection between two blocks                         |
+| `[item, ...]`                     | ordered, heterogeneous grouping                      |
+| `(param: Type, ...) Type { ... }` | function definition                                  |
+| `label = ...`                     | binding of a label to a value, a function, or a type |
+| `*label`                          | alias of the slot `label` resolves to                |
+| `EXTERN`                          | the only exit from the language                      |
 
-- `BIT`: The data primitive. Initialized to an arbitrary state.
-- `NAND`: The operation primitive. Computes Sheffer stroke over two `BIT` values.
-- `BRANCH`: The branching primitive. Selects an expression block based on a `BIT`.
-- `[item, ...]`: The collection primitive. Groups ordered, heterogeneous elements.
-- `(param: Type, ...) Type { ... }`: The function definition primitive.
-- `label = ...`: The assignment primitive. Copies right-to-left into storage.
-- `*label`: The reference primitive. Aliases an existing storage slot.
-- `EXTERN`: The external primitive. Accesses syscalls, allocators, and intrinsics.
+## Rules
 
-## Core Rules
+### Determinacy
 
-1. **Bare Storage:** Every value is either an explicit primitive or held in a labeled memory slot. Labels are statically typed and invariant. Types are nominal: explicit casting functions must be implemented to convert between different types, even if they share the same layout.
-2. **Infix Label Grammar:** Labels allow `_` and `.` strictly between alphanumeric characters: `[a-zA-Z0-9]+([_.][a-zA-Z0-9]+)*`. Neither `_` nor `.` may begin or end a label.
-3. **Rust-Like Expression Blocks:** The terminal expression in a block produces its return value. A statement terminating with an assignment yields no value and cannot be returned.
-4. **Reference Lifetimes:** Functions cannot return reference types (`*Type`). References only alias downward or sideways on the stack, preventing dangling references by design.
-5. **External Memory:** `EXTERN` acts as an optimization barrier. Dynamic heap storage is addressed using value handles (e.g., bit collections), never through language-level `*` references.
+Every occurrence of `BIT` denotes the same indeterminate value. An expression is determinate when its value is the same under both states of that value. A program may only depend on determinate expressions.
 
-## Canonical Example
+`NAND(BIT, NAND(BIT, BIT))` is determinate and is one. A bare `BIT` is not determinate. An unwritten slot holds an indeterminate value, and two such slots are unrelated.
 
-The following annotated program demonstrates bootstrapping, nominal typing, explicit casting, pass-by-reference mutation, heterogeneous collections, unbinding, expression-oriented branching, and heap interactions via `EXTERN`.
+### Types
+
+Every label is statically typed. A type is a tree of `BIT`s and collections, and two types with the same tree are the same type. A reference type `*Type` is the type of a slot of that type.
+
+A binding whose right-hand side is a type expression binds a type, and the label is an alias for that type. A type expression is `BIT`, a label bound to a type, `*Type`, or a collection of types.
+
+### Block value
+
+A block evaluates to its terminal bare expression, or to `[]` when it ends in a binding.
+
+### Names
+
+A name is global or local. A global name is defined once; shadowing it is an error. A parameter or block binding is local to its function or block.
+
+A name is visible from its binding onward. A function's name is also visible in its own body, so a function may call itself.
+
+### References
+
+A reference is an alias, not a value. Reading it reads the aliased slot; assigning to it writes the aliased slot. A `*Type` parameter aliases the caller's slot, so `*param` forwards that same slot.
+
+A reference may alias only downward or sideways on the stack. A function therefore cannot return a reference, and a reference cannot be stored in a collection. Dangling is unrepresentable rather than checked.
+
+A reference may be a destructuring target.
+
+### External memory
+
+`EXTERN` is an optimization barrier. Heap storage is addressed by value handles, never by `*` references.
+
+## Emergence
+
+Constants, logic, arithmetic, numeric types, and control structures are library code. The language gains nothing when a library gains a capability.
+
+Library code reaches native speed because a compiler recognizes it, not because the language grows. See [COMPILER.md](COMPILER.md).
+
+The logic operators derive from `NAND`:
+
+- `not(a)` is `NAND(a, a)`
+- `and(a, b)` is `not(NAND(a, b))`
+- `or(a, b)` is `NAND(not(a), not(b))`
+- `xor(a, b)` is `NAND(NAND(a, n), NAND(b, n))` where `n` is `NAND(a, b)`
+
+## Example
 
 ```
-// 1. BOOTSTRAPPING CONSTANTS
-// Bits begin in an arbitrary state. Standard values must be algebraically derived.
-seed = BIT
-ONE: BIT = NAND(seed, NAND(seed, seed))
-ZERO: BIT = NAND(ONE, ONE)
+BIT.ONE = NAND(BIT, NAND(BIT, BIT))
+BIT.ZERO = NAND(BIT.ONE, BIT.ONE)
 
-// 2. NOMINAL TYPES AND EXPLICIT CASTING
-// Types are invariant. Identical underlying layouts require explicit casts.
 U2 = [BIT, BIT]
 PAIR = [BIT, BIT]
-
-cast.u2.to.pair = (src: U2) PAIR {
-    [b0, b1] = src
-    [b0, b1]
-}
-
-// Heterogeneous collection containing different types
 TUPLE = [BIT, U2, PAIR]
 
-// 3. LOGIC OPERATORS
-not = (a: BIT) BIT {
+// PAIR and U2 are the same type, so no conversion is needed.
+
+bit.not = (a: BIT) BIT {
     NAND(a, a)
 }
 
-xor = (a: BIT, b: BIT) BIT {
-    n = NAND(a, b)
-    NAND(NAND(a, n), NAND(b, n))
+// A reference parameter writes through to the caller's slot.
+bit.toggle = (target: *BIT) [] {
+    target = bit.not(target)
 }
 
-// 4. REFERENCES AND IN-PLACE MUTATION
-// Functions cannot return references, but parameters can be passed as references.
-toggle = (target: *BIT) [] {
-    target = not(target)
-    []
+// A reference parameter forwards as a reference.
+bit.toggle.twice = (target: *BIT) [] {
+    bit.toggle(*target)
+    bit.toggle(*target)
 }
 
-// 5. BRANCHING AND BLOCK EVALUATION
-// Both branches must yield the same type. The final bare expression is returned.
-choose = (flag: BIT, opt.a: U2, opt.b: U2) U2 {
+// Both blocks yield U2. The bare expression is last.
+u2.select = (flag: BIT, when.one: U2, when.zero: U2) U2 {
     BRANCH (flag) {
-        opt.a
+        when.one
     } {
-        // Assignments cannot serve as return values.
-        // The bare expression opt.b is placed last.
-        dummy: BIT = ZERO
-        opt.b
+        unused: BIT = BIT.ZERO
+        when.zero
     }
 }
 
-// 6. HEAP MANAGEMENT VIA EXTERN
-// Heap pointers are stored as data handles, not language references.
-OP.ALLOC = [ZERO, ONE]
-OP.FREE  = [ONE, ZERO]
-
-alloc.slot = () U2 {
-    EXTERN(OP.ALLOC)
+// The heap is reached by handle, not by reference.
+// U64 and the operation constants are elided.
+heap.alloc = () [BIT, U64] {
+    EXTERN(OP.MEMORY.ACQUIRE)
 }
 
-free.slot = (handle: *U2) [] {
-    EXTERN(OP.FREE, handle)
-    handle = [ZERO, ZERO]
-    []
+heap.free = (handle: *U64) [] {
+    [released] = EXTERN(OP.MEMORY.RELEASE, handle)
+    handle = U64.ZERO
 }
 
-// 7. CANONICAL EXECUTION FLOW
 main = () BIT {
-    // Label storage declaration
-    state: BIT = ZERO
+    state: BIT = BIT.ZERO
 
-    // Reference creation and write-through mutation
     alias: *BIT = *state
-    alias = ONE
-    // Both 'state' and 'alias' now store ONE
+    alias = BIT.ONE
 
-    toggle(*state)
-    // 'state' is toggled back to ZERO
+    bit.toggle.twice(*state)
 
-    // Instantiating collections
-    first.u2: U2 = [ZERO, ONE]
-    second.u2: U2 = [ONE, ONE]
+    low: U2 = [BIT.ZERO, BIT.ONE]
+    high: U2 = [BIT.ONE, BIT.ONE]
+    chosen: U2 = u2.select(state, low, high)
+    paired: PAIR = chosen
 
-    // Branch expression
-    selected: U2 = choose(state, first.u2, second.u2)
+    bundle: TUPLE = [state, chosen, paired]
+    [head, *middle, last] = bundle
 
-    // Explicit casting between nominal types
-    paired: PAIR = cast.u2.to.pair(selected)
+    // The handle is determinate only in the success block.
+    [acquired, handle] = heap.alloc()
+    BRANCH (acquired) {
+        heap.free(*handle)
+    } {
+        []
+    }
 
-    // Heterogeneous collection grouping and unbinding
-    bundle: TUPLE = [state, selected, paired]
-    [head.bit, *tail.u2, out.pair] = bundle
-
-    // Heap allocation pattern
-    heap.ptr: U2 = alloc.slot()
-    free.slot(*heap.ptr)
-
-    // Return the final evaluated bit
-    head.bit
+    head
 }
 ```
 
-## Truth Values
+## Grammar
 
-The standard logic operators are derived from `NAND`:
-
-- `not a = NAND(a, a)`
-- `a and b = NAND(NAND(a, b), NAND(a, b))`
-- `a or b = NAND(NAND(a, a), NAND(b, b))`
-- `a xor b = NAND(NAND(a, NAND(a, b)), NAND(b, NAND(a, b)))`
-
-## Formal Grammar
-
-Whitespace and comments are stripped before parsing.
+Whitespace and comments are stripped before parsing. A label is a keyword only when it equals that keyword exactly, so `BIT.ONE` is a label and `BIT` is not.
 
 ```ebnf
 Program        ::= Statement*
 
 Statement      ::= Binding | Expression
 
-Binding        ::= Target "=" Expression
+Binding        ::= Target "=" (Expression | FunctionDef)
 Target         ::= TypedIdent
                  | "*" Label
                  | "[" Target ("," Target)* "]"
@@ -160,7 +167,6 @@ Expression     ::= Primary
                  | BranchExpr
                  | NandExpr
                  | CollectionExpr
-                 | FunctionDef
                  | CallExpr
 
 Primary        ::= Label | "*" Label | "BIT"
@@ -181,5 +187,20 @@ Type           ::= "BIT"
 
 Block          ::= "{" Statement* Expression? "}"
 Label          ::= [a-zA-Z0-9]+ ( ("_" | ".") [a-zA-Z0-9]+ )*
+Keyword        ::= "BIT" | "NAND" | "BRANCH" | "EXTERN"
 Comment        ::= "//" [^\n]*
 ```
+
+## Ownership
+
+- This document owns the language: the primitives, the rules, and the grammar.
+- A compiler owns its lowering and its runtime interface. [COMPILER.md](COMPILER.md) records those for `lapc`.
+- A library owns everything else.
+
+A compiler may not add a primitive, a type rule, or a syntax form.
+
+## Stability
+
+The primitives, the rules, and the grammar are frozen. A program that is valid today stays valid, and a compiler that rejects it is wrong.
+
+New capability arrives as a library, or as compiler recognition of a library, never as a language change.
