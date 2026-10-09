@@ -1641,25 +1641,29 @@ mod tests {
         assert_eq!(main(), 1);
     }
 
-    const ENTRY: &str =
-        "extern unsigned long lap_main(void);\nint main(void) { return (int)(lap_main() & 1); }\n";
-
-    const EXTERN_ENTRY: &str = "extern unsigned long lap_main(void);\n#include <stdint.h>\nvoid lap_extern(uint64_t operation, uint64_t argument0, uint64_t argument1, uint64_t argument2, uint64_t argument3, uint64_t *out) {\n  (void)operation; (void)argument0; (void)argument1; (void)argument2; (void)argument3;\n  out[0] = 1; out[1] = 42;\n}\nint main(void) { return (int)(lap_main() & 1); }\n";
+    const ENTRY: &str = "unsafe extern \"C\" { fn lap_main() -> u64; }\n#[unsafe(no_mangle)]\npub extern \"C\" fn lap_extern(_operation: u64, _argument0: u64, _argument1: u64, _argument2: u64, _argument3: u64, out: *mut u64) {\n    unsafe { *out = 1; *out.add(1) = 42; }\n}\nfn main() { std::process::exit((unsafe { lap_main() } & 1) as i32); }\n";
 
     fn link_and_run(name: &str, object: &[u8], entry: &str) -> i32 {
         let directory =
             std::env::temp_dir().join(format!("lapc-codegen-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&directory).expect("the directory is created");
         let object_path = directory.join("program.o");
-        let entry_path = directory.join("entry.c");
-        let binary = directory.join("program");
+        let entry_path = directory.join("entry.rs");
+        let binary = directory.join(format!("program{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(&object_path, object).expect("the object is written");
         std::fs::write(&entry_path, entry).expect("the entry is written");
-        let status = std::process::Command::new("cc")
+        let mut command = std::process::Command::new("rustc");
+        command
+            .arg("--edition=2024")
             .arg("-o")
             .arg(&binary)
-            .arg(&object_path)
-            .arg(&entry_path)
+            .arg(&entry_path);
+        if cfg!(target_os = "linux") {
+            command.arg("-C").arg("relocation-model=static");
+        }
+        let status = command
+            .arg("-C")
+            .arg(format!("link-arg={}", object_path.display()))
             .status()
             .expect("the compiler runs");
         assert!(status.success(), "the object links");
@@ -2164,7 +2168,7 @@ mod tests {
         let program = Program::new(vec![helper, main]);
         let object = emit_object(&program).expect("the object emits");
         assert!(!object.is_empty());
-        assert_eq!(link_and_run("every-construct", &object, EXTERN_ENTRY), 1);
+        assert_eq!(link_and_run("every-construct", &object, ENTRY), 1);
     }
 
     #[test]
@@ -3078,7 +3082,7 @@ mod tests {
         };
         let main = constant_function("main", Type::Bit, value);
         let object = emit_object(&Program::new(vec![main])).expect("the object emits");
-        assert_eq!(link_and_run("extern-wide", &object, EXTERN_ENTRY), 1);
+        assert_eq!(link_and_run("extern-wide", &object, ENTRY), 1);
     }
 
     const COUNTING_PRELUDE: &str = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\n\

@@ -196,10 +196,22 @@ mod tests {
             .collect()
     }
 
+    fn c_compiler_available() -> bool {
+        let linker = env::var("CC").unwrap_or_else(|_| String::from("cc"));
+        let available = ProcessCommand::new(linker)
+            .arg("--version")
+            .output()
+            .is_ok();
+        if !available {
+            eprintln!("skipping: no C compiler is available");
+        }
+        available
+    }
+
     fn build_sources(name: &str, sources: &[&str]) -> PathBuf {
         let directory = test_directory(name);
         let files = write_sources(&directory, sources);
-        let output = directory.join("program");
+        let output = directory.join(format!("program{}", std::env::consts::EXE_SUFFIX));
         run(Arguments {
             command: Command::Build {
                 files,
@@ -251,18 +263,27 @@ mod tests {
 
     #[test]
     fn a_program_returning_zero_exits_with_zero() {
+        if !c_compiler_available() {
+            return;
+        }
         let code = build_one_and_run("zero", &format!("{PRELUDE}main = () BIT {{ BIT.ZERO }}\n"));
         assert_eq!(code, 0);
     }
 
     #[test]
     fn a_program_returning_one_exits_with_one() {
+        if !c_compiler_available() {
+            return;
+        }
         let code = build_one_and_run("one", &format!("{PRELUDE}main = () BIT {{ BIT.ONE }}\n"));
         assert_eq!(code, 1);
     }
 
     #[test]
     fn a_program_with_a_function_and_a_reference_runs() {
+        if !c_compiler_available() {
+            return;
+        }
         let code = build_one_and_run(
             "toggle",
             &format!(
@@ -276,6 +297,9 @@ mod tests {
 
     #[test]
     fn a_program_with_a_branch_and_a_collection_runs() {
+        if !c_compiler_available() {
+            return;
+        }
         let code = build_one_and_run(
             "branch",
             &format!(
@@ -289,6 +313,9 @@ mod tests {
 
     #[test]
     fn a_nested_destructuring_runs() {
+        if !c_compiler_available() {
+            return;
+        }
         let code = build_one_and_run(
             "nested",
             &format!(
@@ -301,6 +328,9 @@ mod tests {
 
     #[test]
     fn the_readme_example_core_runs() {
+        if !c_compiler_available() {
+            return;
+        }
         let code = build_one_and_run(
             "readme",
             &format!(
@@ -319,6 +349,9 @@ mod tests {
 
     #[test]
     fn files_are_appended_in_order() {
+        if !c_compiler_available() {
+            return;
+        }
         let code = build_and_run(
             "order",
             &[
@@ -390,8 +423,11 @@ mod tests {
 
     #[test]
     fn the_runtime_test_passes() {
+        if !c_compiler_available() {
+            return;
+        }
         let directory = test_directory("runtime");
-        let binary = directory.join("lap_runtime_test");
+        let binary = directory.join(format!("lap_runtime_test{}", std::env::consts::EXE_SUFFIX));
         let status = ProcessCommand::new("cc")
             .arg("-std=c17")
             .arg("-Wall")
@@ -412,6 +448,9 @@ mod tests {
 
     #[test]
     fn a_deep_tail_recursion_runs() {
+        if !c_compiler_available() {
+            return;
+        }
         let input = vec![b'x'; 300_000];
         let (code, output) = build_and_run_with_input("drain", &[DRAIN], &input);
         assert_eq!(code, 0);
