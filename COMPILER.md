@@ -29,11 +29,11 @@ This is why the language does not need arithmetic primitives.
 Each entry names an intrinsic and its lowering. The label is the contract: a function with this label must behave as the intrinsic.
 
 ```
-operation u8.add:
+operation liblapc.u8.add:
     lowering: iadd
 ```
 
-The table is hardcoded. The compiler does not discover entries.
+The table is hardcoded. The compiler does not discover entries. A label is matched whole, including its `liblapc.` prefix; there is no suffix or pattern matching.
 
 ### Matching
 
@@ -47,6 +47,8 @@ An intrinsic is a first-class IR node, not an `EXTERN` call, so later passes sti
 - Matching is by label.
 - Only a whole function matches. Erasure runs before inlining.
 - A miss is never an error. The `NAND` tree is correct, only slower.
+- Erasure applies to values of 64 bits or fewer. A wider function is left as a `NAND` tree.
+- A comparison (`eq`, `lt`, `is.zero`) takes operands of one type and yields a `BIT`. Every other intrinsic yields its operand type.
 
 ### Adding an entry
 

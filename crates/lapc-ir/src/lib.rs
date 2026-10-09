@@ -73,14 +73,40 @@ pub enum Intrinsic {
     Xor,
     Add,
     Sub,
+    Mul,
+    Inc,
+    Dec,
+    ShiftLeftOne,
+    ShiftRightOne,
+    Eq,
+    Lt,
+    IsZero,
+    Select,
 }
 
 impl Intrinsic {
     pub fn arity(&self) -> usize {
         match self {
-            Intrinsic::Not => 1,
-            Intrinsic::And | Intrinsic::Or | Intrinsic::Xor | Intrinsic::Add | Intrinsic::Sub => 2,
+            Intrinsic::Not
+            | Intrinsic::Inc
+            | Intrinsic::Dec
+            | Intrinsic::ShiftLeftOne
+            | Intrinsic::ShiftRightOne
+            | Intrinsic::IsZero => 1,
+            Intrinsic::And
+            | Intrinsic::Or
+            | Intrinsic::Xor
+            | Intrinsic::Add
+            | Intrinsic::Sub
+            | Intrinsic::Mul
+            | Intrinsic::Eq
+            | Intrinsic::Lt => 2,
+            Intrinsic::Select => 3,
         }
+    }
+
+    pub fn is_comparison(&self) -> bool {
+        matches!(self, Intrinsic::Eq | Intrinsic::Lt | Intrinsic::IsZero)
     }
 }
 
@@ -242,6 +268,17 @@ mod tests {
     fn intrinsic_arity_is_fixed() {
         assert_eq!(Intrinsic::Not.arity(), 1);
         assert_eq!(Intrinsic::Add.arity(), 2);
+        assert_eq!(Intrinsic::Select.arity(), 3);
+    }
+
+    #[test]
+    fn only_comparisons_narrow_to_a_bit() {
+        for intrinsic in [Intrinsic::Eq, Intrinsic::Lt, Intrinsic::IsZero] {
+            assert!(intrinsic.is_comparison());
+        }
+        for intrinsic in [Intrinsic::Not, Intrinsic::Add, Intrinsic::Select] {
+            assert!(!intrinsic.is_comparison());
+        }
     }
 
     #[test]
@@ -300,6 +337,15 @@ mod tests {
             Intrinsic::Xor,
             Intrinsic::Add,
             Intrinsic::Sub,
+            Intrinsic::Mul,
+            Intrinsic::Inc,
+            Intrinsic::Dec,
+            Intrinsic::ShiftLeftOne,
+            Intrinsic::ShiftRightOne,
+            Intrinsic::Eq,
+            Intrinsic::Lt,
+            Intrinsic::IsZero,
+            Intrinsic::Select,
         ] {
             assert!(intrinsic.arity() >= 1);
         }

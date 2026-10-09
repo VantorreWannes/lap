@@ -467,11 +467,19 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         if arguments.len() != intrinsic.arity() {
             return Err(CodegenError::new("an intrinsic has the wrong arity"));
         }
-        let width = expected.width();
-        if width <= 64 {
+        let result_width = expected.width();
+        let operand_width = if intrinsic.is_comparison() {
+            self.type_of(&arguments[0])?.width()
+        } else {
+            result_width
+        };
+        if intrinsic == Intrinsic::Select && operand_width != 1 {
+            return Err(CodegenError::new("a select needs a bit condition"));
+        }
+        if operand_width <= 64 {
             let mut words = Vec::new();
             for argument in arguments {
-                words.push(self.lower_word(argument, width)?);
+                words.push(self.lower_word(argument, operand_width)?);
             }
             let word = match intrinsic {
                 Intrinsic::Not => self.builder.ins().bnot(words[0]),
@@ -480,12 +488,37 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
                 Intrinsic::Xor => self.builder.ins().bxor(words[0], words[1]),
                 Intrinsic::Add => self.builder.ins().iadd(words[0], words[1]),
                 Intrinsic::Sub => self.builder.ins().isub(words[0], words[1]),
+                Intrinsic::Mul => self.builder.ins().imul(words[0], words[1]),
+                Intrinsic::Inc => self.builder.ins().iadd_imm_u(words[0], 1),
+                Intrinsic::Dec => {
+                    let one = self.builder.ins().iconst(types::I64, 1);
+                    self.builder.ins().isub(words[0], one)
+                }
+                Intrinsic::ShiftLeftOne => self.builder.ins().ishl_imm_u(words[0], 1),
+                Intrinsic::ShiftRightOne => self.builder.ins().ushr_imm_u(words[0], 1),
+                Intrinsic::Eq => {
+                    let flag = self.builder.ins().icmp(IntCC::Equal, words[0], words[1]);
+                    self.builder.ins().uextend(types::I64, flag)
+                }
+                Intrinsic::Lt => {
+                    let flag = self
+                        .builder
+                        .ins()
+                        .icmp(IntCC::UnsignedLessThan, words[0], words[1]);
+                    self.builder.ins().uextend(types::I64, flag)
+                }
+                Intrinsic::IsZero => {
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    let flag = self.builder.ins().icmp(IntCC::Equal, words[0], zero);
+                    self.builder.ins().uextend(types::I64, flag)
+                }
+                Intrinsic::Select => self.builder.ins().select(words[0], words[1], words[2]),
             };
-            Ok(Lowered::Word(self.mask(word, width)))
+            Ok(Lowered::Word(self.mask(word, result_width)))
         } else {
             let mut values = Vec::new();
             for argument in arguments {
-                values.push(self.lower_wide_argument(argument, width)?);
+                values.push(self.lower_wide_argument(argument, operand_width)?);
             }
             let operation = match intrinsic {
                 Intrinsic::Not => WideOperation::Not,
@@ -494,8 +527,13 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
                 Intrinsic::Xor => WideOperation::Xor,
                 Intrinsic::Add => WideOperation::Add,
                 Intrinsic::Sub => WideOperation::Sub,
+                _ => {
+                    return Err(CodegenError::new(
+                        "an intrinsic is only defined for widths up to 64",
+                    ));
+                }
             };
-            self.lower_wide_operation(operation, &values, width)
+            self.lower_wide_operation(operation, &values, operand_width)
         }
     }
 
@@ -1502,7 +1540,9 @@ mod tests {
         !(left & right) & mask_wide(width)
     }
 
-    fn expected_intrinsic(intrinsic: Intrinsic, left: &[bool], right: &[bool]) -> Vec<bool> {
+    fn expected_intrinsic(intrinsic: Intrinsic, arguments: &[Vec<bool>]) -> Vec<bool> {
+        let left = arguments[0].as_slice();
+        let right = arguments.get(1).map(Vec::as_slice).unwrap_or(&[]);
         match intrinsic {
             Intrinsic::Not => left.iter().map(|value| !value).collect(),
             Intrinsic::And => left
@@ -1522,6 +1562,23 @@ mod tests {
                 .collect(),
             Intrinsic::Add => add_values(left, right),
             Intrinsic::Sub => sub_values(left, right),
+            Intrinsic::Mul => mul_values(left, right),
+            Intrinsic::Inc => add_values(left, &bits_of_value(1, left.len())),
+            Intrinsic::Dec => sub_values(left, &bits_of_value(1, left.len())),
+            Intrinsic::ShiftLeftOne => shift_left(left, 1),
+            Intrinsic::ShiftRightOne => shift_right(left, 1),
+            Intrinsic::Eq => vec![left == right],
+            Intrinsic::Lt => vec![unsigned_less_than(left, right)],
+            Intrinsic::IsZero => vec![left.iter().all(|bit| !bit)],
+            Intrinsic::Select => {
+                let when_one = arguments[1].as_slice();
+                let when_zero = arguments[2].as_slice();
+                left.iter()
+                    .zip(when_one)
+                    .zip(when_zero)
+                    .map(|((flag, one), zero)| if *flag { *one } else { *zero })
+                    .collect()
+            }
         }
     }
 
@@ -1552,6 +1609,37 @@ mod tests {
             borrow = i8::from(difference < 0);
         }
         result
+    }
+
+    fn mul_values(left: &[bool], right: &[bool]) -> Vec<bool> {
+        let mut result = vec![false; left.len()];
+        for (index, bit) in right.iter().enumerate() {
+            if *bit {
+                result = add_values(&result, &shift_left(left, index));
+            }
+        }
+        result
+    }
+
+    fn shift_left(values: &[bool], amount: usize) -> Vec<bool> {
+        (0..values.len())
+            .map(|index| index >= amount && values[index - amount])
+            .collect()
+    }
+
+    fn shift_right(values: &[bool], amount: usize) -> Vec<bool> {
+        (0..values.len())
+            .map(|index| index + amount < values.len() && values[index + amount])
+            .collect()
+    }
+
+    fn unsigned_less_than(left: &[bool], right: &[bool]) -> bool {
+        for (left, right) in left.iter().zip(right).rev() {
+            if left != right {
+                return !*left;
+            }
+        }
+        false
     }
 
     fn mask_wide(width: usize) -> u128 {
@@ -2275,17 +2363,18 @@ mod tests {
             for intrinsic in intrinsics {
                 let left = pattern_bits(width, 2);
                 let right = pattern_bits(width, 4);
-                let arguments = if intrinsic == Intrinsic::Not {
-                    vec![bits(&left)]
+                let argument_bits = if intrinsic == Intrinsic::Not {
+                    vec![left.clone()]
                 } else {
-                    vec![bits(&left), bits(&right)]
+                    vec![left.clone(), right.clone()]
                 };
+                let arguments: Vec<Value> = argument_bits.iter().map(|bits_| bits(bits_)).collect();
                 let program = Program::new(vec![constant_function(
                     "intrinsic",
                     flat_type(width),
                     Value::Intrinsic(intrinsic, arguments),
                 )]);
-                let expected = expected_intrinsic(intrinsic, &left, &right);
+                let expected = expected_intrinsic(intrinsic, &argument_bits);
                 if width <= 64 {
                     assert_eq!(
                         run_word(&program, "intrinsic"),
@@ -2296,6 +2385,65 @@ mod tests {
                     assert_wide_result(&program, "intrinsic", &expected);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn jit_runs_every_new_intrinsic() {
+        let intrinsics = [
+            Intrinsic::Mul,
+            Intrinsic::Inc,
+            Intrinsic::Dec,
+            Intrinsic::ShiftLeftOne,
+            Intrinsic::ShiftRightOne,
+            Intrinsic::Eq,
+            Intrinsic::Lt,
+            Intrinsic::IsZero,
+        ];
+        for width in [1usize, 2, 4, 8, 16, 32, 63, 64] {
+            for intrinsic in intrinsics {
+                let left = pattern_bits(width, 2);
+                let right = pattern_bits(width, 4);
+                let argument_bits = match intrinsic.arity() {
+                    1 => vec![left.clone()],
+                    _ => vec![left.clone(), right.clone()],
+                };
+                let arguments: Vec<Value> = argument_bits.iter().map(|bits_| bits(bits_)).collect();
+                let result = if intrinsic.is_comparison() {
+                    Type::Bit
+                } else {
+                    flat_type(width)
+                };
+                let program = Program::new(vec![constant_function(
+                    "intrinsic",
+                    result,
+                    Value::Intrinsic(intrinsic, arguments),
+                )]);
+                let expected = expected_intrinsic(intrinsic, &argument_bits);
+                assert_eq!(
+                    run_word(&program, "intrinsic"),
+                    bits_to_word(&expected, 0, expected.len()),
+                    "for {intrinsic:?} at width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jit_runs_select() {
+        for (flag, when_one, when_zero) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            let value = Value::Intrinsic(
+                Intrinsic::Select,
+                vec![bit(flag), bit(when_one), bit(when_zero)],
+            );
+            let program = Program::new(vec![constant_function("select", Type::Bit, value)]);
+            let expected = if flag { when_one } else { when_zero };
+            assert_eq!(run_word(&program, "select"), i64::from(expected));
         }
     }
 
@@ -2433,7 +2581,7 @@ mod tests {
 
     #[test]
     fn jit_runs_an_erased_program() {
-        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nu8.add = (a: U8, b: U8) U8 { [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO] }\nmain = () BIT { sum: U8 = u8.add([BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ZERO], [BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO])\n [b0, b1, b2, b3, b4, b5, b6, b7] = sum\n b7 }\n";
+        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nliblapc.u8.add = (a: U8, b: U8) U8 { [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO] }\nmain = () BIT { sum: U8 = liblapc.u8.add([BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ZERO], [BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO])\n [b0, b1, b2, b3, b4, b5, b6, b7] = sum\n b7 }\n";
         let program = lapc_erase::erase_intrinsics(compile_source(source));
         assert_eq!(run_word(&program, "main"), 1);
     }
@@ -2712,7 +2860,7 @@ mod tests {
 
     #[test]
     fn jit_runs_every_erased_intrinsic() {
-        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nbit.not = (a: BIT) BIT { NAND(a, a) }\nbit.xor = (a: BIT, b: BIT) BIT { BIT.ZERO }\nbit.or = (a: BIT, b: BIT) BIT { BIT.ZERO }\nbit.and = (a: BIT, b: BIT) BIT { BIT.ZERO }\nu8.sub = (a: U8, b: U8) U8 { [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO] }\nu8.add = (a: U8, b: U8) U8 { [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO] }\nmain = () BIT { plain: BIT = bit.and(bit.not(BIT.ZERO), bit.or(BIT.ZERO, bit.xor(BIT.ONE, BIT.ZERO)))\n difference: U8 = u8.sub([BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO], [BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO])\n [b0, b1, b2, b3, b4, b5, b6, b7] = difference\n NAND(plain, b7) }\n";
+        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nliblapc.bit.not = (a: BIT) BIT { NAND(a, a) }\nliblapc.bit.xor = (a: BIT, b: BIT) BIT { BIT.ZERO }\nliblapc.bit.or = (a: BIT, b: BIT) BIT { BIT.ZERO }\nliblapc.bit.and = (a: BIT, b: BIT) BIT { BIT.ZERO }\nliblapc.u8.sub = (a: U8, b: U8) U8 { [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO] }\nliblapc.u8.add = (a: U8, b: U8) U8 { [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO] }\nmain = () BIT { plain: BIT = liblapc.bit.and(liblapc.bit.not(BIT.ZERO), liblapc.bit.or(BIT.ZERO, liblapc.bit.xor(BIT.ONE, BIT.ZERO)))\n difference: U8 = liblapc.u8.sub([BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO], [BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO])\n [b0, b1, b2, b3, b4, b5, b6, b7] = difference\n NAND(plain, b7) }\n";
         let program = lapc_erase::erase_intrinsics(compile_source(source));
         assert_eq!(run_word(&program, "main"), 0);
     }
