@@ -191,7 +191,7 @@ fn link(directory: &Path, object: &[u8], output: &Path) -> Result<(), DriverErro
     write(&entry_path, ENTRY_SOURCE.as_bytes())?;
     let compiler = find_compiler()?;
     let mut command = compiler.command();
-    command.arg("-std=c17").arg("-O2");
+    command.arg("-std=c17").arg("-O2").arg("-Wl,-S");
     if cfg!(target_os = "linux") {
         command.arg("-no-pie");
     }

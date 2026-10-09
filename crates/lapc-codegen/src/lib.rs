@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::IntCC;
@@ -27,7 +27,7 @@ pub fn emit_object(program: &Program) -> Result<Vec<u8>, CodegenError> {
     let builder = ObjectBuilder::new(instruction_set, "lap", default_libcall_names())
         .map_err(|error| CodegenError::new(error.to_string()))?;
     let mut module = ObjectModule::new(builder);
-    lower_program(&mut module, program)?;
+    lower_selected(&mut module, program, &emitted_labels(program))?;
     module
         .finish()
         .emit()
@@ -67,12 +67,29 @@ fn host_instruction_set() -> Result<OwnedTargetIsa, CodegenError> {
         .map_err(|error| CodegenError::new(error.to_string()))
 }
 
+#[cfg(test)]
 fn lower_program<M: Module>(
     module: &mut M,
     program: &Program,
 ) -> Result<HashMap<String, FuncId>, CodegenError> {
+    let labels: HashSet<&str> = program
+        .functions()
+        .iter()
+        .map(|function| function.label().text())
+        .collect();
+    lower_selected(module, program, &labels)
+}
+
+fn lower_selected<M: Module>(
+    module: &mut M,
+    program: &Program,
+    labels: &HashSet<&str>,
+) -> Result<HashMap<String, FuncId>, CodegenError> {
     let mut functions = HashMap::new();
     for function in program.functions() {
+        if !labels.contains(function.label().text()) {
+            continue;
+        }
         let signature = function_signature(module, function);
         let identifier = module
             .declare_function(
@@ -100,6 +117,9 @@ fn lower_program<M: Module>(
     let mut context = module.make_context();
     let mut builder_context = FunctionBuilderContext::new();
     for function in program.functions() {
+        if !labels.contains(function.label().text()) {
+            continue;
+        }
         let identifier = symbols
             .functions
             .get(function.label().text())
@@ -166,6 +186,89 @@ fn lower_function<M: Module>(
     }
     builder.finalize(module.target_config());
     Ok(())
+}
+
+fn emitted_labels(program: &Program) -> HashSet<&str> {
+    if !program
+        .functions()
+        .iter()
+        .any(|function| function.label().text() == "main")
+    {
+        return program
+            .functions()
+            .iter()
+            .map(|function| function.label().text())
+            .collect();
+    }
+    let mut labels = HashSet::new();
+    let mut pending = vec!["main"];
+    while let Some(label) = pending.pop() {
+        if !labels.insert(label) {
+            continue;
+        }
+        let function = match program
+            .functions()
+            .iter()
+            .find(|function| function.label().text() == label)
+        {
+            Some(function) => function,
+            None => continue,
+        };
+        let mut calls = Vec::new();
+        collect_block_calls(function.body(), &mut calls);
+        for call in calls {
+            if !labels.contains(call) {
+                pending.push(call);
+            }
+        }
+    }
+    labels
+}
+
+fn collect_value_calls<'program>(value: &'program Value, calls: &mut Vec<&'program str>) {
+    match value {
+        Value::Call(label, arguments) => {
+            calls.push(label.text());
+            for argument in arguments {
+                collect_value_calls(argument, calls);
+            }
+        }
+        Value::Nand(left, right) => {
+            collect_value_calls(left, calls);
+            collect_value_calls(right, calls);
+        }
+        Value::Intrinsic(_, arguments)
+        | Value::Collection(arguments)
+        | Value::Extern(_, arguments) => {
+            for argument in arguments {
+                collect_value_calls(argument, calls);
+            }
+        }
+        Value::Element { collection, .. } => collect_value_calls(collection, calls),
+        Value::Load(reference) => collect_value_calls(reference, calls),
+        Value::Reference { .. } | Value::Constant(_) => {}
+        Value::Branch(condition, then, otherwise) => {
+            collect_value_calls(condition, calls);
+            collect_block_calls(then, calls);
+            collect_block_calls(otherwise, calls);
+        }
+    }
+}
+
+fn collect_block_calls<'program>(block: &'program Block, calls: &mut Vec<&'program str>) {
+    for statement in block.statements() {
+        match statement {
+            Statement::Bind { value, .. } => collect_value_calls(value, calls),
+            Statement::Store { reference, value } => {
+                collect_value_calls(reference, calls);
+                collect_value_calls(value, calls);
+            }
+            Statement::Evaluate { value } => collect_value_calls(value, calls),
+        }
+    }
+    if let Some(result) = block.result() {
+        collect_value_calls(result, calls);
+    }
 }
 
 struct ProgramSymbols<'program> {
@@ -3819,6 +3922,105 @@ mod tests {
         );
         let program = Program::new(vec![first, second]);
         assert!(emit_object(&program).is_ok());
+    }
+
+    #[test]
+    fn emitted_labels_follow_calls_from_main() {
+        let leaf = constant_function("leaf", Type::Bit, bit(false));
+        let middle = function(
+            "middle",
+            vec![],
+            Type::Bit,
+            vec![],
+            block(vec![], Value::Call(Label::new("leaf"), vec![])),
+        );
+        let main = function(
+            "main",
+            vec![],
+            Type::Bit,
+            vec![],
+            block(vec![], Value::Call(Label::new("middle"), vec![])),
+        );
+        let unused = constant_function("unused", Type::Bit, bit(true));
+        let program = Program::new(vec![leaf, middle, main, unused]);
+        let expected: HashSet<&str> = ["main", "middle", "leaf"].into_iter().collect();
+        assert_eq!(emitted_labels(&program), expected);
+    }
+
+    #[test]
+    fn emitted_labels_follow_calls_inside_blocks() {
+        let leaf = constant_function("leaf", Type::Bit, bit(false));
+        let main = function(
+            "main",
+            vec![],
+            Type::Bit,
+            vec![],
+            block(
+                vec![Statement::Bind {
+                    slot: Slot::new(0),
+                    value: Value::Call(Label::new("leaf"), vec![]),
+                }],
+                Value::Branch(
+                    Box::new(bit(true)),
+                    Block::new(
+                        vec![],
+                        Some(Box::new(Value::Call(Label::new("leaf"), vec![]))),
+                    ),
+                    Block::new(
+                        vec![Statement::Evaluate {
+                            value: Value::Call(Label::new("leaf"), vec![]),
+                        }],
+                        None,
+                    ),
+                ),
+            ),
+        );
+        let program = Program::new(vec![leaf, main]);
+        let expected: HashSet<&str> = ["main", "leaf"].into_iter().collect();
+        assert_eq!(emitted_labels(&program), expected);
+    }
+
+    #[test]
+    fn emitted_labels_keep_every_function_without_a_main() {
+        let first = constant_function("first", Type::Bit, bit(false));
+        let second = constant_function("second", Type::Bit, bit(true));
+        let program = Program::new(vec![first, second]);
+        let expected: HashSet<&str> = ["first", "second"].into_iter().collect();
+        assert_eq!(emitted_labels(&program), expected);
+    }
+
+    #[test]
+    fn unreachable_functions_are_not_emitted() {
+        let broken = function(
+            "broken",
+            vec![],
+            Type::Bit,
+            vec![],
+            block(vec![], Value::Intrinsic(Intrinsic::Not, vec![])),
+        );
+        let main = constant_function("main", Type::Bit, bit(false));
+        let program = Program::new(vec![broken, main]);
+        assert!(emit_object(&program).is_ok());
+    }
+
+    #[test]
+    fn a_reachable_broken_function_is_emitted() {
+        let broken = function(
+            "broken",
+            vec![],
+            Type::Bit,
+            vec![],
+            block(vec![], Value::Intrinsic(Intrinsic::Not, vec![])),
+        );
+        let main = function(
+            "main",
+            vec![],
+            Type::Bit,
+            vec![],
+            block(vec![], Value::Call(Label::new("broken"), vec![])),
+        );
+        let program = Program::new(vec![broken, main]);
+        assert!(emit_object(&program).is_err());
     }
 
     #[test]

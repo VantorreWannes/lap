@@ -12,7 +12,7 @@
 
 `lapc` takes one or more files and appends them in the order given, top to bottom. The result is one program.
 
-`lapc check` checks a program. `lapc build` emits an object and links it with the runtime using a C compiler. `CC` names the compiler when set; otherwise the driver tries `cc`, `gcc`, `clang`, and `zig cc`, in that order, and uses the first that can compile the runtime. The runtime needs a POSIX-style C compiler: on Windows, a MinGW-w64 toolchain such as zig or MSYS2, not MSVC. On Linux the link passes `-no-pie`, because the object reaches `lap_extern` through an absolute address.
+`lapc check` checks a program. `lapc build` emits an object and links it with the runtime using a C compiler. `CC` names the compiler when set; otherwise the driver tries `cc`, `gcc`, `clang`, and `zig cc`, in that order, and uses the first that can compile the runtime. The runtime needs a POSIX-style C compiler: on Windows, a MinGW-w64 toolchain such as zig or MSYS2, not MSVC. On Linux the link passes `-no-pie`, because the object reaches `lap_extern` through an absolute address. The link strips debug sections, so a program does not carry the runtime library's debug info.
 
 ## Structure
 
@@ -62,7 +62,7 @@ An intrinsic is a first-class IR node, not an `EXTERN` call, so later passes sti
 
 A value of 64 bits or fewer is a word. A wider value is a stack slot. A reference is a pointer to a slot. `NAND` is `and` then `xor`, plus a mask when the width is under 64.
 
-A call whose arguments contain no call and no `EXTERN` is lowered inline when the callee's body is one expression and every block in it holds no statements. A division lowers to a zero-checked divide; a constant divisor lowers to a shift or to a multiply and a shift instead when one exists.
+A call whose arguments contain no call and no `EXTERN` is lowered inline when the callee's body is one expression and every block in it holds no statements. A division lowers to a zero-checked divide; a constant divisor lowers to a shift or to a multiply and a shift instead when one exists. Only functions reachable from `main` are emitted; a program without `main` emits every function.
 
 ## Runtime interface
 
