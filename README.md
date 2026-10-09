@@ -1,8 +1,12 @@
 # Labels and Primitives
 
-Labels and Primitives is a timeless, cross-paradigm, unchangeable programming language. Only the tooling and compiler implementations around it may change.
+Labels and Primitives (Lap) is a timeless, cross-paradigm, unchangeable programming language. Only the tooling and compiler implementations around it may change.
+
+This document is the language definition. Compiler crates implement it; they do not extend or reinterpret it.
 
 ## Primitives
+
+The language is built from eight primitives. Every other construct derives from them.
 
 - `BIT`: The data primitive. Initialized to an arbitrary state.
 - `NAND`: The operation primitive. Computes Sheffer stroke over two `BIT` values.
@@ -128,12 +132,16 @@ main = () BIT {
 
 ## Truth Values
 
+The standard logic operators are derived from `NAND`:
+
 - `not a = NAND(a, a)`
 - `a and b = NAND(NAND(a, b), NAND(a, b))`
 - `a or b = NAND(NAND(a, a), NAND(b, b))`
 - `a xor b = NAND(NAND(a, NAND(a, b)), NAND(b, NAND(a, b)))`
 
 ## Formal Grammar
+
+Whitespace and comments are stripped before parsing.
 
 ```ebnf
 Program        ::= Statement*
@@ -153,13 +161,15 @@ Expression     ::= Primary
                  | NandExpr
                  | CollectionExpr
                  | FunctionDef
+                 | CallExpr
 
 Primary        ::= Label | "*" Label | "BIT"
 
 NandExpr       ::= "NAND" "(" Expression "," Expression ")"
 BranchExpr     ::= "BRANCH" "(" Expression ")" Block Block
-CallExpr       ::= "EXTERN" "(" Expression ("," Expression)* ")"
+ExternExpr     ::= "EXTERN" "(" Expression ("," Expression)* ")"
 CollectionExpr ::= "[" (Expression ("," Expression)*)? "]"
+CallExpr       ::= Label "(" (Expression ("," Expression)*)? ")"
 
 FunctionDef    ::= "(" ParamList? ")" Type Block
 ParamList      ::= Param ("," Param)*
@@ -171,4 +181,5 @@ Type           ::= "BIT"
 
 Block          ::= "{" Statement* Expression? "}"
 Label          ::= [a-zA-Z0-9]+ ( ("_" | ".") [a-zA-Z0-9]+ )*
+Comment        ::= "//" [^\n]*
 ```
