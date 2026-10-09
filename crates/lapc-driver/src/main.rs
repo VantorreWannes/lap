@@ -120,11 +120,15 @@ fn compiler_candidates() -> Vec<Compiler> {
     ]
 }
 
-static PROBE_NUMBER: AtomicUsize = AtomicUsize::new(0);
+static TEMPORARY_NUMBER: AtomicUsize = AtomicUsize::new(0);
+
+fn temporary_path(name: &str) -> PathBuf {
+    let number = TEMPORARY_NUMBER.fetch_add(1, Ordering::Relaxed);
+    env::temp_dir().join(format!("lapc-{}-{number}-{name}", std::process::id()))
+}
 
 fn compiler_builds_runtime(compiler: &Compiler) -> bool {
-    let number = PROBE_NUMBER.fetch_add(1, Ordering::Relaxed);
-    let source = env::temp_dir().join(format!("lapc-probe-{}-{number}.c", std::process::id()));
+    let source = temporary_path("probe.c");
     let object = source.with_extension("o");
     if fs::write(&source, RUNTIME_SOURCE).is_err() {
         return false;
@@ -168,15 +172,21 @@ fn build(program: &lapc_ir::Program, output: &Path) -> Result<(), DriverError> {
     let object = emit_object(program).map_err(|error| DriverError::Codegen {
         message: format!("{error:?}"),
     })?;
-    let directory = output.with_extension("lapc");
+    let directory = temporary_path("build");
     fs::create_dir_all(&directory).map_err(|error| DriverError::Write {
         path: directory.display().to_string(),
         message: error.to_string(),
     })?;
+    let result = link(&directory, &object, output);
+    let _ = fs::remove_dir_all(&directory);
+    result
+}
+
+fn link(directory: &Path, object: &[u8], output: &Path) -> Result<(), DriverError> {
     let object_path = directory.join("program.o");
     let runtime_path = directory.join("lap_runtime.c");
     let entry_path = directory.join("lap_entry.c");
-    write(&object_path, &object)?;
+    write(&object_path, object)?;
     write(&runtime_path, RUNTIME_SOURCE.as_bytes())?;
     write(&entry_path, ENTRY_SOURCE.as_bytes())?;
     let compiler = find_compiler()?;
