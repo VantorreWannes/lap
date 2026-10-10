@@ -649,6 +649,9 @@ impl<'program> Emitter<'program> {
         if intrinsic == Intrinsic::DivMod {
             return self.divide(arguments, expected);
         }
+        if intrinsic == Intrinsic::AddWithCarry || intrinsic == Intrinsic::SubWithBorrow {
+            return self.carry(intrinsic, arguments, expected);
+        }
         let width = expected.width();
         if width > 64 {
             let helper = match intrinsic {
@@ -694,10 +697,76 @@ impl<'program> Emitter<'program> {
             Intrinsic::DivMod => {
                 return Err("a division is lowered before word operations".to_string());
             }
+            Intrinsic::AddWithCarry | Intrinsic::SubWithBorrow => {
+                return Err("a carry operation is lowered before word operations".to_string());
+            }
         };
         Ok(Emitted::Word(format!(
             "(({expression}) & lap_mask({width}))"
         )))
+    }
+
+    fn carry(
+        &mut self,
+        intrinsic: Intrinsic,
+        arguments: &[Value],
+        expected: &Type,
+    ) -> Result<Emitted, String> {
+        if arguments.len() != 3 {
+            return Err("a carry operation has the wrong arity".to_string());
+        }
+        let operand_type = self.type_of(&arguments[0])?;
+        let operand_width = operand_type.width();
+        if operand_width > 64 {
+            return Err("a carry operation is only defined for widths up to 64".to_string());
+        }
+        let paired = matches!(
+            expected,
+            Type::Collection(elements)
+                if elements.len() == 2
+                    && elements[0] == operand_type
+                    && elements[1] == Type::Bit
+        );
+        if !paired {
+            return Err("a carry operation has the wrong type".to_string());
+        }
+        let left = self.word(&arguments[0], &operand_type)?;
+        let right = self.word(&arguments[1], &operand_type)?;
+        let carry = self.word(&arguments[2], &Type::Bit)?;
+        let left_name = self.temporary_word();
+        let right_name = self.temporary_word();
+        let carry_name = self.temporary_word();
+        self.line(format!("{left_name} = {left};"));
+        self.line(format!("{right_name} = {right};"));
+        self.line(format!("{carry_name} = {carry};"));
+        let partial_name = self.temporary_word();
+        let first_name = self.temporary_word();
+        let total_name = self.temporary_word();
+        let second_name = self.temporary_word();
+        if intrinsic == Intrinsic::AddWithCarry {
+            self.line(format!("{partial_name} = {left_name} + {right_name};"));
+            self.line(format!("{first_name} = {partial_name} < {left_name};"));
+            self.line(format!("{total_name} = {partial_name} + {carry_name};"));
+            self.line(format!("{second_name} = {total_name} < {partial_name};"));
+        } else {
+            self.line(format!("{partial_name} = {left_name} - {right_name};"));
+            self.line(format!("{first_name} = {left_name} < {right_name};"));
+            self.line(format!("{total_name} = {partial_name} - {carry_name};"));
+            self.line(format!("{second_name} = {partial_name} < {carry_name};"));
+        }
+        let out = format!("({first_name} | {second_name})");
+        let width = expected.width();
+        if width <= 64 {
+            return Ok(Emitted::Word(format!(
+                "((({total_name}) | (({out}) << {operand_width})) & lap_mask({width}))"
+            )));
+        }
+        let name = self.temporary_array(width);
+        self.line(format!(
+            "lap_store({name}, 0, {operand_width}, {total_name});"
+        ));
+        self.line(format!("lap_store({name}, {operand_width}, 1, {out});"));
+        Ok(Emitted::Pointer(name))
     }
 
     fn divide(&mut self, arguments: &[Value], expected: &Type) -> Result<Emitted, String> {
@@ -1009,20 +1078,14 @@ impl<'program> Emitter<'program> {
             Value::Constant(bits) => Ok(flat_type(bits.width())),
             Value::Nand(left, _) => self.type_of(left),
             Value::Intrinsic(intrinsic, arguments) => {
-                if *intrinsic == Intrinsic::DivMod {
-                    let operand = arguments
-                        .first()
-                        .ok_or_else(|| "an intrinsic has no arguments".to_string())?;
-                    let operand = self.type_of(operand)?;
-                    return Ok(Type::Collection(vec![operand.clone(), operand]));
-                }
                 if intrinsic.is_comparison() {
                     return Ok(Type::Bit);
                 }
                 let argument = arguments
                     .first()
                     .ok_or_else(|| "an intrinsic has no arguments".to_string())?;
-                self.type_of(argument)
+                let operand = self.type_of(argument)?;
+                Ok(intrinsic.result_type(&operand))
             }
             Value::Collection(elements) => {
                 let mut types = Vec::new();
@@ -1383,25 +1446,33 @@ mod tests {
     }
 
     fn add_values(left: &[bool], right: &[bool]) -> Vec<bool> {
+        add_with_carry_values(left, right, false).0
+    }
+
+    fn add_with_carry_values(left: &[bool], right: &[bool], carry: bool) -> (Vec<bool>, bool) {
         let mut result = Vec::with_capacity(left.len());
-        let mut carry = 0u8;
+        let mut carry = u8::from(carry);
         for (left, right) in left.iter().zip(right) {
             let sum = u8::from(*left) + u8::from(*right) + carry;
             result.push(sum & 1 == 1);
             carry = sum >> 1;
         }
-        result
+        (result, carry == 1)
     }
 
     fn sub_values(left: &[bool], right: &[bool]) -> Vec<bool> {
+        sub_with_borrow_values(left, right, false).0
+    }
+
+    fn sub_with_borrow_values(left: &[bool], right: &[bool], borrow: bool) -> (Vec<bool>, bool) {
         let mut result = Vec::with_capacity(left.len());
-        let mut borrow = 0i8;
+        let mut borrow = i8::from(borrow);
         for (left, right) in left.iter().zip(right) {
             let difference = i8::from(*left) - i8::from(*right) - borrow;
             result.push(difference & 1 == 1);
             borrow = i8::from(difference < 0);
         }
-        result
+        (result, borrow == 1)
     }
 
     fn mul_values(left: &[bool], right: &[bool]) -> Vec<bool> {
@@ -1483,6 +1554,18 @@ mod tests {
                 };
                 let mut result = bits_of_value(quotient, left.len());
                 result.extend(bits_of_value(remainder, left.len()));
+                result
+            }
+            lapc_ir::Intrinsic::AddWithCarry => {
+                let (sum, out) = add_with_carry_values(left, right, arguments[2][0]);
+                let mut result = sum;
+                result.push(out);
+                result
+            }
+            lapc_ir::Intrinsic::SubWithBorrow => {
+                let (difference, out) = sub_with_borrow_values(left, right, arguments[2][0]);
+                let mut result = difference;
+                result.push(out);
                 result
             }
         }
@@ -1613,6 +1696,45 @@ mod tests {
                 elements.push(Value::Intrinsic(intrinsic, arguments));
                 types.push(result);
                 expected.extend(expected_intrinsic(intrinsic, &argument_bits));
+            }
+            let program = Program::new(vec![constant_function(
+                "intrinsic",
+                Type::Collection(types),
+                Value::Collection(elements),
+            )]);
+            if expected.len() <= 64 {
+                assert_word(
+                    &program,
+                    "intrinsic",
+                    bits_to_word(&expected, expected.len()),
+                );
+            } else {
+                assert_wide(&program, "intrinsic", &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn runs_carry_intrinsics() {
+        let intrinsics = [
+            lapc_ir::Intrinsic::AddWithCarry,
+            lapc_ir::Intrinsic::SubWithBorrow,
+        ];
+        for width in [1usize, 2, 4, 8, 16, 32, 63, 64] {
+            let mut elements = Vec::new();
+            let mut types = Vec::new();
+            let mut expected = Vec::new();
+            for intrinsic in intrinsics {
+                for carry in [false, true] {
+                    let left = pattern_bits(width, 2);
+                    let right = pattern_bits(width, 4);
+                    let argument_bits = vec![left.clone(), right.clone(), vec![carry]];
+                    let arguments: Vec<Value> =
+                        argument_bits.iter().map(|bits_| bits(bits_)).collect();
+                    elements.push(Value::Intrinsic(intrinsic, arguments));
+                    types.push(Type::Collection(vec![flat_type(width), Type::Bit]));
+                    expected.extend(expected_intrinsic(intrinsic, &argument_bits));
+                }
             }
             let program = Program::new(vec![constant_function(
                 "intrinsic",
@@ -2882,21 +3004,33 @@ mod tests {
     }
 
     #[test]
-    fn runs_an_erased_division() {
-        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nliblapc.u8.div.mod = (value: U8, divisor: U8) [U8, U8] { [[BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO], [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO]] }\nmain = () BIT { [quotient, remainder] = liblapc.u8.div.mod([BIT.ZERO, BIT.ONE, BIT.ZERO, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ZERO, BIT.ONE], [BIT.ZERO, BIT.ONE, BIT.ZERO, BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO])\n [q0, q1, q2, q3, q4, q5, q6, q7] = quotient\n [r0, r1, r2, r3, r4, r5, r6, r7] = remainder\n NAND(NAND(q4, r1), NAND(q4, r1)) }\n";
-        assert_word(&compile_source(source), "main", 1);
-    }
-
-    #[test]
     fn runs_an_erased_program() {
-        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nliblapc.u8.add = (a: U8, b: U8) U8 { [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO] }\nmain = () BIT { sum: U8 = liblapc.u8.add([BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ZERO], [BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO])\n [b0, b1, b2, b3, b4, b5, b6, b7] = sum\n b7 }\n";
+        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nintrinsic.u8.add.with.carry = (left: U8, right: U8, carry: BIT) [U8, BIT] { [[BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO], BIT.ZERO] }\nmain = () BIT { [sum, carry] = intrinsic.u8.add.with.carry([BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ZERO], [BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO], BIT.ZERO)\n [b0, b1, b2, b3, b4, b5, b6, b7] = sum\n b7 }\n";
         assert_word(&compile_source(source), "main", 1);
     }
 
     #[test]
     fn runs_every_erased_intrinsic() {
-        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nliblapc.bit.not = (a: BIT) BIT { NAND(a, a) }\nliblapc.bit.xor = (a: BIT, b: BIT) BIT { BIT.ZERO }\nliblapc.bit.or = (a: BIT, b: BIT) BIT { BIT.ZERO }\nliblapc.bit.and = (a: BIT, b: BIT) BIT { BIT.ZERO }\nliblapc.u8.sub = (a: U8, b: U8) U8 { [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO] }\nliblapc.u8.add = (a: U8, b: U8) U8 { [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO] }\nmain = () BIT { plain: BIT = liblapc.bit.and(liblapc.bit.not(BIT.ZERO), liblapc.bit.or(BIT.ZERO, liblapc.bit.xor(BIT.ONE, BIT.ZERO)))\n difference: U8 = liblapc.u8.sub([BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO], [BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO])\n [b0, b1, b2, b3, b4, b5, b6, b7] = difference\n NAND(plain, b7) }\n";
+        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nintrinsic.bit.not = (a: BIT) BIT { NAND(a, a) }\nintrinsic.bit.exclusive.or = (a: BIT, b: BIT) BIT { BIT.ZERO }\nintrinsic.bit.or = (a: BIT, b: BIT) BIT { BIT.ZERO }\nintrinsic.bit.and = (a: BIT, b: BIT) BIT { BIT.ZERO }\nintrinsic.u8.sub.with.borrow = (left: U8, right: U8, borrow: BIT) [U8, BIT] { [[BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO], BIT.ZERO] }\nintrinsic.u8.add.with.carry = (left: U8, right: U8, carry: BIT) [U8, BIT] { [[BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO], BIT.ZERO] }\nmain = () BIT { plain: BIT = intrinsic.bit.and(intrinsic.bit.not(BIT.ZERO), intrinsic.bit.or(BIT.ZERO, intrinsic.bit.exclusive.or(BIT.ONE, BIT.ZERO)))\n [difference, borrow] = intrinsic.u8.sub.with.borrow([BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO], [BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO], BIT.ZERO)\n [b0, b1, b2, b3, b4, b5, b6, b7] = difference\n NAND(plain, b7) }\n";
         assert_word(&compile_source(source), "main", 0);
+    }
+
+    #[test]
+    fn runs_an_erased_intrinsic_label() {
+        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nintrinsic.bit.not = (value: BIT) BIT { NAND(value, value) }\nmain = () BIT { intrinsic.bit.not(BIT.ZERO) }\n";
+        assert_word(&compile_source(source), "main", 1);
+    }
+
+    #[test]
+    fn runs_an_erased_add_with_carry() {
+        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nU8.MAX = [BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE]\nU8.ONE = [BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO]\nintrinsic.u8.add.with.carry = (left: U8, right: U8, carry: BIT) [U8, BIT] { [left, BIT.ZERO] }\nmain = () BIT { [sum, carry] = intrinsic.u8.add.with.carry(U8.MAX, U8.ONE, BIT.ZERO)\n carry }\n";
+        assert_word(&compile_source(source), "main", 1);
+    }
+
+    #[test]
+    fn runs_an_erased_sub_with_borrow() {
+        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nU8.ZERO = [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO]\nU8.ONE = [BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO]\nintrinsic.u8.sub.with.borrow = (left: U8, right: U8, borrow: BIT) [U8, BIT] { [left, BIT.ZERO] }\nmain = () BIT { [difference, borrow] = intrinsic.u8.sub.with.borrow(U8.ZERO, U8.ONE, BIT.ZERO)\n borrow }\n";
+        assert_word(&compile_source(source), "main", 1);
     }
 
     #[test]

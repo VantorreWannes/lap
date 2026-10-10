@@ -29,21 +29,23 @@ This is why the language does not need arithmetic primitives.
 Each entry names an intrinsic and its lowering. The label is the contract: a function with this label must behave as the intrinsic.
 
 ```
-operation liblapc.u8.add:
-    lowering: iadd
+operation intrinsic.u8.add.with.carry:
+    lowering: add with carry
 ```
 
-The table is hardcoded. The compiler does not discover entries. A label is matched whole, including its `liblapc.` prefix; there is no suffix or pattern matching.
+The table is hardcoded. The compiler does not discover entries. A label is matched whole, including its `intrinsic.` prefix; there is no suffix or pattern matching.
 
 ### Declaring
 
-A function whose label is in the table is declared with an empty collection in place of a signature and a body:
+A function whose label is in the table may be declared with an empty collection in place of a signature and a body:
 
 ```
-liblapc.u8.add = []
+intrinsic.u8.add.with.carry = []
 ```
 
-The compiler derives the signature from the label. The segment after `liblapc.` names the operand type, and the table entry names the arity and the result. The erasure pass then replaces the body.
+The compiler derives the signature from the label. The segment after the `intrinsic.` prefix names the operand type, and the table entry names the arity and the result. The erasure pass then replaces the body.
+
+A function whose label is in the table may also carry a body. The body is the reference implementation, and the erasure pass replaces it the same way.
 
 A label outside the table keeps the language rule: `label = []` binds the empty collection type.
 
@@ -60,8 +62,8 @@ An intrinsic is a first-class IR node, not an `EXTERN` call, so later passes sti
 - Only a whole function matches. Erasure runs before inlining.
 - A miss is never an error. The `NAND` tree is correct, only slower.
 - Erasure applies to values of 64 bits or fewer. A wider function is left as a `NAND` tree.
-- A comparison (`eq`, `lt`, `is.zero`) takes operands of one type and yields a `BIT`. Every other intrinsic yields its operand type.
-- A division (`div.mod`) takes two operands of one type and yields their quotient and remainder as a pair, quotient first. A zero divisor yields two zeroes.
+- A comparison (`equal`) takes operands of one type and yields a `BIT`. Every other intrinsic yields its operand type.
+- A carry operation (`add.with.carry`, `sub.with.borrow`) takes two operands of one type and a `BIT` carry or borrow, and yields the result and the carry or borrow out as a pair, result first.
 
 ### Adding an entry
 

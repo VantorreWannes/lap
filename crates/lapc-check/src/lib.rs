@@ -1202,11 +1202,11 @@ mod tests {
     #[test]
     fn an_erased_function_is_declared_with_an_empty_collection() {
         let program = check(
-            "liblapc.bit.not = []\n\
-             main = () BIT { liblapc.bit.not(BIT.ONE) }\n",
+            "intrinsic.bit.not = []\n\
+             main = () BIT { intrinsic.bit.not(BIT.ONE) }\n",
         )
         .expect("the program checks");
-        let erased = function(&program, "liblapc.bit.not");
+        let erased = function(&program, "intrinsic.bit.not");
         assert_eq!(erased.parameters().len(), 1);
         assert_eq!(erased.result(), &Type::Bit);
     }
@@ -1214,18 +1214,15 @@ mod tests {
     #[test]
     fn an_erased_function_derives_its_signature_from_its_label() {
         let source = format!(
-            "U64 = [{}]\nliblapc.u64.div.mod = []\nmain = () BIT {{ BIT.ZERO }}\n",
+            "U64 = [{}]\nintrinsic.u64.add.with.carry = []\nmain = () BIT {{ BIT.ZERO }}\n",
             type_list(64)
         );
         let program = check(&source).expect("the program checks");
-        let erased = function(&program, "liblapc.u64.div.mod");
-        assert_eq!(erased.parameters().len(), 2);
+        let erased = function(&program, "intrinsic.u64.add.with.carry");
+        assert_eq!(erased.parameters().len(), 3);
         assert_eq!(
             erased.result(),
-            &Type::Collection(vec![
-                Type::Collection(vec![Type::Bit; 64]),
-                Type::Collection(vec![Type::Bit; 64]),
-            ])
+            &Type::Collection(vec![Type::Collection(vec![Type::Bit; 64]), Type::Bit])
         );
     }
 

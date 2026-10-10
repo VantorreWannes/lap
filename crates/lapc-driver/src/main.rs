@@ -375,7 +375,7 @@ mod tests {
         let code = build_one_and_run(
             "erased",
             &format!(
-                "{PRELUDE}liblapc.bit.not = []\nmain = () BIT {{ liblapc.bit.not(BIT.ZERO) }}\n"
+                "{PRELUDE}intrinsic.bit.not = []\nmain = () BIT {{ intrinsic.bit.not(BIT.ZERO) }}\n"
             ),
         );
         assert_eq!(code, 1);

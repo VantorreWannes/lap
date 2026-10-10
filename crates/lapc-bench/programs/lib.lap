@@ -73,39 +73,148 @@ STREAM.OUT = U64.ONE
 
 // An erased function is declared with an empty collection. The compiler knows
 // its signature from the label, and the erasure pass replaces the body with the
-// intrinsic.
-liblapc.bit.not = []
-liblapc.bit.and = []
-liblapc.bit.or = []
-liblapc.bit.xor = []
-liblapc.bit.select = []
+// intrinsic. Only a label prefixed with intrinsic. is recognized.
+intrinsic.bit.not = []
+intrinsic.bit.and = []
+intrinsic.bit.or = []
+intrinsic.bit.exclusive.or = []
+intrinsic.bit.select = []
 
-liblapc.u8.add = []
-liblapc.u8.sub = []
-liblapc.u8.mul = []
-liblapc.u8.and = []
-liblapc.u8.or = []
-liblapc.u8.xor = []
-liblapc.u8.not = []
-liblapc.u8.shift.left.one = []
-liblapc.u8.shift.right.one = []
-liblapc.u8.eq = []
-liblapc.u8.lt = []
-liblapc.u8.is.zero = []
+intrinsic.u8.add.with.carry = []
+intrinsic.u8.sub.with.borrow = []
+intrinsic.u8.and = []
+intrinsic.u8.or = []
+intrinsic.u8.exclusive.or = []
+intrinsic.u8.not = []
+intrinsic.u8.shift.left.one = []
+intrinsic.u8.shift.right.one = []
 
-liblapc.u64.add = []
-liblapc.u64.sub = []
-liblapc.u64.mul = []
-liblapc.u64.and = []
-liblapc.u64.or = []
-liblapc.u64.xor = []
-liblapc.u64.not = []
-liblapc.u64.shift.left.one = []
-liblapc.u64.shift.right.one = []
-liblapc.u64.eq = []
-liblapc.u64.lt = []
-liblapc.u64.is.zero = []
-liblapc.u64.div.mod = []
+intrinsic.u64.add.with.carry = []
+intrinsic.u64.sub.with.borrow = []
+intrinsic.u64.and = []
+intrinsic.u64.or = []
+intrinsic.u64.exclusive.or = []
+intrinsic.u64.not = []
+intrinsic.u64.shift.left.one = []
+intrinsic.u64.shift.right.one = []
+
+liblapc.bit.not = (value: BIT) BIT {
+    intrinsic.bit.not(value)
+}
+
+liblapc.bit.and = (left: BIT, right: BIT) BIT {
+    intrinsic.bit.and(left, right)
+}
+
+liblapc.bit.or = (left: BIT, right: BIT) BIT {
+    intrinsic.bit.or(left, right)
+}
+
+liblapc.bit.xor = (left: BIT, right: BIT) BIT {
+    intrinsic.bit.exclusive.or(left, right)
+}
+
+liblapc.bit.select = (flag: BIT, when.one: BIT, when.zero: BIT) BIT {
+    intrinsic.bit.select(flag, when.one, when.zero)
+}
+
+liblapc.u8.add = (left: U8, right: U8) U8 {
+    [sum, carry] = intrinsic.u8.add.with.carry(left, right, BIT.ZERO)
+    sum
+}
+
+liblapc.u8.sub = (left: U8, right: U8) U8 {
+    [difference, borrow] = intrinsic.u8.sub.with.borrow(left, right, BIT.ZERO)
+    difference
+}
+
+liblapc.u8.xor = (left: U8, right: U8) U8 {
+    intrinsic.u8.exclusive.or(left, right)
+}
+
+liblapc.u8.and = (left: U8, right: U8) U8 {
+    intrinsic.u8.and(left, right)
+}
+
+liblapc.u8.or = (left: U8, right: U8) U8 {
+    intrinsic.u8.or(left, right)
+}
+
+liblapc.u8.not = (value: U8) U8 {
+    intrinsic.u8.not(value)
+}
+
+liblapc.u8.shift.left.one = (value: U8) U8 {
+    intrinsic.u8.shift.left.one(value)
+}
+
+liblapc.u8.shift.right.one = (value: U8) U8 {
+    intrinsic.u8.shift.right.one(value)
+}
+
+liblapc.u8.lt = (left: U8, right: U8) BIT {
+    [difference, borrow] = intrinsic.u8.sub.with.borrow(left, right, BIT.ZERO)
+    borrow
+}
+
+liblapc.u8.is.zero = (value: U8) BIT {
+    [difference, borrow] = intrinsic.u8.sub.with.borrow(U8.ZERO, value, BIT.ZERO)
+    intrinsic.bit.not(borrow)
+}
+
+liblapc.u8.eq = (left: U8, right: U8) BIT {
+    [difference, borrow] = intrinsic.u8.sub.with.borrow(left, right, BIT.ZERO)
+    liblapc.u8.is.zero(difference)
+}
+
+liblapc.u64.add = (left: U64, right: U64) U64 {
+    [sum, carry] = intrinsic.u64.add.with.carry(left, right, BIT.ZERO)
+    sum
+}
+
+liblapc.u64.sub = (left: U64, right: U64) U64 {
+    [difference, borrow] = intrinsic.u64.sub.with.borrow(left, right, BIT.ZERO)
+    difference
+}
+
+liblapc.u64.xor = (left: U64, right: U64) U64 {
+    intrinsic.u64.exclusive.or(left, right)
+}
+
+liblapc.u64.and = (left: U64, right: U64) U64 {
+    intrinsic.u64.and(left, right)
+}
+
+liblapc.u64.or = (left: U64, right: U64) U64 {
+    intrinsic.u64.or(left, right)
+}
+
+liblapc.u64.not = (value: U64) U64 {
+    intrinsic.u64.not(value)
+}
+
+liblapc.u64.shift.left.one = (value: U64) U64 {
+    intrinsic.u64.shift.left.one(value)
+}
+
+liblapc.u64.shift.right.one = (value: U64) U64 {
+    intrinsic.u64.shift.right.one(value)
+}
+
+liblapc.u64.lt = (left: U64, right: U64) BIT {
+    [difference, borrow] = intrinsic.u64.sub.with.borrow(left, right, BIT.ZERO)
+    borrow
+}
+
+liblapc.u64.is.zero = (value: U64) BIT {
+    [difference, borrow] = intrinsic.u64.sub.with.borrow(U64.ZERO, value, BIT.ZERO)
+    intrinsic.bit.not(borrow)
+}
+
+liblapc.u64.eq = (left: U64, right: U64) BIT {
+    [difference, borrow] = intrinsic.u64.sub.with.borrow(left, right, BIT.ZERO)
+    liblapc.u64.is.zero(difference)
+}
 
 write.byte = (byte: U8) [] {
     [sent] = EXTERN(OP.STREAM.WRITE, STREAM.OUT, byte)

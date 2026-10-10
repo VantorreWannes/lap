@@ -1,4 +1,4 @@
-use lapc_ir::{Block, Function, Intrinsic, Program, Type, Value, intrinsic_for};
+use lapc_ir::{Block, Function, Program, Type, Value, intrinsic_for};
 
 pub fn erase_intrinsics(program: Program) -> Program {
     let functions = program.functions().iter().map(erase_function).collect();
@@ -24,21 +24,15 @@ fn erase_function(function: &Function) -> Function {
     if operand.width() > 64 {
         return function.clone();
     }
-    for parameter in function.parameters() {
-        if function.slots()[parameter.slot().index()] != operand {
-            return function.clone();
-        }
+    let parameter_types: Vec<Type> = function
+        .parameters()
+        .iter()
+        .map(|parameter| function.slots()[parameter.slot().index()].clone())
+        .collect();
+    if parameter_types != intrinsic.parameter_types(&operand) {
+        return function.clone();
     }
-    if intrinsic.is_comparison() {
-        if !result.is_bit() {
-            return function.clone();
-        }
-    } else if intrinsic == Intrinsic::DivMod {
-        let paired = Type::Collection(vec![operand.clone(), operand.clone()]);
-        if result != paired {
-            return function.clone();
-        }
-    } else if result != operand {
+    if result != intrinsic.result_type(&operand) {
         return function.clone();
     }
     let arguments = function
@@ -68,7 +62,7 @@ fn erase_function(function: &Function) -> Function {
 mod tests {
     use super::*;
     use lapc_ast::Label;
-    use lapc_ir::{BitVector, Parameter, Slot, Statement, Type};
+    use lapc_ir::{BitVector, Intrinsic, Parameter, Slot, Statement, Type};
 
     fn function_with_body(label: &str, parameters: usize, type_: Type, body: Value) -> Function {
         let slots = vec![type_.clone(); parameters];
@@ -84,10 +78,28 @@ mod tests {
         )
     }
 
+    fn carry_function(label: &str, carry_type: Type) -> Function {
+        let operand = Type::Collection(vec![Type::Bit; 8]);
+        Function::new(
+            Label::new(label),
+            vec![
+                Parameter::new(Slot::new(0)),
+                Parameter::new(Slot::new(1)),
+                Parameter::new(Slot::new(2)),
+            ],
+            Type::Collection(vec![operand.clone(), Type::Bit]),
+            vec![operand.clone(), operand, carry_type],
+            Block::new(
+                vec![],
+                Some(Box::new(Value::Constant(BitVector::new(vec![false; 9])))),
+            ),
+        )
+    }
+
     #[test]
     fn a_matching_function_is_erased() {
         let function = function_with_body(
-            "liblapc.bit.not",
+            "intrinsic.bit.not",
             1,
             Type::Bit,
             Value::Nand(
@@ -118,10 +130,10 @@ mod tests {
     #[test]
     fn a_comparison_is_erased_to_a_bit() {
         let function = Function::new(
-            Label::new("liblapc.u8.eq"),
+            Label::new("intrinsic.bit.equal"),
             vec![Parameter::new(Slot::new(0)), Parameter::new(Slot::new(1))],
             Type::Bit,
-            vec![Type::Collection(vec![Type::Bit; 8]); 2],
+            vec![Type::Bit, Type::Bit],
             Block::new(
                 vec![],
                 Some(Box::new(Value::Constant(BitVector::new(vec![false])))),
@@ -136,39 +148,32 @@ mod tests {
     }
 
     #[test]
-    fn a_division_is_erased_to_a_pair() {
-        let function = Function::new(
-            Label::new("liblapc.u64.div.mod"),
-            vec![Parameter::new(Slot::new(0)), Parameter::new(Slot::new(1))],
-            Type::Collection(vec![
-                Type::Collection(vec![Type::Bit; 64]),
-                Type::Collection(vec![Type::Bit; 64]),
-            ]),
-            vec![Type::Collection(vec![Type::Bit; 64]); 2],
-            Block::new(
-                vec![],
-                Some(Box::new(Value::Constant(BitVector::new(vec![false; 128])))),
-            ),
-        );
+    fn an_add_with_carry_is_erased_to_a_pair() {
+        let function = carry_function("intrinsic.u8.add.with.carry", Type::Bit);
         let program = erase_intrinsics(Program::new(vec![function]));
         let erased = &program.functions()[0];
         assert!(matches!(
             erased.body().result(),
-            Some(Value::Intrinsic(Intrinsic::DivMod, arguments)) if arguments.len() == 2
+            Some(Value::Intrinsic(Intrinsic::AddWithCarry, arguments)) if arguments.len() == 3
         ));
     }
 
     #[test]
-    fn a_division_with_an_unpaired_result_is_untouched() {
-        let function = Function::new(
-            Label::new("liblapc.u64.div.mod"),
-            vec![Parameter::new(Slot::new(0)), Parameter::new(Slot::new(1))],
-            Type::Collection(vec![Type::Bit; 64]),
-            vec![Type::Collection(vec![Type::Bit; 64]); 2],
-            Block::new(
-                vec![],
-                Some(Box::new(Value::Constant(BitVector::new(vec![false; 64])))),
-            ),
+    fn a_sub_with_borrow_is_erased_to_a_pair() {
+        let function = carry_function("intrinsic.u8.sub.with.borrow", Type::Bit);
+        let program = erase_intrinsics(Program::new(vec![function]));
+        let erased = &program.functions()[0];
+        assert!(matches!(
+            erased.body().result(),
+            Some(Value::Intrinsic(Intrinsic::SubWithBorrow, arguments)) if arguments.len() == 3
+        ));
+    }
+
+    #[test]
+    fn a_carry_with_the_wrong_type_is_untouched() {
+        let function = carry_function(
+            "intrinsic.u8.add.with.carry",
+            Type::Collection(vec![Type::Bit; 8]),
         );
         let program = erase_intrinsics(Program::new(vec![function.clone()]));
         assert_eq!(program.functions()[0], function);
@@ -177,10 +182,10 @@ mod tests {
     #[test]
     fn a_comparison_with_a_wide_result_is_untouched() {
         let function = Function::new(
-            Label::new("liblapc.u8.eq"),
+            Label::new("intrinsic.bit.equal"),
             vec![Parameter::new(Slot::new(0)), Parameter::new(Slot::new(1))],
             Type::Collection(vec![Type::Bit; 8]),
-            vec![Type::Collection(vec![Type::Bit; 8]); 2],
+            vec![Type::Bit, Type::Bit],
             Block::new(
                 vec![],
                 Some(Box::new(Value::Constant(BitVector::new(vec![false; 8])))),
@@ -193,7 +198,7 @@ mod tests {
     #[test]
     fn a_wide_function_is_untouched() {
         let function = Function::new(
-            Label::new("liblapc.u64.add"),
+            Label::new("intrinsic.u64.and"),
             vec![Parameter::new(Slot::new(0)), Parameter::new(Slot::new(1))],
             Type::Collection(vec![Type::Bit; 128]),
             vec![Type::Collection(vec![Type::Bit; 128]); 2],
@@ -209,7 +214,7 @@ mod tests {
     #[test]
     fn a_function_outside_the_table_is_untouched() {
         let function = function_with_body(
-            "liblapc.bit.identity",
+            "intrinsic.bit.identity",
             1,
             Type::Bit,
             Value::Load(Box::new(Value::Reference {
@@ -224,7 +229,7 @@ mod tests {
     #[test]
     fn a_function_with_the_wrong_arity_is_untouched() {
         let function = function_with_body(
-            "liblapc.bit.not",
+            "intrinsic.bit.not",
             2,
             Type::Bit,
             Value::Constant(BitVector::new(vec![false])),
@@ -236,7 +241,7 @@ mod tests {
     #[test]
     fn a_function_with_the_wrong_width_is_untouched() {
         let function = Function::new(
-            Label::new("liblapc.u8.add"),
+            Label::new("intrinsic.u8.and"),
             vec![Parameter::new(Slot::new(0)), Parameter::new(Slot::new(1))],
             Type::Collection(vec![Type::Bit, Type::Bit, Type::Bit]),
             vec![
@@ -257,7 +262,7 @@ mod tests {
     #[test]
     fn a_statement_body_is_replaced_by_the_intrinsic() {
         let function = Function::new(
-            Label::new("liblapc.bit.and"),
+            Label::new("intrinsic.bit.and"),
             vec![Parameter::new(Slot::new(0)), Parameter::new(Slot::new(1))],
             Type::Bit,
             vec![Type::Bit, Type::Bit],
@@ -293,7 +298,7 @@ mod tests {
     #[test]
     fn a_reference_result_is_untouched() {
         let function = Function::new(
-            Label::new("liblapc.bit.not"),
+            Label::new("intrinsic.bit.not"),
             vec![Parameter::new(Slot::new(0))],
             Type::Reference(Box::new(Type::Bit)),
             vec![Type::Reference(Box::new(Type::Bit))],
@@ -309,7 +314,7 @@ mod tests {
     #[test]
     fn erasing_twice_is_erasing_once() {
         let function = function_with_body(
-            "liblapc.bit.not",
+            "intrinsic.bit.not",
             1,
             Type::Bit,
             Value::Constant(BitVector::new(vec![false])),

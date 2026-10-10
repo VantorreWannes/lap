@@ -51,25 +51,23 @@ pub fn intrinsic_for(label: &str) -> Option<Intrinsic> {
 pub fn intrinsic_signature(label: &str) -> Option<(Vec<Type>, Type)> {
     let intrinsic = intrinsic_for(label)?;
     let operand = intrinsic_operand(label)?;
-    let result = if intrinsic.is_comparison() {
-        Type::Bit
-    } else if intrinsic == Intrinsic::DivMod {
-        Type::Collection(vec![operand.clone(), operand.clone()])
-    } else {
-        operand.clone()
-    };
-    Some((vec![operand; intrinsic.arity()], result))
+    Some((
+        intrinsic.parameter_types(&operand),
+        intrinsic.result_type(&operand),
+    ))
 }
 
 fn intrinsic_operand(label: &str) -> Option<Type> {
-    let (name, _) = label.strip_prefix("liblapc.")?.split_once('.')?;
+    let (name, _) = label.strip_prefix("intrinsic.")?.split_once('.')?;
     let width = match name {
         "bit" => return Some(Type::Bit),
+        "u2" => 2,
         "u4" => 4,
         "u8" => 8,
         "u16" => 16,
         "u32" => 32,
         "u64" => 64,
+        "u128" => 128,
         _ => return None,
     };
     Some(Type::Collection(vec![Type::Bit; width]))
@@ -125,6 +123,8 @@ pub enum Intrinsic {
     IsZero,
     Select,
     DivMod,
+    AddWithCarry,
+    SubWithBorrow,
 }
 
 impl Intrinsic {
@@ -145,12 +145,34 @@ impl Intrinsic {
             | Intrinsic::Eq
             | Intrinsic::Lt
             | Intrinsic::DivMod => 2,
-            Intrinsic::Select => 3,
+            Intrinsic::Select | Intrinsic::AddWithCarry | Intrinsic::SubWithBorrow => 3,
         }
     }
 
     pub fn is_comparison(&self) -> bool {
         matches!(self, Intrinsic::Eq | Intrinsic::Lt | Intrinsic::IsZero)
+    }
+
+    pub fn parameter_types(&self, operand: &Type) -> Vec<Type> {
+        match self {
+            Intrinsic::AddWithCarry | Intrinsic::SubWithBorrow => {
+                vec![operand.clone(), operand.clone(), Type::Bit]
+            }
+            _ => vec![operand.clone(); self.arity()],
+        }
+    }
+
+    pub fn result_type(&self, operand: &Type) -> Type {
+        if self.is_comparison() {
+            return Type::Bit;
+        }
+        match self {
+            Intrinsic::DivMod => Type::Collection(vec![operand.clone(), operand.clone()]),
+            Intrinsic::AddWithCarry | Intrinsic::SubWithBorrow => {
+                Type::Collection(vec![operand.clone(), Type::Bit])
+            }
+            _ => operand.clone(),
+        }
     }
 }
 
@@ -279,86 +301,68 @@ impl Program {
 }
 
 const INTRINSICS: &[(&str, Intrinsic)] = &[
-    ("liblapc.bit.not", Intrinsic::Not),
-    ("liblapc.bit.and", Intrinsic::And),
-    ("liblapc.bit.or", Intrinsic::Or),
-    ("liblapc.bit.xor", Intrinsic::Xor),
-    ("liblapc.bit.select", Intrinsic::Select),
-    ("liblapc.u4.add", Intrinsic::Add),
-    ("liblapc.u4.sub", Intrinsic::Sub),
-    ("liblapc.u4.mul", Intrinsic::Mul),
-    ("liblapc.u4.inc", Intrinsic::Inc),
-    ("liblapc.u4.dec", Intrinsic::Dec),
-    ("liblapc.u4.and", Intrinsic::And),
-    ("liblapc.u4.or", Intrinsic::Or),
-    ("liblapc.u4.xor", Intrinsic::Xor),
-    ("liblapc.u4.not", Intrinsic::Not),
-    ("liblapc.u4.shift.left.one", Intrinsic::ShiftLeftOne),
-    ("liblapc.u4.shift.right.one", Intrinsic::ShiftRightOne),
-    ("liblapc.u4.eq", Intrinsic::Eq),
-    ("liblapc.u4.lt", Intrinsic::Lt),
-    ("liblapc.u4.is.zero", Intrinsic::IsZero),
-    ("liblapc.u4.div.mod", Intrinsic::DivMod),
-    ("liblapc.u8.add", Intrinsic::Add),
-    ("liblapc.u8.sub", Intrinsic::Sub),
-    ("liblapc.u8.mul", Intrinsic::Mul),
-    ("liblapc.u8.inc", Intrinsic::Inc),
-    ("liblapc.u8.dec", Intrinsic::Dec),
-    ("liblapc.u8.and", Intrinsic::And),
-    ("liblapc.u8.or", Intrinsic::Or),
-    ("liblapc.u8.xor", Intrinsic::Xor),
-    ("liblapc.u8.not", Intrinsic::Not),
-    ("liblapc.u8.shift.left.one", Intrinsic::ShiftLeftOne),
-    ("liblapc.u8.shift.right.one", Intrinsic::ShiftRightOne),
-    ("liblapc.u8.eq", Intrinsic::Eq),
-    ("liblapc.u8.lt", Intrinsic::Lt),
-    ("liblapc.u8.is.zero", Intrinsic::IsZero),
-    ("liblapc.u8.div.mod", Intrinsic::DivMod),
-    ("liblapc.u16.add", Intrinsic::Add),
-    ("liblapc.u16.sub", Intrinsic::Sub),
-    ("liblapc.u16.mul", Intrinsic::Mul),
-    ("liblapc.u16.inc", Intrinsic::Inc),
-    ("liblapc.u16.dec", Intrinsic::Dec),
-    ("liblapc.u16.and", Intrinsic::And),
-    ("liblapc.u16.or", Intrinsic::Or),
-    ("liblapc.u16.xor", Intrinsic::Xor),
-    ("liblapc.u16.not", Intrinsic::Not),
-    ("liblapc.u16.shift.left.one", Intrinsic::ShiftLeftOne),
-    ("liblapc.u16.shift.right.one", Intrinsic::ShiftRightOne),
-    ("liblapc.u16.eq", Intrinsic::Eq),
-    ("liblapc.u16.lt", Intrinsic::Lt),
-    ("liblapc.u16.is.zero", Intrinsic::IsZero),
-    ("liblapc.u16.div.mod", Intrinsic::DivMod),
-    ("liblapc.u32.add", Intrinsic::Add),
-    ("liblapc.u32.sub", Intrinsic::Sub),
-    ("liblapc.u32.mul", Intrinsic::Mul),
-    ("liblapc.u32.inc", Intrinsic::Inc),
-    ("liblapc.u32.dec", Intrinsic::Dec),
-    ("liblapc.u32.and", Intrinsic::And),
-    ("liblapc.u32.or", Intrinsic::Or),
-    ("liblapc.u32.xor", Intrinsic::Xor),
-    ("liblapc.u32.not", Intrinsic::Not),
-    ("liblapc.u32.shift.left.one", Intrinsic::ShiftLeftOne),
-    ("liblapc.u32.shift.right.one", Intrinsic::ShiftRightOne),
-    ("liblapc.u32.eq", Intrinsic::Eq),
-    ("liblapc.u32.lt", Intrinsic::Lt),
-    ("liblapc.u32.is.zero", Intrinsic::IsZero),
-    ("liblapc.u32.div.mod", Intrinsic::DivMod),
-    ("liblapc.u64.add", Intrinsic::Add),
-    ("liblapc.u64.sub", Intrinsic::Sub),
-    ("liblapc.u64.mul", Intrinsic::Mul),
-    ("liblapc.u64.inc", Intrinsic::Inc),
-    ("liblapc.u64.dec", Intrinsic::Dec),
-    ("liblapc.u64.and", Intrinsic::And),
-    ("liblapc.u64.or", Intrinsic::Or),
-    ("liblapc.u64.xor", Intrinsic::Xor),
-    ("liblapc.u64.not", Intrinsic::Not),
-    ("liblapc.u64.shift.left.one", Intrinsic::ShiftLeftOne),
-    ("liblapc.u64.shift.right.one", Intrinsic::ShiftRightOne),
-    ("liblapc.u64.eq", Intrinsic::Eq),
-    ("liblapc.u64.lt", Intrinsic::Lt),
-    ("liblapc.u64.is.zero", Intrinsic::IsZero),
-    ("liblapc.u64.div.mod", Intrinsic::DivMod),
+    ("intrinsic.bit.not", Intrinsic::Not),
+    ("intrinsic.bit.and", Intrinsic::And),
+    ("intrinsic.bit.or", Intrinsic::Or),
+    ("intrinsic.bit.exclusive.or", Intrinsic::Xor),
+    ("intrinsic.bit.equal", Intrinsic::Eq),
+    ("intrinsic.bit.select", Intrinsic::Select),
+    ("intrinsic.u2.add.with.carry", Intrinsic::AddWithCarry),
+    ("intrinsic.u2.sub.with.borrow", Intrinsic::SubWithBorrow),
+    ("intrinsic.u2.not", Intrinsic::Not),
+    ("intrinsic.u2.and", Intrinsic::And),
+    ("intrinsic.u2.or", Intrinsic::Or),
+    ("intrinsic.u2.exclusive.or", Intrinsic::Xor),
+    ("intrinsic.u2.shift.left.one", Intrinsic::ShiftLeftOne),
+    ("intrinsic.u2.shift.right.one", Intrinsic::ShiftRightOne),
+    ("intrinsic.u4.add.with.carry", Intrinsic::AddWithCarry),
+    ("intrinsic.u4.sub.with.borrow", Intrinsic::SubWithBorrow),
+    ("intrinsic.u4.not", Intrinsic::Not),
+    ("intrinsic.u4.and", Intrinsic::And),
+    ("intrinsic.u4.or", Intrinsic::Or),
+    ("intrinsic.u4.exclusive.or", Intrinsic::Xor),
+    ("intrinsic.u4.shift.left.one", Intrinsic::ShiftLeftOne),
+    ("intrinsic.u4.shift.right.one", Intrinsic::ShiftRightOne),
+    ("intrinsic.u8.add.with.carry", Intrinsic::AddWithCarry),
+    ("intrinsic.u8.sub.with.borrow", Intrinsic::SubWithBorrow),
+    ("intrinsic.u8.not", Intrinsic::Not),
+    ("intrinsic.u8.and", Intrinsic::And),
+    ("intrinsic.u8.or", Intrinsic::Or),
+    ("intrinsic.u8.exclusive.or", Intrinsic::Xor),
+    ("intrinsic.u8.shift.left.one", Intrinsic::ShiftLeftOne),
+    ("intrinsic.u8.shift.right.one", Intrinsic::ShiftRightOne),
+    ("intrinsic.u16.add.with.carry", Intrinsic::AddWithCarry),
+    ("intrinsic.u16.sub.with.borrow", Intrinsic::SubWithBorrow),
+    ("intrinsic.u16.not", Intrinsic::Not),
+    ("intrinsic.u16.and", Intrinsic::And),
+    ("intrinsic.u16.or", Intrinsic::Or),
+    ("intrinsic.u16.exclusive.or", Intrinsic::Xor),
+    ("intrinsic.u16.shift.left.one", Intrinsic::ShiftLeftOne),
+    ("intrinsic.u16.shift.right.one", Intrinsic::ShiftRightOne),
+    ("intrinsic.u32.add.with.carry", Intrinsic::AddWithCarry),
+    ("intrinsic.u32.sub.with.borrow", Intrinsic::SubWithBorrow),
+    ("intrinsic.u32.not", Intrinsic::Not),
+    ("intrinsic.u32.and", Intrinsic::And),
+    ("intrinsic.u32.or", Intrinsic::Or),
+    ("intrinsic.u32.exclusive.or", Intrinsic::Xor),
+    ("intrinsic.u32.shift.left.one", Intrinsic::ShiftLeftOne),
+    ("intrinsic.u32.shift.right.one", Intrinsic::ShiftRightOne),
+    ("intrinsic.u64.add.with.carry", Intrinsic::AddWithCarry),
+    ("intrinsic.u64.sub.with.borrow", Intrinsic::SubWithBorrow),
+    ("intrinsic.u64.not", Intrinsic::Not),
+    ("intrinsic.u64.and", Intrinsic::And),
+    ("intrinsic.u64.or", Intrinsic::Or),
+    ("intrinsic.u64.exclusive.or", Intrinsic::Xor),
+    ("intrinsic.u64.shift.left.one", Intrinsic::ShiftLeftOne),
+    ("intrinsic.u64.shift.right.one", Intrinsic::ShiftRightOne),
+    ("intrinsic.u128.add.with.carry", Intrinsic::AddWithCarry),
+    ("intrinsic.u128.sub.with.borrow", Intrinsic::SubWithBorrow),
+    ("intrinsic.u128.not", Intrinsic::Not),
+    ("intrinsic.u128.and", Intrinsic::And),
+    ("intrinsic.u128.or", Intrinsic::Or),
+    ("intrinsic.u128.exclusive.or", Intrinsic::Xor),
+    ("intrinsic.u128.shift.left.one", Intrinsic::ShiftLeftOne),
+    ("intrinsic.u128.shift.right.one", Intrinsic::ShiftRightOne),
 ];
 
 #[cfg(test)]
@@ -475,6 +479,8 @@ mod tests {
             Intrinsic::IsZero,
             Intrinsic::Select,
             Intrinsic::DivMod,
+            Intrinsic::AddWithCarry,
+            Intrinsic::SubWithBorrow,
         ] {
             assert!(intrinsic.arity() >= 1);
         }
@@ -534,44 +540,66 @@ mod tests {
     fn a_binary_signature_takes_and_yields_the_operand() {
         let operand = Type::Collection(vec![Type::Bit; 8]);
         assert_eq!(
-            intrinsic_signature("liblapc.u8.add"),
+            intrinsic_signature("intrinsic.u8.and"),
             Some((vec![operand.clone(), operand.clone()], operand))
         );
     }
 
     #[test]
     fn a_comparison_signature_yields_a_bit() {
-        let operand = Type::Collection(vec![Type::Bit; 8]);
         assert_eq!(
-            intrinsic_signature("liblapc.u8.lt"),
-            Some((vec![operand.clone(), operand], Type::Bit))
-        );
-    }
-
-    #[test]
-    fn a_division_signature_yields_a_pair() {
-        let operand = Type::Collection(vec![Type::Bit; 64]);
-        assert_eq!(
-            intrinsic_signature("liblapc.u64.div.mod"),
-            Some((
-                vec![operand.clone(), operand.clone()],
-                Type::Collection(vec![operand.clone(), operand])
-            ))
+            intrinsic_signature("intrinsic.bit.equal"),
+            Some((vec![Type::Bit, Type::Bit], Type::Bit))
         );
     }
 
     #[test]
     fn a_bit_signature_takes_and_yields_a_bit() {
         assert_eq!(
-            intrinsic_signature("liblapc.bit.not"),
+            intrinsic_signature("intrinsic.bit.not"),
             Some((vec![Type::Bit], Type::Bit))
         );
     }
 
     #[test]
+    fn a_carry_signature_takes_a_carry_and_yields_a_pair() {
+        let operand = Type::Collection(vec![Type::Bit; 8]);
+        let parameters = vec![operand.clone(), operand.clone(), Type::Bit];
+        let result = Type::Collection(vec![operand.clone(), Type::Bit]);
+        assert_eq!(
+            intrinsic_signature("intrinsic.u8.add.with.carry"),
+            Some((parameters.clone(), result.clone()))
+        );
+        assert_eq!(
+            intrinsic_signature("intrinsic.u8.sub.with.borrow"),
+            Some((parameters, result))
+        );
+    }
+
+    #[test]
+    fn an_intrinsic_label_is_matched_whole() {
+        assert_eq!(
+            intrinsic_for("intrinsic.u8.add.with.carry"),
+            Some(Intrinsic::AddWithCarry)
+        );
+        assert_eq!(intrinsic_for("intrinsic.u8.add"), None);
+        assert_eq!(intrinsic_for("u8.add.with.carry"), None);
+    }
+
+    #[test]
+    fn a_two_bit_operand_is_a_pair_of_bits() {
+        let operand = Type::Collection(vec![Type::Bit; 2]);
+        assert_eq!(
+            intrinsic_signature("intrinsic.u2.not"),
+            Some((vec![operand.clone()], operand))
+        );
+    }
+
+    #[test]
     fn a_label_outside_the_table_has_no_signature() {
-        assert_eq!(intrinsic_signature("liblapc.u8.identity"), None);
-        assert_eq!(intrinsic_signature("liblapc.u7.add"), None);
+        assert_eq!(intrinsic_signature("intrinsic.u8.identity"), None);
+        assert_eq!(intrinsic_signature("intrinsic.u7.add"), None);
+        assert_eq!(intrinsic_signature("liblapc.u8.add"), None);
         assert_eq!(intrinsic_signature("u8.add"), None);
     }
 }
