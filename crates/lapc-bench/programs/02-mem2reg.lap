@@ -1,0 +1,39 @@
+mix = (i: U64, acc: U64) U64 {
+    a: U64 = liblapc.u64.add(i, acc)
+    b: U64 = liblapc.u64.xor(a, i)
+    c: U64 = liblapc.u64.add(b, a)
+    d: U64 = liblapc.u64.xor(c, b)
+    e: U64 = liblapc.u64.add(d, c)
+    f: U64 = liblapc.u64.xor(e, d)
+    g: U64 = liblapc.u64.add(f, e)
+    h: U64 = liblapc.u64.xor(g, f)
+    liblapc.u64.add(h, g)
+}
+
+loop = (count: U64, i: U64, acc: U64) U64 {
+    done: BIT = liblapc.u64.eq(i, count)
+    BRANCH (done) {
+        acc
+    } {
+        next: U64 = liblapc.u64.add(i, U64.ONE)
+        total: U64 = mix(i, acc)
+        loop(count, next, total)
+    }
+}
+
+main = () BIT {
+    [started, start] = EXTERN(OP.CLOCK.MONOTONIC)
+    BRANCH (started) {
+        result: U64 = loop(U64.BIT.24, U64.ZERO, U64.ZERO)
+        [ended, end] = EXTERN(OP.CLOCK.MONOTONIC)
+        BRANCH (ended) {
+            write.u64(liblapc.u64.sub(end, start))
+            write.u64(result)
+            BIT.ZERO
+        } {
+            BIT.ONE
+        }
+    } {
+        BIT.ONE
+    }
+}

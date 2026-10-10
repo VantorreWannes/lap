@@ -1,0 +1,36 @@
+sum.loop = (count: U64, i: U64, acc: U64) U64 {
+    done: BIT = liblapc.u64.eq(i, count)
+    BRANCH (done) {
+        acc
+    } {
+        next: U64 = liblapc.u64.add(i, U64.ONE)
+        even: BIT = liblapc.u64.is.zero(liblapc.u64.and(i, U64.ONE))
+        total: U64 = BRANCH (even) {
+            liblapc.u64.add(acc, i)
+        } {
+            liblapc.u64.xor(acc, i)
+        }
+        sum.loop(count, next, total)
+    }
+}
+
+sum = (count: U64) U64 {
+    sum.loop(count, U64.ZERO, U64.ZERO)
+}
+
+main = () BIT {
+    [started, start] = EXTERN(OP.CLOCK.MONOTONIC)
+    BRANCH (started) {
+        result: U64 = sum(U64.BIT.24)
+        [ended, end] = EXTERN(OP.CLOCK.MONOTONIC)
+        BRANCH (ended) {
+            write.u64(liblapc.u64.sub(end, start))
+            write.u64(result)
+            BIT.ZERO
+        } {
+            BIT.ONE
+        }
+    } {
+        BIT.ONE
+    }
+}

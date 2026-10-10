@@ -1,0 +1,42 @@
+choose = (i: U64, acc: U64) U64 {
+    even: BIT = liblapc.u64.is.zero(liblapc.u64.and(i, U64.ONE))
+    step: U64 = BRANCH (even) {
+        liblapc.u64.add(acc, i)
+    } {
+        liblapc.u64.xor(acc, i)
+    }
+    small: BIT = liblapc.u64.lt(step, U64.BIT.20)
+    BRANCH (small) {
+        liblapc.u64.add(step, U64.ONE)
+    } {
+        liblapc.u64.sub(step, U64.ONE)
+    }
+}
+
+loop = (count: U64, i: U64, acc: U64) U64 {
+    done: BIT = liblapc.u64.eq(i, count)
+    BRANCH (done) {
+        acc
+    } {
+        next: U64 = liblapc.u64.add(i, U64.ONE)
+        total: U64 = choose(i, acc)
+        loop(count, next, total)
+    }
+}
+
+main = () BIT {
+    [started, start] = EXTERN(OP.CLOCK.MONOTONIC)
+    BRANCH (started) {
+        result: U64 = loop(U64.BIT.24, U64.ZERO, U64.ZERO)
+        [ended, end] = EXTERN(OP.CLOCK.MONOTONIC)
+        BRANCH (ended) {
+            write.u64(liblapc.u64.sub(end, start))
+            write.u64(result)
+            BIT.ZERO
+        } {
+            BIT.ONE
+        }
+    } {
+        BIT.ONE
+    }
+}

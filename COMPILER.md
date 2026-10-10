@@ -6,7 +6,7 @@
 
 [README.md](README.md) owns the language. This document owns the lowering, the intrinsic table, the backend, and the runtime interface. [EXTERN.md](EXTERN.md) owns the external operation table.
 
-`lapc` adds no syntax and no type rule. A program it accepts is accepted by any conforming compiler.
+`lapc` adds no syntax. It accepts one form the language does not name: an erased function declaration, which [Operation erasure](#operation-erasure) owns. Every other program it accepts is accepted by any conforming compiler.
 
 ## Input
 
@@ -35,6 +35,18 @@ operation liblapc.u8.add:
 
 The table is hardcoded. The compiler does not discover entries. A label is matched whole, including its `liblapc.` prefix; there is no suffix or pattern matching.
 
+### Declaring
+
+A function whose label is in the table is declared with an empty collection in place of a signature and a body:
+
+```
+liblapc.u8.add = []
+```
+
+The compiler derives the signature from the label. The segment after `liblapc.` names the operand type, and the table entry names the arity and the result. The erasure pass then replaces the body.
+
+A label outside the table keeps the language rule: `label = []` binds the empty collection type.
+
 ### Matching
 
 1. Look up the function's label in the table.
@@ -62,7 +74,9 @@ An intrinsic is a first-class IR node, not an `EXTERN` call, so later passes sti
 
 A value of 64 bits or fewer is a word. A wider value is a stack slot. A reference is a pointer to a slot. `NAND` is `and` then `xor`, plus a mask when the width is under 64.
 
-A call whose arguments contain no call and no `EXTERN` is lowered inline when the callee's body is one expression and every block in it holds no statements. A word parameter whose address is never taken is carried across a self-tail call instead of its stack slot. A division lowers to a zero-checked divide; a constant divisor lowers to a shift or to a multiply and a shift instead when one exists. A multiply by a constant lowers to a short sequence of shifts and adds when one exists. Only functions reachable from `main` are emitted; a program without `main` emits every function.
+A word binding whose slot is never addressed and never rebound stays in a register instead of its stack slot. A branch result is a block parameter, not a stack slot. A copy of a value at most 512 bits wide is a straight-line sequence of word moves; a wider copy is a loop.
+
+A call whose arguments contain no call and no `EXTERN` is lowered inline when the callee's body holds only pure bindings and every block in it holds no other statement. A word parameter whose address is never taken is carried across a self-tail call instead of its stack slot. A division lowers to a zero-checked divide; a constant divisor lowers to a shift or to a multiply and a shift instead when one exists. A multiply by a constant lowers to a short sequence of shifts and adds when one exists. Only functions reachable from `main` are emitted; a program without `main` emits every function.
 
 ## Runtime interface
 

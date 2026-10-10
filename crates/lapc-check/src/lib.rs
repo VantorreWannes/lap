@@ -7,7 +7,7 @@ use lapc_ast::{
 use lapc_extern::lookup;
 use lapc_ir::{
     BitVector, Block as IrBlock, Function, Parameter as IrParameter, Program as IrProgram, Slot,
-    Statement as IrStatement, Type, Value,
+    Statement as IrStatement, Type, Value, extern_result_type, intrinsic_signature,
 };
 
 pub fn check_program(program: &Program) -> Result<IrProgram, CheckError> {
@@ -129,8 +129,7 @@ impl BitDeterminacy {
 struct CheckedValue {
     type_: Type,
     bits: Vec<BitDeterminacy>,
-    status_of: Option<usize>,
-    status_element: Option<usize>,
+    extern_call: Option<usize>,
     reference_target: Option<ReferenceTarget>,
     value: Value,
 }
@@ -162,8 +161,7 @@ struct ReferenceTarget {
 struct LocalBinding {
     slot: Slot,
     type_: Type,
-    bits: Vec<BitDeterminacy>,
-    status_of: Option<usize>,
+    extern_call: Option<usize>,
     reference_target: Option<ReferenceTarget>,
 }
 
@@ -198,6 +196,7 @@ struct Checker {
     functions: Vec<Function>,
     builder: FunctionBuilder,
     scope: HashMap<Label, LocalBinding>,
+    slot_bits: Vec<Vec<BitDeterminacy>>,
     guards: Vec<usize>,
     extern_count: usize,
 }
@@ -209,9 +208,20 @@ impl Checker {
             functions: Vec::new(),
             builder: FunctionBuilder::new(),
             scope: HashMap::new(),
+            slot_bits: Vec::new(),
             guards: Vec::new(),
             extern_count: 0,
         }
+    }
+
+    fn add_slot(&mut self, type_: Type) -> Slot {
+        let slot = self.builder.add_slot(type_);
+        self.slot_bits.push(Vec::new());
+        slot
+    }
+
+    fn set_slot_bits(&mut self, slot: Slot, bits: Vec<BitDeterminacy>) {
+        self.slot_bits[slot.index()] = bits;
     }
 
     fn check_top_level(&mut self, statement: &Statement) -> Result<(), CheckError> {
@@ -232,6 +242,13 @@ impl Checker {
         match binding.value() {
             BindingValue::Function(definition) => self.check_function(&label, definition),
             BindingValue::Expression(expression) => {
+                if let Expression::Collection(elements) = expression {
+                    if elements.is_empty() {
+                        if let Some((parameters, result)) = intrinsic_signature(label.text()) {
+                            return self.check_erased_function(&label, parameters, result);
+                        }
+                    }
+                }
                 if let Some(type_expression) = self.as_type_expression(expression) {
                     let type_ = self.resolve_type(&type_expression)?;
                     self.globals.insert(label, GlobalBinding::Type(type_));
@@ -251,6 +268,39 @@ impl Checker {
                 Ok(())
             }
         }
+    }
+
+    fn check_erased_function(
+        &mut self,
+        label: &Label,
+        parameters: Vec<Type>,
+        result: Type,
+    ) -> Result<(), CheckError> {
+        self.globals.insert(
+            label.clone(),
+            GlobalBinding::Function {
+                parameters: parameters.clone(),
+                result: result.clone(),
+            },
+        );
+        let ir_parameters = (0..parameters.len())
+            .map(|index| IrParameter::new(Slot::new(index)))
+            .collect();
+        let body = IrBlock::new(
+            vec![],
+            Some(Box::new(Value::Constant(BitVector::new(vec![
+                false;
+                result.width()
+            ])))),
+        );
+        self.functions.push(Function::new(
+            label.clone(),
+            ir_parameters,
+            result,
+            parameters,
+            body,
+        ));
+        Ok(())
     }
 
     fn check_function(
@@ -275,6 +325,7 @@ impl Checker {
         );
         let saved_builder = std::mem::replace(&mut self.builder, FunctionBuilder::new());
         let saved_scope = std::mem::take(&mut self.scope);
+        let saved_slot_bits = std::mem::take(&mut self.slot_bits);
         let saved_guards = std::mem::take(&mut self.guards);
         let mut ir_parameters = Vec::new();
         for (parameter, type_) in definition.parameters().iter().zip(parameters.iter()) {
@@ -284,14 +335,14 @@ impl Checker {
                     parameter.label(),
                 ));
             }
-            let slot = self.builder.add_slot(type_.clone());
+            let slot = self.add_slot(type_.clone());
+            self.set_slot_bits(slot, vec![BitDeterminacy::Determinate; type_.width()]);
             self.scope.insert(
                 parameter.label().clone(),
                 LocalBinding {
                     slot,
                     type_: type_.clone(),
-                    bits: vec![BitDeterminacy::Determinate; type_.width()],
-                    status_of: None,
+                    extern_call: None,
                     reference_target: None,
                 },
             );
@@ -321,6 +372,7 @@ impl Checker {
         let slots = std::mem::take(&mut self.builder.slots);
         self.builder = saved_builder;
         self.scope = saved_scope;
+        self.slot_bits = saved_slot_bits;
         self.guards = saved_guards;
         self.functions.push(Function::new(
             label.clone(),
@@ -347,6 +399,7 @@ impl Checker {
 
     fn check_block(&mut self, block: &Block) -> Result<Option<CheckedValue>, CheckError> {
         let saved_scope = self.scope.clone();
+        let saved_slot_bits = self.slot_bits.clone();
         let mut result = None;
         for statement in block.statements() {
             match statement {
@@ -363,6 +416,8 @@ impl Checker {
             result = Some(self.check_expression(expression)?);
         }
         self.scope = saved_scope;
+        self.slot_bits = saved_slot_bits;
+        self.slot_bits.resize(self.builder.slots.len(), Vec::new());
         Ok(result)
     }
 
@@ -392,62 +447,30 @@ impl Checker {
             let slot = local.slot;
             let target = local.reference_target;
             let pointed = *pointed;
-            if let Some(type_expression) = named.type_expression() {
-                let annotated = self.resolve_type(type_expression)?;
-                if annotated != pointed {
-                    return Err(CheckError::at(CheckErrorKind::TypeMismatch, label));
-                }
-            }
-            let checked = self.check_expression(expression)?;
-            if checked.type_ != pointed {
-                return Err(CheckError::at(CheckErrorKind::TypeMismatch, label));
-            }
-            if !checked.is_determinate(&self.guards) {
-                return Err(CheckError::at(CheckErrorKind::Indeterminate, label));
-            }
-            if let Some(target) = target {
-                self.update_target_bits(target, &checked.bits);
-            }
-            let reference = Value::Reference {
-                slot,
-                bit_offset: 0,
-            };
-            self.builder.statements.push(IrStatement::Store {
-                reference,
-                value: checked.value,
-            });
-            return Ok(());
+            self.check_annotation(named, &pointed, label)?;
+            return self.store_through_reference(slot, target, &pointed, expression, label);
         }
         if self.globals.contains_key(label) {
             return Err(CheckError::at(CheckErrorKind::ShadowedGlobal, label));
         }
         let checked = self.check_expression(expression)?;
-        let type_ = match named.type_expression() {
-            Some(type_expression) => {
-                let annotated = self.resolve_type(type_expression)?;
-                if annotated != checked.type_ {
-                    return Err(CheckError::at(CheckErrorKind::TypeMismatch, label));
-                }
-                annotated
+        self.check_annotation(named, &checked.type_, label)?;
+        self.bind_local_value(label, checked);
+        Ok(())
+    }
+
+    fn check_annotation(
+        &self,
+        named: &NamedTarget,
+        expected: &Type,
+        label: &Label,
+    ) -> Result<(), CheckError> {
+        if let Some(type_expression) = named.type_expression() {
+            let annotated = self.resolve_type(type_expression)?;
+            if annotated != *expected {
+                return Err(CheckError::at(CheckErrorKind::TypeMismatch, label));
             }
-            None => checked.type_.clone(),
-        };
-        let reference_target = checked.reference_target;
-        let slot = self.builder.add_slot(type_.clone());
-        self.builder.statements.push(IrStatement::Bind {
-            slot,
-            value: checked.value,
-        });
-        self.scope.insert(
-            label.clone(),
-            LocalBinding {
-                slot,
-                type_,
-                bits: checked.bits,
-                status_of: checked.status_of,
-                reference_target,
-            },
-        );
+        }
         Ok(())
     }
 
@@ -463,23 +486,34 @@ impl Checker {
             }
         };
         let (slot, target, pointed) = {
-            let target = self.lookup_local(label)?;
-            match &target.type_ {
+            let local = self.lookup_local(label)?;
+            match &local.type_ {
                 Type::Reference(pointed) => {
-                    (target.slot, target.reference_target, (**pointed).clone())
+                    (local.slot, local.reference_target, (**pointed).clone())
                 }
                 other => (
-                    target.slot,
+                    local.slot,
                     Some(ReferenceTarget {
-                        slot: target.slot,
+                        slot: local.slot,
                         bit_offset: 0,
                     }),
                     other.clone(),
                 ),
             }
         };
+        self.store_through_reference(slot, target, &pointed, expression, label)
+    }
+
+    fn store_through_reference(
+        &mut self,
+        slot: Slot,
+        target: Option<ReferenceTarget>,
+        pointed: &Type,
+        expression: &Expression,
+        label: &Label,
+    ) -> Result<(), CheckError> {
         let checked = self.check_expression(expression)?;
-        if checked.type_ != pointed {
+        if checked.type_ != *pointed {
             return Err(CheckError::at(CheckErrorKind::TypeMismatch, label));
         }
         if !checked.is_determinate(&self.guards) {
@@ -488,15 +522,32 @@ impl Checker {
         if let Some(target) = target {
             self.update_target_bits(target, &checked.bits);
         }
-        let reference = Value::Reference {
-            slot,
-            bit_offset: 0,
-        };
         self.builder.statements.push(IrStatement::Store {
-            reference,
+            reference: Value::Reference {
+                slot,
+                bit_offset: 0,
+            },
             value: checked.value,
         });
         Ok(())
+    }
+
+    fn bind_local_value(&mut self, label: &Label, checked: CheckedValue) {
+        let slot = self.add_slot(checked.type_.clone());
+        self.set_slot_bits(slot, checked.bits);
+        self.builder.statements.push(IrStatement::Bind {
+            slot,
+            value: checked.value,
+        });
+        self.scope.insert(
+            label.clone(),
+            LocalBinding {
+                slot,
+                type_: checked.type_,
+                extern_call: checked.extern_call,
+                reference_target: checked.reference_target,
+            },
+        );
     }
 
     fn check_destructuring(
@@ -520,7 +571,7 @@ impl Checker {
         }
         let needs_slot = source_needs_slot(targets);
         let (value, slot) = if needs_slot {
-            let slot = self.builder.add_slot(checked.type_.clone());
+            let slot = self.add_slot(checked.type_.clone());
             self.builder.statements.push(IrStatement::Bind {
                 slot,
                 value: checked.value,
@@ -543,12 +594,12 @@ impl Checker {
             bit_offset: 0,
         };
         for (index, target) in targets.iter().enumerate() {
-            let status_of = if index == 0 {
-                checked.status_of.or(checked.status_element)
+            let extern_call = if index == 0 {
+                checked.extern_call
             } else {
                 None
             };
-            self.bind_destructuring_target(target, &source, index, status_of)?;
+            self.bind_destructuring_target(target, &source, index, extern_call)?;
         }
         Ok(())
     }
@@ -558,7 +609,7 @@ impl Checker {
         target: &Target,
         source: &DestructuringSource,
         index: usize,
-        status_of: Option<usize>,
+        extern_call: Option<usize>,
     ) -> Result<(), CheckError> {
         let element_type = match source.type_.elements() {
             Some(elements) => elements
@@ -586,27 +637,15 @@ impl Checker {
                 if self.globals.contains_key(label) {
                     return Err(CheckError::at(CheckErrorKind::ShadowedGlobal, label));
                 }
-                if let Some(type_expression) = named.type_expression() {
-                    let annotated = self.resolve_type(type_expression)?;
-                    if annotated != element.type_ {
-                        return Err(CheckError::at(CheckErrorKind::TypeMismatch, label));
-                    }
-                }
-                let slot = self.builder.add_slot(element.type_.clone());
-                self.builder.statements.push(IrStatement::Bind {
-                    slot,
+                self.check_annotation(named, &element.type_, label)?;
+                let checked = CheckedValue {
+                    type_: element.type_.clone(),
+                    bits: element.bits,
+                    extern_call,
+                    reference_target: None,
                     value: element.value,
-                });
-                self.scope.insert(
-                    label.clone(),
-                    LocalBinding {
-                        slot,
-                        type_: element.type_.clone(),
-                        bits: element.bits,
-                        status_of,
-                        reference_target: None,
-                    },
-                );
+                };
+                self.bind_local_value(label, checked);
                 Ok(())
             }
             Target::Reference(label) => {
@@ -617,9 +656,8 @@ impl Checker {
                     slot,
                     bit_offset: element.bit_offset,
                 };
-                let reference_slot = self
-                    .builder
-                    .add_slot(Type::Reference(Box::new(element.type_.clone())));
+                let reference_slot =
+                    self.add_slot(Type::Reference(Box::new(element.type_.clone())));
                 self.builder.statements.push(IrStatement::Bind {
                     slot: reference_slot,
                     value: reference,
@@ -629,8 +667,7 @@ impl Checker {
                     LocalBinding {
                         slot: reference_slot,
                         type_: Type::Reference(Box::new(element.type_.clone())),
-                        bits: element.bits,
-                        status_of: None,
+                        extern_call: None,
                         reference_target: Some(ReferenceTarget {
                             slot,
                             bit_offset: element.bit_offset,
@@ -660,8 +697,7 @@ impl Checker {
             Expression::Bit => Ok(CheckedValue {
                 type_: Type::Bit,
                 bits: vec![BitDeterminacy::Bit],
-                status_of: None,
-                status_element: None,
+                extern_call: None,
                 reference_target: None,
                 value: Value::Constant(BitVector::new(vec![false])),
             }),
@@ -681,19 +717,17 @@ impl Checker {
         if let Some(local) = self.scope.get(label) {
             let slot = local.slot;
             let type_ = local.type_.clone();
-            let bits = local.bits.clone();
-            let status_of = local.status_of;
+            let extern_call = local.extern_call;
             let reference_target = local.reference_target;
             if let Type::Reference(pointed) = type_ {
-                let target_bits = match reference_target {
+                let bits = match reference_target {
                     Some(target) => self.target_bits(target, pointed.width()),
                     None => vec![BitDeterminacy::Determinate; pointed.width()],
                 };
                 return Ok(CheckedValue {
                     type_: *pointed,
-                    bits: target_bits,
-                    status_of: None,
-                    status_element: None,
+                    bits,
+                    extern_call: None,
                     reference_target,
                     value: Value::Load(Box::new(Value::Reference {
                         slot,
@@ -701,11 +735,11 @@ impl Checker {
                     })),
                 });
             }
+            let bits = self.slot_bits[slot.index()].clone();
             return Ok(CheckedValue {
                 type_,
                 bits,
-                status_of,
-                status_element: None,
+                extern_call,
                 reference_target: None,
                 value: Value::Load(Box::new(Value::Reference {
                     slot,
@@ -720,8 +754,7 @@ impl Checker {
                     .iter()
                     .map(|bit| BitDeterminacy::from_bit(*bit))
                     .collect(),
-                status_of: None,
-                status_element: None,
+                extern_call: None,
                 reference_target: None,
                 value: Value::Constant(BitVector::new(bits.clone())),
             }),
@@ -755,8 +788,7 @@ impl Checker {
         Ok(CheckedValue {
             type_: Type::Reference(Box::new(pointed)),
             bits,
-            status_of: None,
-            status_element: None,
+            extern_call: None,
             reference_target: target,
             value: Value::Reference {
                 slot,
@@ -778,8 +810,7 @@ impl Checker {
         Ok(CheckedValue {
             type_: Type::Bit,
             bits: vec![BitDeterminacy::nand(&left.bits[0], &right.bits[0])],
-            status_of: None,
-            status_element: None,
+            extern_call: None,
             reference_target: None,
             value: Value::Nand(Box::new(left.value), Box::new(right.value)),
         })
@@ -799,11 +830,11 @@ impl Checker {
             return Err(CheckError::new(CheckErrorKind::Indeterminate));
         }
         let saved_statements = self.builder.statements.len();
-        if let Some(call) = condition.status_of {
+        if let Some(call) = condition.extern_call {
             self.guards.push(call);
         }
         let then_value = self.check_block(then_block)?.unwrap_or_else(empty_value);
-        if condition.status_of.is_some() {
+        if condition.extern_call.is_some() {
             self.guards.pop();
         }
         let then_statements = self.builder.statements.split_off(saved_statements);
@@ -812,7 +843,7 @@ impl Checker {
         if then_value.type_ != else_value.type_ {
             return Err(CheckError::new(CheckErrorKind::TypeMismatch));
         }
-        let then_bits = discharge_guard(&then_value.bits, condition.status_of);
+        let then_bits = discharge_guard(&then_value.bits, condition.extern_call);
         let bits = match condition.bits[0] {
             BitDeterminacy::Zero => else_value.bits.clone(),
             BitDeterminacy::One => then_bits,
@@ -828,8 +859,7 @@ impl Checker {
         Ok(CheckedValue {
             type_: then_value.type_,
             bits,
-            status_of: None,
-            status_element: None,
+            extern_call: None,
             reference_target: if then_value.reference_target == else_value.reference_target {
                 then_value.reference_target
             } else {
@@ -884,15 +914,10 @@ impl Checker {
             let payload = BitDeterminacy::Guarded(BTreeSet::from([call]));
             bits.extend(std::iter::repeat_n(payload, *width));
         }
-        let mut result_type = vec![Type::Bit];
-        for width in specification.payload_widths() {
-            result_type.push(Type::Collection(vec![Type::Bit; *width]));
-        }
         Ok(CheckedValue {
-            type_: Type::Collection(result_type),
+            type_: extern_result_type(specification),
             bits,
-            status_of: None,
-            status_element: Some(call),
+            extern_call: Some(call),
             reference_target: None,
             value: Value::Extern(specification.operation(), argument_values),
         })
@@ -914,8 +939,7 @@ impl Checker {
         Ok(CheckedValue {
             type_: Type::Collection(types),
             bits,
-            status_of: None,
-            status_element: None,
+            extern_call: None,
             reference_target: None,
             value: Value::Collection(values),
         })
@@ -954,8 +978,7 @@ impl Checker {
         Ok(CheckedValue {
             type_: result.clone(),
             bits: vec![BitDeterminacy::Determinate; result.width()],
-            status_of: None,
-            status_element: None,
+            extern_call: None,
             reference_target: None,
             value: Value::Call(label.clone(), argument_values),
         })
@@ -968,29 +991,18 @@ impl Checker {
     }
 
     fn target_bits(&self, target: ReferenceTarget, width: usize) -> Vec<BitDeterminacy> {
-        for local in self.scope.values() {
-            if local.slot == target.slot {
-                let start = target.bit_offset.min(local.bits.len());
-                let end = (start + width).min(local.bits.len());
-                if end - start == width {
-                    return local.bits[start..end].to_vec();
-                }
-                break;
-            }
+        let bits = &self.slot_bits[target.slot.index()];
+        if target.bit_offset + width <= bits.len() {
+            bits[target.bit_offset..target.bit_offset + width].to_vec()
+        } else {
+            vec![BitDeterminacy::Determinate; width]
         }
-        vec![BitDeterminacy::Determinate; width]
     }
 
     fn update_target_bits(&mut self, target: ReferenceTarget, bits: &[BitDeterminacy]) {
-        for local in self.scope.values_mut() {
-            if local.slot == target.slot {
-                let start = target.bit_offset.min(local.bits.len());
-                let end = (start + bits.len()).min(local.bits.len());
-                if end - start == bits.len() {
-                    local.bits[start..end].clone_from_slice(bits);
-                }
-                return;
-            }
+        let slot_bits = &mut self.slot_bits[target.slot.index()];
+        if target.bit_offset + bits.len() <= slot_bits.len() {
+            slot_bits[target.bit_offset..target.bit_offset + bits.len()].clone_from_slice(bits);
         }
     }
 
@@ -1107,8 +1119,7 @@ fn empty_value() -> CheckedValue {
     CheckedValue {
         type_: Type::Collection(Vec::new()),
         bits: Vec::new(),
-        status_of: None,
-        status_element: None,
+        extern_call: None,
         reference_target: None,
         value: Value::Collection(Vec::new()),
     }
@@ -1171,6 +1182,47 @@ mod tests {
         let program = check(
             "bit.not = (a: BIT) BIT { NAND(a, a) }\n\
              main = () BIT { bit.not(BIT.ONE) }\n",
+        )
+        .expect("the program checks");
+        assert_eq!(program.functions().len(), 2);
+    }
+
+    #[test]
+    fn an_erased_function_is_declared_with_an_empty_collection() {
+        let program = check(
+            "liblapc.bit.not = []\n\
+             main = () BIT { liblapc.bit.not(BIT.ONE) }\n",
+        )
+        .expect("the program checks");
+        let erased = function(&program, "liblapc.bit.not");
+        assert_eq!(erased.parameters().len(), 1);
+        assert_eq!(erased.result(), &Type::Bit);
+    }
+
+    #[test]
+    fn an_erased_function_derives_its_signature_from_its_label() {
+        let source = format!(
+            "U64 = [{}]\nliblapc.u64.div.mod = []\nmain = () BIT {{ BIT.ZERO }}\n",
+            type_list(64)
+        );
+        let program = check(&source).expect("the program checks");
+        let erased = function(&program, "liblapc.u64.div.mod");
+        assert_eq!(erased.parameters().len(), 2);
+        assert_eq!(
+            erased.result(),
+            &Type::Collection(vec![
+                Type::Collection(vec![Type::Bit; 64]),
+                Type::Collection(vec![Type::Bit; 64]),
+            ])
+        );
+    }
+
+    #[test]
+    fn an_empty_collection_outside_the_table_still_binds_a_type() {
+        let program = check(
+            "EMPTY = []\n\
+             nothing = () EMPTY { [] }\n\
+             main = () BIT { nothing()\n BIT.ZERO }\n",
         )
         .expect("the program checks");
         assert_eq!(program.functions().len(), 2);
@@ -1256,6 +1308,15 @@ mod tests {
     fn a_branch_on_a_status_bit_discharges_the_guard() {
         let program = check_with_extern(
             "main = () BIT { [status, byte] = EXTERN(OP.RANDOM.BYTE)\n value: U8 = BRANCH (status) { byte } { U8.ZERO }\n checked: U8 = u8.identity(value)\n BIT.ZERO }\n",
+        )
+        .expect("the program checks");
+        assert_eq!(program.functions().len(), 2);
+    }
+
+    #[test]
+    fn a_bound_extern_result_keeps_its_guard() {
+        let program = check_with_extern(
+            "main = () BIT { result: [BIT, U8] = EXTERN(OP.RANDOM.BYTE)\n [status, byte] = result\n BRANCH (status) { checked: U8 = u8.identity(byte)\n BIT.ONE } { BIT.ZERO } }\n",
         )
         .expect("the program checks");
         assert_eq!(program.functions().len(), 2);

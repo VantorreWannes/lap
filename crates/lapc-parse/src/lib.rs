@@ -2,7 +2,7 @@ use lapc_ast::Program;
 
 pub fn parse_program(source: &str) -> Result<Program, ParseError> {
     let tokens = lexer::tokenize(source)?;
-    parser::parse_program(tokens, source.len())
+    parser::parse_program(tokens, Position::new(source.len()))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,7 +58,7 @@ mod lexer {
     }
 
     impl Keyword {
-        fn from_text(text: &str) -> Option<Self> {
+        pub(super) fn from_text(text: &str) -> Option<Self> {
             match text {
                 "BIT" => Some(Self::Bit),
                 "NAND" => Some(Self::Nand),
@@ -81,6 +81,24 @@ mod lexer {
         Colon,
         Equals,
         Star,
+    }
+
+    impl Punctuation {
+        fn from_character(character: char) -> Option<Self> {
+            match character {
+                '(' => Some(Self::LeftParenthesis),
+                ')' => Some(Self::RightParenthesis),
+                '[' => Some(Self::LeftBracket),
+                ']' => Some(Self::RightBracket),
+                '{' => Some(Self::LeftBrace),
+                '}' => Some(Self::RightBrace),
+                ',' => Some(Self::Comma),
+                ':' => Some(Self::Colon),
+                '=' => Some(Self::Equals),
+                '*' => Some(Self::Star),
+                _ => None,
+            }
+        }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,20 +168,7 @@ mod lexer {
             character: char,
             position: Position,
         ) -> Result<TokenKind<'a>, ParseError> {
-            let punctuation = match character {
-                '(' => Some(Punctuation::LeftParenthesis),
-                ')' => Some(Punctuation::RightParenthesis),
-                '[' => Some(Punctuation::LeftBracket),
-                ']' => Some(Punctuation::RightBracket),
-                '{' => Some(Punctuation::LeftBrace),
-                '}' => Some(Punctuation::RightBrace),
-                ',' => Some(Punctuation::Comma),
-                ':' => Some(Punctuation::Colon),
-                '=' => Some(Punctuation::Equals),
-                '*' => Some(Punctuation::Star),
-                _ => None,
-            };
-            if let Some(punctuation) = punctuation {
+            if let Some(punctuation) = Punctuation::from_character(character) {
                 self.advance();
                 return Ok(TokenKind::Punctuation(punctuation));
             }
@@ -179,7 +184,7 @@ mod lexer {
         fn lex_label(&mut self) -> Result<TokenKind<'a>, ParseError> {
             let start = self.position;
             self.advance_while(|character| character.is_ascii_alphanumeric());
-            while let Some('_') | Some('.') = self.peek() {
+            while let Some('_' | '.') = self.peek() {
                 let separator = self.position;
                 self.advance();
                 if !self
@@ -238,9 +243,9 @@ mod parser {
 
     pub(super) fn parse_program(
         tokens: Vec<Token<'_>>,
-        end_offset: usize,
+        end_position: Position,
     ) -> Result<Program, ParseError> {
-        Parser::new(tokens, Position::new(end_offset)).parse_program()
+        Parser::new(tokens, end_position).parse_program()
     }
 
     struct Parser<'a> {
@@ -1460,7 +1465,7 @@ mod tests {
 
     fn assert_label_is_not_a_keyword(label: &Label) {
         assert!(
-            !matches!(label.text(), "BIT" | "NAND" | "BRANCH" | "EXTERN"),
+            lexer::Keyword::from_text(label.text()).is_none(),
             "the label {} is a keyword",
             label.text()
         );

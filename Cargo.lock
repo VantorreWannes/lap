@@ -404,6 +404,13 @@ name = "lapc-ast"
 version = "0.1.0"
 
 [[package]]
+name = "lapc-bench"
+version = "0.1.0"
+dependencies = [
+ "lapc-driver",
+]
+
+[[package]]
 name = "lapc-check"
 version = "0.1.0"
 dependencies = [

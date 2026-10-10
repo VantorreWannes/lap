@@ -1,0 +1,127 @@
+BIT.ONE = NAND(BIT, NAND(BIT, BIT))
+BIT.ZERO = NAND(BIT.ONE, BIT.ONE)
+
+U8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]
+U64 = [
+    BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT,
+    BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT,
+    BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT,
+    BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT,
+    BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT,
+    BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT,
+    BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT,
+    BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT
+]
+U128 = [U64, U64]
+
+U8.ZERO = [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO]
+U8.ONE = [BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO]
+U8.TWO = [BIT.ZERO, BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO]
+U8.THREE = [BIT.ONE, BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO]
+U8.FIVE = [BIT.ONE, BIT.ZERO, BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO]
+
+U64.ZERO = [
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO
+]
+
+U64.ONE = [
+    BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO
+]
+
+U64.BIT.20 = [
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO
+]
+
+U64.BIT.24 = [
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO,
+    BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO
+]
+
+U128.ZERO = [U64.ZERO, U64.ZERO]
+U128.ONE = [U64.ONE, U64.ZERO]
+
+OP.STREAM.WRITE = [U8.TWO, U8.TWO]
+OP.CLOCK.MONOTONIC = [U8.ZERO, U8.THREE]
+STREAM.OUT = U64.ONE
+
+// An erased function is declared with an empty collection. The compiler knows
+// its signature from the label, and the erasure pass replaces the body with the
+// intrinsic.
+liblapc.bit.not = []
+liblapc.bit.and = []
+liblapc.bit.or = []
+liblapc.bit.xor = []
+liblapc.bit.select = []
+
+liblapc.u8.add = []
+liblapc.u8.sub = []
+liblapc.u8.mul = []
+liblapc.u8.and = []
+liblapc.u8.or = []
+liblapc.u8.xor = []
+liblapc.u8.not = []
+liblapc.u8.shift.left.one = []
+liblapc.u8.shift.right.one = []
+liblapc.u8.eq = []
+liblapc.u8.lt = []
+liblapc.u8.is.zero = []
+
+liblapc.u64.add = []
+liblapc.u64.sub = []
+liblapc.u64.mul = []
+liblapc.u64.and = []
+liblapc.u64.or = []
+liblapc.u64.xor = []
+liblapc.u64.not = []
+liblapc.u64.shift.left.one = []
+liblapc.u64.shift.right.one = []
+liblapc.u64.eq = []
+liblapc.u64.lt = []
+liblapc.u64.is.zero = []
+liblapc.u64.div.mod = []
+
+write.byte = (byte: U8) [] {
+    [sent] = EXTERN(OP.STREAM.WRITE, STREAM.OUT, byte)
+}
+
+write.u64 = (value: U64) [] {
+    [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15,
+     b16, b17, b18, b19, b20, b21, b22, b23, b24, b25, b26, b27, b28, b29, b30, b31,
+     b32, b33, b34, b35, b36, b37, b38, b39, b40, b41, b42, b43, b44, b45, b46, b47,
+     b48, b49, b50, b51, b52, b53, b54, b55, b56, b57, b58, b59, b60, b61, b62, b63] = value
+    write.byte([b0, b1, b2, b3, b4, b5, b6, b7])
+    write.byte([b8, b9, b10, b11, b12, b13, b14, b15])
+    write.byte([b16, b17, b18, b19, b20, b21, b22, b23])
+    write.byte([b24, b25, b26, b27, b28, b29, b30, b31])
+    write.byte([b32, b33, b34, b35, b36, b37, b38, b39])
+    write.byte([b40, b41, b42, b43, b44, b45, b46, b47])
+    write.byte([b48, b49, b50, b51, b52, b53, b54, b55])
+    write.byte([b56, b57, b58, b59, b60, b61, b62, b63])
+}

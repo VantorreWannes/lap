@@ -9,4 +9,5 @@ members = [
     "crates/lapc-erase",
     "crates/lapc-codegen",
     "crates/lapc-driver",
+    "crates/lapc-bench",
 ]

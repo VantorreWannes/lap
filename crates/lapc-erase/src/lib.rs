@@ -1,4 +1,4 @@
-use lapc_ir::{Block, Function, Intrinsic, Program, Type, Value};
+use lapc_ir::{Block, Function, Intrinsic, Program, Type, Value, intrinsic_for};
 
 pub fn erase_intrinsics(program: Program) -> Program {
     let functions = program.functions().iter().map(erase_function).collect();
@@ -63,96 +63,6 @@ fn erase_function(function: &Function) -> Function {
         body,
     )
 }
-
-fn intrinsic_for(label: &str) -> Option<Intrinsic> {
-    INTRINSICS
-        .iter()
-        .find(|(name, _)| *name == label)
-        .map(|(_, intrinsic)| *intrinsic)
-}
-
-const INTRINSICS: &[(&str, Intrinsic)] = &[
-    ("liblapc.bit.not", Intrinsic::Not),
-    ("liblapc.bit.and", Intrinsic::And),
-    ("liblapc.bit.or", Intrinsic::Or),
-    ("liblapc.bit.xor", Intrinsic::Xor),
-    ("liblapc.bit.select", Intrinsic::Select),
-    ("liblapc.u4.add", Intrinsic::Add),
-    ("liblapc.u4.sub", Intrinsic::Sub),
-    ("liblapc.u4.mul", Intrinsic::Mul),
-    ("liblapc.u4.inc", Intrinsic::Inc),
-    ("liblapc.u4.dec", Intrinsic::Dec),
-    ("liblapc.u4.and", Intrinsic::And),
-    ("liblapc.u4.or", Intrinsic::Or),
-    ("liblapc.u4.xor", Intrinsic::Xor),
-    ("liblapc.u4.not", Intrinsic::Not),
-    ("liblapc.u4.shift.left.one", Intrinsic::ShiftLeftOne),
-    ("liblapc.u4.shift.right.one", Intrinsic::ShiftRightOne),
-    ("liblapc.u4.eq", Intrinsic::Eq),
-    ("liblapc.u4.lt", Intrinsic::Lt),
-    ("liblapc.u4.is.zero", Intrinsic::IsZero),
-    ("liblapc.u4.div.mod", Intrinsic::DivMod),
-    ("liblapc.u8.add", Intrinsic::Add),
-    ("liblapc.u8.sub", Intrinsic::Sub),
-    ("liblapc.u8.mul", Intrinsic::Mul),
-    ("liblapc.u8.inc", Intrinsic::Inc),
-    ("liblapc.u8.dec", Intrinsic::Dec),
-    ("liblapc.u8.and", Intrinsic::And),
-    ("liblapc.u8.or", Intrinsic::Or),
-    ("liblapc.u8.xor", Intrinsic::Xor),
-    ("liblapc.u8.not", Intrinsic::Not),
-    ("liblapc.u8.shift.left.one", Intrinsic::ShiftLeftOne),
-    ("liblapc.u8.shift.right.one", Intrinsic::ShiftRightOne),
-    ("liblapc.u8.eq", Intrinsic::Eq),
-    ("liblapc.u8.lt", Intrinsic::Lt),
-    ("liblapc.u8.is.zero", Intrinsic::IsZero),
-    ("liblapc.u8.div.mod", Intrinsic::DivMod),
-    ("liblapc.u16.add", Intrinsic::Add),
-    ("liblapc.u16.sub", Intrinsic::Sub),
-    ("liblapc.u16.mul", Intrinsic::Mul),
-    ("liblapc.u16.inc", Intrinsic::Inc),
-    ("liblapc.u16.dec", Intrinsic::Dec),
-    ("liblapc.u16.and", Intrinsic::And),
-    ("liblapc.u16.or", Intrinsic::Or),
-    ("liblapc.u16.xor", Intrinsic::Xor),
-    ("liblapc.u16.not", Intrinsic::Not),
-    ("liblapc.u16.shift.left.one", Intrinsic::ShiftLeftOne),
-    ("liblapc.u16.shift.right.one", Intrinsic::ShiftRightOne),
-    ("liblapc.u16.eq", Intrinsic::Eq),
-    ("liblapc.u16.lt", Intrinsic::Lt),
-    ("liblapc.u16.is.zero", Intrinsic::IsZero),
-    ("liblapc.u16.div.mod", Intrinsic::DivMod),
-    ("liblapc.u32.add", Intrinsic::Add),
-    ("liblapc.u32.sub", Intrinsic::Sub),
-    ("liblapc.u32.mul", Intrinsic::Mul),
-    ("liblapc.u32.inc", Intrinsic::Inc),
-    ("liblapc.u32.dec", Intrinsic::Dec),
-    ("liblapc.u32.and", Intrinsic::And),
-    ("liblapc.u32.or", Intrinsic::Or),
-    ("liblapc.u32.xor", Intrinsic::Xor),
-    ("liblapc.u32.not", Intrinsic::Not),
-    ("liblapc.u32.shift.left.one", Intrinsic::ShiftLeftOne),
-    ("liblapc.u32.shift.right.one", Intrinsic::ShiftRightOne),
-    ("liblapc.u32.eq", Intrinsic::Eq),
-    ("liblapc.u32.lt", Intrinsic::Lt),
-    ("liblapc.u32.is.zero", Intrinsic::IsZero),
-    ("liblapc.u32.div.mod", Intrinsic::DivMod),
-    ("liblapc.u64.add", Intrinsic::Add),
-    ("liblapc.u64.sub", Intrinsic::Sub),
-    ("liblapc.u64.mul", Intrinsic::Mul),
-    ("liblapc.u64.inc", Intrinsic::Inc),
-    ("liblapc.u64.dec", Intrinsic::Dec),
-    ("liblapc.u64.and", Intrinsic::And),
-    ("liblapc.u64.or", Intrinsic::Or),
-    ("liblapc.u64.xor", Intrinsic::Xor),
-    ("liblapc.u64.not", Intrinsic::Not),
-    ("liblapc.u64.shift.left.one", Intrinsic::ShiftLeftOne),
-    ("liblapc.u64.shift.right.one", Intrinsic::ShiftRightOne),
-    ("liblapc.u64.eq", Intrinsic::Eq),
-    ("liblapc.u64.lt", Intrinsic::Lt),
-    ("liblapc.u64.is.zero", Intrinsic::IsZero),
-    ("liblapc.u64.div.mod", Intrinsic::DivMod),
-];
 
 #[cfg(test)]
 mod tests {
@@ -409,22 +319,4 @@ mod tests {
         assert_eq!(once, twice);
     }
 
-    #[test]
-    fn every_table_label_is_a_lap_label() {
-        for (name, _) in INTRINSICS {
-            assert!(!name.is_empty());
-            assert!(name.chars().all(|character| {
-                character.is_ascii_alphanumeric() || character == '.' || character == '_'
-            }));
-        }
-    }
-
-    #[test]
-    fn every_table_label_is_unique() {
-        for (index, (name, _)) in INTRINSICS.iter().enumerate() {
-            for (other, _) in &INTRINSICS[index + 1..] {
-                assert_ne!(name, other);
-            }
-        }
-    }
 }

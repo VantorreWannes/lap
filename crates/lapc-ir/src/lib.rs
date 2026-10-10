@@ -1,5 +1,5 @@
 use lapc_ast::Label;
-use lapc_extern::Operation;
+use lapc_extern::{Operation, OperationSpecification};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Type {
@@ -31,6 +31,48 @@ impl Type {
             _ => None,
         }
     }
+}
+
+pub fn extern_result_type(specification: &OperationSpecification) -> Type {
+    let mut elements = vec![Type::Bit];
+    for width in specification.payload_widths() {
+        elements.push(Type::Collection(vec![Type::Bit; *width]));
+    }
+    Type::Collection(elements)
+}
+
+pub fn intrinsic_for(label: &str) -> Option<Intrinsic> {
+    INTRINSICS
+        .iter()
+        .find(|(name, _)| *name == label)
+        .map(|(_, intrinsic)| *intrinsic)
+}
+
+pub fn intrinsic_signature(label: &str) -> Option<(Vec<Type>, Type)> {
+    let intrinsic = intrinsic_for(label)?;
+    let operand = intrinsic_operand(label)?;
+    let result = if intrinsic.is_comparison() {
+        Type::Bit
+    } else if intrinsic == Intrinsic::DivMod {
+        Type::Collection(vec![operand.clone(), operand.clone()])
+    } else {
+        operand.clone()
+    };
+    Some((vec![operand; intrinsic.arity()], result))
+}
+
+fn intrinsic_operand(label: &str) -> Option<Type> {
+    let (name, _) = label.strip_prefix("liblapc.")?.split_once('.')?;
+    let width = match name {
+        "bit" => return Some(Type::Bit),
+        "u4" => 4,
+        "u8" => 8,
+        "u16" => 16,
+        "u32" => 32,
+        "u64" => 64,
+        _ => return None,
+    };
+    Some(Type::Collection(vec![Type::Bit; width]))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -236,6 +278,89 @@ impl Program {
     }
 }
 
+const INTRINSICS: &[(&str, Intrinsic)] = &[
+    ("liblapc.bit.not", Intrinsic::Not),
+    ("liblapc.bit.and", Intrinsic::And),
+    ("liblapc.bit.or", Intrinsic::Or),
+    ("liblapc.bit.xor", Intrinsic::Xor),
+    ("liblapc.bit.select", Intrinsic::Select),
+    ("liblapc.u4.add", Intrinsic::Add),
+    ("liblapc.u4.sub", Intrinsic::Sub),
+    ("liblapc.u4.mul", Intrinsic::Mul),
+    ("liblapc.u4.inc", Intrinsic::Inc),
+    ("liblapc.u4.dec", Intrinsic::Dec),
+    ("liblapc.u4.and", Intrinsic::And),
+    ("liblapc.u4.or", Intrinsic::Or),
+    ("liblapc.u4.xor", Intrinsic::Xor),
+    ("liblapc.u4.not", Intrinsic::Not),
+    ("liblapc.u4.shift.left.one", Intrinsic::ShiftLeftOne),
+    ("liblapc.u4.shift.right.one", Intrinsic::ShiftRightOne),
+    ("liblapc.u4.eq", Intrinsic::Eq),
+    ("liblapc.u4.lt", Intrinsic::Lt),
+    ("liblapc.u4.is.zero", Intrinsic::IsZero),
+    ("liblapc.u4.div.mod", Intrinsic::DivMod),
+    ("liblapc.u8.add", Intrinsic::Add),
+    ("liblapc.u8.sub", Intrinsic::Sub),
+    ("liblapc.u8.mul", Intrinsic::Mul),
+    ("liblapc.u8.inc", Intrinsic::Inc),
+    ("liblapc.u8.dec", Intrinsic::Dec),
+    ("liblapc.u8.and", Intrinsic::And),
+    ("liblapc.u8.or", Intrinsic::Or),
+    ("liblapc.u8.xor", Intrinsic::Xor),
+    ("liblapc.u8.not", Intrinsic::Not),
+    ("liblapc.u8.shift.left.one", Intrinsic::ShiftLeftOne),
+    ("liblapc.u8.shift.right.one", Intrinsic::ShiftRightOne),
+    ("liblapc.u8.eq", Intrinsic::Eq),
+    ("liblapc.u8.lt", Intrinsic::Lt),
+    ("liblapc.u8.is.zero", Intrinsic::IsZero),
+    ("liblapc.u8.div.mod", Intrinsic::DivMod),
+    ("liblapc.u16.add", Intrinsic::Add),
+    ("liblapc.u16.sub", Intrinsic::Sub),
+    ("liblapc.u16.mul", Intrinsic::Mul),
+    ("liblapc.u16.inc", Intrinsic::Inc),
+    ("liblapc.u16.dec", Intrinsic::Dec),
+    ("liblapc.u16.and", Intrinsic::And),
+    ("liblapc.u16.or", Intrinsic::Or),
+    ("liblapc.u16.xor", Intrinsic::Xor),
+    ("liblapc.u16.not", Intrinsic::Not),
+    ("liblapc.u16.shift.left.one", Intrinsic::ShiftLeftOne),
+    ("liblapc.u16.shift.right.one", Intrinsic::ShiftRightOne),
+    ("liblapc.u16.eq", Intrinsic::Eq),
+    ("liblapc.u16.lt", Intrinsic::Lt),
+    ("liblapc.u16.is.zero", Intrinsic::IsZero),
+    ("liblapc.u16.div.mod", Intrinsic::DivMod),
+    ("liblapc.u32.add", Intrinsic::Add),
+    ("liblapc.u32.sub", Intrinsic::Sub),
+    ("liblapc.u32.mul", Intrinsic::Mul),
+    ("liblapc.u32.inc", Intrinsic::Inc),
+    ("liblapc.u32.dec", Intrinsic::Dec),
+    ("liblapc.u32.and", Intrinsic::And),
+    ("liblapc.u32.or", Intrinsic::Or),
+    ("liblapc.u32.xor", Intrinsic::Xor),
+    ("liblapc.u32.not", Intrinsic::Not),
+    ("liblapc.u32.shift.left.one", Intrinsic::ShiftLeftOne),
+    ("liblapc.u32.shift.right.one", Intrinsic::ShiftRightOne),
+    ("liblapc.u32.eq", Intrinsic::Eq),
+    ("liblapc.u32.lt", Intrinsic::Lt),
+    ("liblapc.u32.is.zero", Intrinsic::IsZero),
+    ("liblapc.u32.div.mod", Intrinsic::DivMod),
+    ("liblapc.u64.add", Intrinsic::Add),
+    ("liblapc.u64.sub", Intrinsic::Sub),
+    ("liblapc.u64.mul", Intrinsic::Mul),
+    ("liblapc.u64.inc", Intrinsic::Inc),
+    ("liblapc.u64.dec", Intrinsic::Dec),
+    ("liblapc.u64.and", Intrinsic::And),
+    ("liblapc.u64.or", Intrinsic::Or),
+    ("liblapc.u64.xor", Intrinsic::Xor),
+    ("liblapc.u64.not", Intrinsic::Not),
+    ("liblapc.u64.shift.left.one", Intrinsic::ShiftLeftOne),
+    ("liblapc.u64.shift.right.one", Intrinsic::ShiftRightOne),
+    ("liblapc.u64.eq", Intrinsic::Eq),
+    ("liblapc.u64.lt", Intrinsic::Lt),
+    ("liblapc.u64.is.zero", Intrinsic::IsZero),
+    ("liblapc.u64.div.mod", Intrinsic::DivMod),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,5 +493,85 @@ mod tests {
     #[test]
     fn an_empty_program_has_no_functions() {
         assert!(Program::new(vec![]).functions().is_empty());
+    }
+
+    #[test]
+    fn an_extern_result_is_the_status_bit_and_the_payload_fields() {
+        let specification = lapc_extern::lookup(0x0100).expect("memory.acquire is in the table");
+        assert_eq!(
+            extern_result_type(specification),
+            Type::Collection(vec![Type::Bit, Type::Collection(vec![Type::Bit; 64])])
+        );
+    }
+
+    #[test]
+    fn every_table_label_is_a_lap_label() {
+        for (name, _) in INTRINSICS {
+            assert!(!name.is_empty());
+            assert!(name.chars().all(|character| {
+                character.is_ascii_alphanumeric() || character == '.' || character == '_'
+            }));
+        }
+    }
+
+    #[test]
+    fn every_table_label_is_unique() {
+        for (index, (name, _)) in INTRINSICS.iter().enumerate() {
+            for (other, _) in &INTRINSICS[index + 1..] {
+                assert_ne!(name, other);
+            }
+        }
+    }
+
+    #[test]
+    fn every_table_label_has_a_signature() {
+        for (name, _) in INTRINSICS {
+            assert!(intrinsic_signature(name).is_some());
+        }
+    }
+
+    #[test]
+    fn a_binary_signature_takes_and_yields_the_operand() {
+        let operand = Type::Collection(vec![Type::Bit; 8]);
+        assert_eq!(
+            intrinsic_signature("liblapc.u8.add"),
+            Some((vec![operand.clone(), operand.clone()], operand))
+        );
+    }
+
+    #[test]
+    fn a_comparison_signature_yields_a_bit() {
+        let operand = Type::Collection(vec![Type::Bit; 8]);
+        assert_eq!(
+            intrinsic_signature("liblapc.u8.lt"),
+            Some((vec![operand.clone(), operand], Type::Bit))
+        );
+    }
+
+    #[test]
+    fn a_division_signature_yields_a_pair() {
+        let operand = Type::Collection(vec![Type::Bit; 64]);
+        assert_eq!(
+            intrinsic_signature("liblapc.u64.div.mod"),
+            Some((
+                vec![operand.clone(), operand.clone()],
+                Type::Collection(vec![operand.clone(), operand])
+            ))
+        );
+    }
+
+    #[test]
+    fn a_bit_signature_takes_and_yields_a_bit() {
+        assert_eq!(
+            intrinsic_signature("liblapc.bit.not"),
+            Some((vec![Type::Bit], Type::Bit))
+        );
+    }
+
+    #[test]
+    fn a_label_outside_the_table_has_no_signature() {
+        assert_eq!(intrinsic_signature("liblapc.u8.identity"), None);
+        assert_eq!(intrinsic_signature("liblapc.u7.add"), None);
+        assert_eq!(intrinsic_signature("u8.add"), None);
     }
 }

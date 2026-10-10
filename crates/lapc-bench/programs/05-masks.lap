@@ -1,0 +1,35 @@
+byte.mix = (acc: U8) U8 {
+    a: U8 = liblapc.u8.add(acc, U8.ONE)
+    b: U8 = liblapc.u8.xor(a, acc)
+    c: U8 = liblapc.u8.add(b, a)
+    d: U8 = liblapc.u8.xor(c, b)
+    liblapc.u8.add(d, c)
+}
+
+loop = (count: U64, i: U64, acc: U8) U8 {
+    done: BIT = liblapc.u64.eq(i, count)
+    BRANCH (done) {
+        acc
+    } {
+        next: U64 = liblapc.u64.add(i, U64.ONE)
+        total: U8 = byte.mix(acc)
+        loop(count, next, total)
+    }
+}
+
+main = () BIT {
+    [started, start] = EXTERN(OP.CLOCK.MONOTONIC)
+    BRANCH (started) {
+        result: U8 = loop(U64.BIT.24, U64.ZERO, U8.ZERO)
+        [ended, end] = EXTERN(OP.CLOCK.MONOTONIC)
+        BRANCH (ended) {
+            write.u64(liblapc.u64.sub(end, start))
+            write.byte(result)
+            BIT.ZERO
+        } {
+            BIT.ONE
+        }
+    } {
+        BIT.ONE
+    }
+}
