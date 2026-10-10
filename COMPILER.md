@@ -74,7 +74,7 @@ An intrinsic is a first-class IR node, not an `EXTERN` call, so later passes sti
 
 A value of 64 bits or fewer is a word. A wider value is a stack slot. A reference is a pointer to a slot. `NAND` is `and` then `xor`, plus a mask when the width is under 64.
 
-A word binding whose slot is never addressed and never rebound stays in a register instead of its stack slot. A branch result is a block parameter, not a stack slot. A copy of a value at most 512 bits wide is a straight-line sequence of word moves; a wider copy is a loop.
+A word binding whose slot is never addressed and never rebound stays in a register instead of its stack slot. A binding of a collection whose elements are all words stays in registers the same way. A branch result is a block parameter, not a stack slot. A copy of a value at most 512 bits wide is a straight-line sequence of word moves; a wider copy is a loop.
 
 A call whose arguments contain no call and no `EXTERN` is lowered inline when the callee's body holds only pure bindings and every block in it holds no other statement. A word parameter whose address is never taken is carried across a self-tail call instead of its stack slot. A division lowers to a zero-checked divide; a constant divisor lowers to a shift or to a multiply and a shift instead when one exists. A multiply by a constant lowers to a short sequence of shifts and adds when one exists. Only functions reachable from `main` are emitted; a program without `main` emits every function.
 

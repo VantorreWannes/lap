@@ -513,6 +513,21 @@ fn promotable_parameters(function: &Function) -> Vec<Slot> {
         .collect()
 }
 
+fn element_word(
+    words: &[(CraneliftValue, usize)],
+    offset: usize,
+    width: usize,
+) -> Option<CraneliftValue> {
+    let mut start = 0;
+    for (word, element_width) in words {
+        if start == offset && *element_width == width {
+            return Some(*word);
+        }
+        start += element_width;
+    }
+    None
+}
+
 fn collect_value_targets(value: &Value, taken: &mut Vec<Slot>, bound: &mut Vec<Slot>) {
     match value {
         Value::Load(reference) => {
@@ -612,6 +627,7 @@ struct Lowering<'builder, 'function, 'program, M: Module> {
     pointer_type: CraneliftType,
     body_block: Option<CraneliftBlock>,
     promoted_values: Vec<Option<CraneliftValue>>,
+    promoted_collections: Vec<Option<Vec<(CraneliftValue, usize)>>>,
     single_assignment: Vec<bool>,
 }
 
@@ -653,6 +669,7 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
             pointer_type,
             body_block: None,
             promoted_values: vec![None; function.slots().len()],
+            promoted_collections: vec![None; function.slots().len()],
             single_assignment: single_assignment_slots(function),
         })
     }
@@ -1298,6 +1315,19 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         if width != expected.width() {
             return Err(CodegenError::new("an element has the wrong width"));
         }
+        if let Value::Load(reference) = operand {
+            if let Value::Reference {
+                slot,
+                bit_offset: 0,
+            } = reference.as_ref()
+            {
+                if let Some(words) = self.promoted_collection(*slot) {
+                    if let Some(word) = element_word(&words, offset, width) {
+                        return Ok(Lowered::Word(word));
+                    }
+                }
+            }
+        }
         if width <= 64 {
             if let Value::Load(reference) = operand {
                 if !self.is_promoted_reference(reference) {
@@ -1368,6 +1398,9 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
             if *bit_offset == 0 {
                 if let Some(value) = self.promoted_values.get(slot.index()).copied().flatten() {
                     return Ok(Lowered::Word(value));
+                }
+                if let Some(words) = self.promoted_collection(*slot) {
+                    return self.materialize_words(&words, inner.width());
                 }
             }
         }
@@ -1529,17 +1562,83 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         value: &Value,
         type_: &Type,
     ) -> Result<bool, CodegenError> {
-        if !self.is_promotable_local(slot) || type_.width() > 64 {
+        if !self.is_promotable_local(slot) {
             return Ok(false);
         }
-        let lowered = self.lower_value(value, type_)?;
-        match lowered {
-            Lowered::Word(word) => {
-                self.promoted_values[slot.index()] = Some(word);
-                Ok(true)
-            }
-            Lowered::Slot(_) => Err(CodegenError::new("a promoted binding needs a word")),
+        if type_.width() <= 64 {
+            let lowered = self.lower_value(value, type_)?;
+            return match lowered {
+                Lowered::Word(word) => {
+                    self.promoted_values[slot.index()] = Some(word);
+                    Ok(true)
+                }
+                Lowered::Slot(_) => Err(CodegenError::new("a promoted binding needs a word")),
+            };
         }
+        let Some(words) = self.lower_collection_words(value, type_)? else {
+            return Ok(false);
+        };
+        self.promoted_collections[slot.index()] = Some(words);
+        Ok(true)
+    }
+
+    fn lower_collection_words(
+        &mut self,
+        value: &Value,
+        type_: &Type,
+    ) -> Result<Option<Vec<(CraneliftValue, usize)>>, CodegenError> {
+        if let (Value::Collection(elements), Type::Collection(types)) = (value, type_) {
+            if elements.len() != types.len() || types.iter().any(|type_| type_.width() > 64) {
+                return Ok(None);
+            }
+            let mut words = Vec::new();
+            for (element, element_type) in elements.iter().zip(types) {
+                let word = self.lower_word(element, element_type.width())?;
+                words.push((word, element_type.width()));
+            }
+            return Ok(Some(words));
+        }
+        if let Value::Load(reference) = value {
+            if let Value::Reference {
+                slot,
+                bit_offset: 0,
+            } = reference.as_ref()
+            {
+                if let Some(words) = self.promoted_collection(*slot) {
+                    if words.iter().map(|(_, width)| width).sum::<usize>() == type_.width() {
+                        return Ok(Some(words));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn promoted_collection(&self, slot: Slot) -> Option<Vec<(CraneliftValue, usize)>> {
+        self.promoted_collections
+            .get(slot.index())
+            .cloned()
+            .flatten()
+    }
+
+    fn materialize_words(
+        &mut self,
+        words: &[(CraneliftValue, usize)],
+        width: usize,
+    ) -> Result<Lowered, CodegenError> {
+        let slot = self.allocate_value_slot(width)?;
+        let destination = self.slot_pointer(slot);
+        let mut offset = 0;
+        for (word, element_width) in words {
+            let pointer = self.pointer_offset(destination, offset);
+            self.store_bits(pointer, *word, *element_width)?;
+            offset += element_width;
+        }
+        Ok(Lowered::Slot(self.builder.ins().stack_addr(
+            self.pointer_type,
+            slot,
+            0,
+        )))
     }
 
     fn is_promoted_reference(&self, value: &Value) -> bool {
@@ -3369,6 +3468,115 @@ mod tests {
         let main: extern "C" fn() -> i64 =
             unsafe { std::mem::transmute(entry(&module, &identifiers, "main")) };
         assert_eq!(main(), 1);
+    }
+
+    #[test]
+    fn jit_runs_a_promoted_wide_collection() {
+        let wide = Type::Collection(vec![Type::Collection(vec![Type::Bit; 64]), Type::Bit]);
+        let mut low = vec![false; 64];
+        low[3] = true;
+        let main = function(
+            "main",
+            vec![],
+            Type::Bit,
+            vec![wide.clone()],
+            block(
+                vec![Statement::Bind {
+                    slot: Slot::new(0),
+                    value: Value::Collection(vec![bits(&low), bit(true)]),
+                }],
+                Value::Element {
+                    collection: Box::new(Value::Load(Box::new(Value::Reference {
+                        slot: Slot::new(0),
+                        bit_offset: 0,
+                    }))),
+                    index: 1,
+                },
+            ),
+        );
+        let program = Program::new(vec![main]);
+        assert_eq!(run_word(&program, "main"), 1);
+    }
+
+    #[test]
+    fn jit_runs_a_wide_collection_read_as_a_whole() {
+        let wide = Type::Collection(vec![Type::Collection(vec![Type::Bit; 64]), Type::Bit]);
+        let mut low = vec![false; 64];
+        low[3] = true;
+        let main = function(
+            "main",
+            vec![],
+            Type::Bit,
+            vec![wide.clone(), wide.clone()],
+            block(
+                vec![
+                    Statement::Bind {
+                        slot: Slot::new(0),
+                        value: Value::Collection(vec![bits(&low), bit(true)]),
+                    },
+                    Statement::Bind {
+                        slot: Slot::new(1),
+                        value: Value::Load(Box::new(Value::Reference {
+                            slot: Slot::new(0),
+                            bit_offset: 0,
+                        })),
+                    },
+                ],
+                Value::Element {
+                    collection: Box::new(Value::Load(Box::new(Value::Reference {
+                        slot: Slot::new(1),
+                        bit_offset: 0,
+                    }))),
+                    index: 1,
+                },
+            ),
+        );
+        let program = Program::new(vec![main]);
+        assert_eq!(run_word(&program, "main"), 1);
+    }
+
+    #[test]
+    fn jit_passes_a_promoted_wide_collection_to_a_call() {
+        let wide = Type::Collection(vec![Type::Collection(vec![Type::Bit; 64]), Type::Bit]);
+        let mut low = vec![false; 64];
+        low[3] = true;
+        let callee = function(
+            "callee",
+            vec![Parameter::new(Slot::new(0))],
+            Type::Bit,
+            vec![wide.clone()],
+            block(
+                vec![],
+                Value::Element {
+                    collection: Box::new(Value::Load(Box::new(Value::Reference {
+                        slot: Slot::new(0),
+                        bit_offset: 0,
+                    }))),
+                    index: 1,
+                },
+            ),
+        );
+        let main = function(
+            "main",
+            vec![],
+            Type::Bit,
+            vec![wide.clone()],
+            block(
+                vec![Statement::Bind {
+                    slot: Slot::new(0),
+                    value: Value::Collection(vec![bits(&low), bit(true)]),
+                }],
+                Value::Call(
+                    Label::new("callee"),
+                    vec![Value::Load(Box::new(Value::Reference {
+                        slot: Slot::new(0),
+                        bit_offset: 0,
+                    }))],
+                ),
+            ),
+        );
+        let program = Program::new(vec![callee, main]);
+        assert_eq!(run_word(&program, "main"), 1);
     }
 
     #[test]
