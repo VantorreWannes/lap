@@ -3,7 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use lapc_driver::{Compiler, build, check, find_compiler, temporary_path};
+use lapc_codegen::{Compiler, find_compiler};
+use lapc_driver::{build, check, temporary_path};
 
 const REPETITIONS: usize = 5;
 
@@ -21,7 +22,7 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let directory = programs_directory();
-    let compiler = find_compiler().map_err(|error| error.to_string())?;
+    let compiler = find_compiler()?;
     println!(
         "{:<16} {:>12} {:>12} {:>8}",
         "benchmark", "lap ns", "c ns", "lap/c"

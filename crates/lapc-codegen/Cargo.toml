@@ -6,15 +6,9 @@ edition = "2024"
 [dependencies]
 lapc-ir = { path = "../lapc-ir" }
 lapc-extern = { path = "../lapc-extern" }
-cranelift-codegen = "0.136.2"
-cranelift-frontend = "0.136.2"
-cranelift-module = "0.136.2"
-cranelift-object = "0.136.2"
-target-lexicon = "0.13.5"
 
 [dev-dependencies]
-cranelift-jit = "0.136.2"
 lapc-ast = { path = "../lapc-ast" }
+lapc-parse = { path = "../lapc-parse" }
 lapc-check = { path = "../lapc-check" }
 lapc-erase = { path = "../lapc-erase" }
-lapc-parse = { path = "../lapc-parse" }

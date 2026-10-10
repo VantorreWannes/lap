@@ -290,7 +290,8 @@ impl Checker {
             vec![],
             Some(Box::new(Value::Constant(BitVector::new(vec![
                 false;
-                result.width()
+                result
+                    .width()
             ])))),
         );
         self.functions.push(Function::new(

@@ -1,38 +1,150 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::fmt::Write;
 
-use cranelift_codegen::Context;
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{
-    AbiParam, Block as CraneliftBlock, BlockArg, Endianness, InstBuilder, MemFlagsData, Signature,
-    StackSlot, StackSlotData, StackSlotKind, TrapCode, Type as CraneliftType,
-    Value as CraneliftValue, types,
-};
-use cranelift_codegen::isa::OwnedTargetIsa;
-use cranelift_codegen::settings::{self, Configurable};
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
-use cranelift_object::{ObjectBuilder, ObjectModule};
-use lapc_extern::{Operation, OperationSpecification, lookup as lookup_operation};
-use lapc_ir::{BitVector, Block, Function, Intrinsic, Program, Slot, Statement, Type, Value};
+use lapc_ir::{Block, Function, Intrinsic, Program, Slot, Statement, Type, Value};
 
-const STACK_SLOT_SLACK: usize = 8;
-const STACK_SLOT_ALIGNMENT_SHIFT: u8 = 3;
-const EXTERN_OUTPUT_SIZE: usize = 2 * STACK_SLOT_SLACK;
-const INLINE_BUDGET: usize = 4096;
-const INLINE_SIZE_LIMIT: usize = 64;
-const COPY_UNROLL_LIMIT: usize = 8;
+mod compiler;
 
-pub fn emit_object(program: &Program) -> Result<Vec<u8>, CodegenError> {
-    let instruction_set = host_instruction_set()?;
-    let builder = ObjectBuilder::new(instruction_set, "lap", default_libcall_names())
-        .map_err(|error| CodegenError::new(error.to_string()))?;
-    let mut module = ObjectModule::new(builder);
-    let program = inline_program(program);
-    lower_selected(&mut module, &program, &emitted_labels(&program))?;
-    module
-        .finish()
-        .emit()
-        .map_err(|error| CodegenError::new(error.to_string()))
+pub use compiler::{Compiler, find_compiler};
+
+const PRELUDE: &str = r#"
+static uint64_t lap_mask(uint64_t width) {
+  return (width >= 64) ? ~(uint64_t)0 : (((uint64_t)1 << width) - 1);
+}
+
+static uint64_t lap_load(const uint64_t *base, uint64_t bit, uint64_t width) {
+  uint64_t index = bit >> 6;
+  uint64_t shift = bit & 63;
+  uint64_t low = base[index] >> shift;
+  uint64_t high = (shift == 0) ? 0 : (base[index + 1] << (64 - shift));
+  return (low | high) & lap_mask(width);
+}
+
+static void lap_store(uint64_t *base, uint64_t bit, uint64_t width, uint64_t value) {
+  uint64_t index = bit >> 6;
+  uint64_t shift = bit & 63;
+  uint64_t mask = lap_mask(width);
+  uint64_t field = mask << shift;
+  base[index] = (base[index] & ~field) | ((value & mask) << shift);
+  if (shift != 0 && shift + width > 64) {
+    uint64_t extra = shift + width - 64;
+    uint64_t high_mask = lap_mask(extra);
+    uint64_t high = (value & mask) >> (64 - shift);
+    base[index + 1] = (base[index + 1] & ~high_mask) | (high & high_mask);
+  }
+}
+
+static void lap_copy(uint64_t *destination, const uint64_t *source, uint64_t width) {
+  uint64_t words = (width + 63) >> 6;
+  for (uint64_t index = 0; index < words; index++) {
+    destination[index] = source[index];
+  }
+}
+
+static void lap_wide_mask(uint64_t *value, uint64_t width) {
+  uint64_t words = (width + 63) >> 6;
+  if (words > 0) {
+    value[words - 1] &= lap_mask(width - (words - 1) * 64);
+  }
+}
+
+static void lap_wide_not(uint64_t *out, const uint64_t *a, uint64_t width) {
+  uint64_t words = (width + 63) >> 6;
+  for (uint64_t index = 0; index < words; index++) {
+    out[index] = ~a[index];
+  }
+  lap_wide_mask(out, width);
+}
+
+static void lap_wide_and(uint64_t *out, const uint64_t *a, const uint64_t *b, uint64_t width) {
+  uint64_t words = (width + 63) >> 6;
+  for (uint64_t index = 0; index < words; index++) {
+    out[index] = a[index] & b[index];
+  }
+  lap_wide_mask(out, width);
+}
+
+static void lap_wide_or(uint64_t *out, const uint64_t *a, const uint64_t *b, uint64_t width) {
+  uint64_t words = (width + 63) >> 6;
+  for (uint64_t index = 0; index < words; index++) {
+    out[index] = a[index] | b[index];
+  }
+  lap_wide_mask(out, width);
+}
+
+static void lap_wide_xor(uint64_t *out, const uint64_t *a, const uint64_t *b, uint64_t width) {
+  uint64_t words = (width + 63) >> 6;
+  for (uint64_t index = 0; index < words; index++) {
+    out[index] = a[index] ^ b[index];
+  }
+  lap_wide_mask(out, width);
+}
+
+static void lap_wide_nand(uint64_t *out, const uint64_t *a, const uint64_t *b, uint64_t width) {
+  uint64_t words = (width + 63) >> 6;
+  for (uint64_t index = 0; index < words; index++) {
+    out[index] = ~(a[index] & b[index]);
+  }
+  lap_wide_mask(out, width);
+}
+
+static void lap_wide_add(uint64_t *out, const uint64_t *a, const uint64_t *b, uint64_t width) {
+  uint64_t words = (width + 63) >> 6;
+  uint64_t carry = 0;
+  for (uint64_t index = 0; index < words; index++) {
+    uint64_t sum = a[index] + b[index];
+    uint64_t first = sum < a[index];
+    uint64_t total = sum + carry;
+    uint64_t second = total < sum;
+    carry = first | second;
+    out[index] = total;
+  }
+  lap_wide_mask(out, width);
+}
+
+static void lap_wide_sub(uint64_t *out, const uint64_t *a, const uint64_t *b, uint64_t width) {
+  uint64_t words = (width + 63) >> 6;
+  uint64_t borrow = 0;
+  for (uint64_t index = 0; index < words; index++) {
+    uint64_t difference = a[index] - b[index];
+    uint64_t first = a[index] < b[index];
+    uint64_t total = difference - borrow;
+    uint64_t second = difference < borrow;
+    borrow = first | second;
+    out[index] = total;
+  }
+  lap_wide_mask(out, width);
+}
+"#;
+
+pub fn emit_c(program: &Program) -> Result<String, CodegenError> {
+    let labels = emitted_labels(program);
+    let mut output = String::new();
+    output.push_str("#include <stdbool.h>\n#include <stdint.h>\n");
+    output.push_str(PRELUDE);
+    for specification in lapc_extern::OPERATIONS {
+        let arguments = "uint64_t, ".repeat(specification.argument_widths().len());
+        let _ = writeln!(
+            output,
+            "extern void {}({}uint64_t *out);",
+            operation_symbol(specification),
+            arguments
+        );
+    }
+    output.push('\n');
+    for function in program.functions() {
+        if labels.contains(function.label().text()) {
+            let _ = writeln!(output, "{};", declaration(function));
+        }
+    }
+    output.push('\n');
+    for function in program.functions() {
+        if labels.contains(function.label().text()) {
+            output.push_str(&definition(program, function).map_err(CodegenError::new)?);
+            output.push('\n');
+        }
+    }
+    Ok(output)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,330 +172,6 @@ impl std::fmt::Display for CodegenError {
 
 impl std::error::Error for CodegenError {}
 
-fn host_instruction_set() -> Result<OwnedTargetIsa, CodegenError> {
-    let mut builder = settings::builder();
-    builder
-        .set("opt_level", "speed")
-        .map_err(|error| CodegenError::new(error.to_string()))?;
-    let flags = settings::Flags::new(builder);
-    cranelift_codegen::isa::lookup(target_lexicon::HOST)
-        .map_err(|error| CodegenError::new(error.to_string()))?
-        .finish(flags)
-        .map_err(|error| CodegenError::new(error.to_string()))
-}
-
-#[cfg(test)]
-fn lower_program<M: Module>(
-    module: &mut M,
-    program: &Program,
-) -> Result<HashMap<String, FuncId>, CodegenError> {
-    let labels: HashSet<&str> = program
-        .functions()
-        .iter()
-        .map(|function| function.label().text())
-        .collect();
-    lower_selected(module, program, &labels)
-}
-
-fn lower_selected<M: Module>(
-    module: &mut M,
-    program: &Program,
-    labels: &HashSet<&str>,
-) -> Result<HashMap<String, FuncId>, CodegenError> {
-    let mut functions = HashMap::new();
-    for function in program.functions() {
-        if !labels.contains(function.label().text()) {
-            continue;
-        }
-        let signature = function_signature(module, function);
-        let identifier = module
-            .declare_function(
-                &export_name(function.label().text()),
-                function_linkage(function.label().text()),
-                &signature,
-            )
-            .map_err(|error| CodegenError::new(error.to_string()))?;
-        functions.insert(
-            function.label().text(),
-            FunctionSymbol {
-                function,
-                identifier,
-            },
-        );
-    }
-    let symbols = ProgramSymbols { functions };
-    let mut context = module.make_context();
-    let mut builder_context = FunctionBuilderContext::new();
-    for function in program.functions() {
-        if !labels.contains(function.label().text()) {
-            continue;
-        }
-        let identifier = symbols
-            .functions
-            .get(function.label().text())
-            .map(|symbol| symbol.identifier)
-            .ok_or_else(|| CodegenError::new("a function is not declared"))?;
-        lower_function(
-            module,
-            &mut context,
-            &mut builder_context,
-            function,
-            &symbols,
-        )?;
-        module
-            .define_function(identifier, &mut context)
-            .map_err(|error| CodegenError::new(error.to_string()))?;
-        module.clear_context(&mut context);
-    }
-    Ok(symbols
-        .functions
-        .iter()
-        .map(|(label, symbol)| ((*label).to_string(), symbol.identifier))
-        .collect())
-}
-
-fn function_signature<M: Module>(module: &M, function: &Function) -> Signature {
-    let mut signature = module.make_signature();
-    if function.result().width() > 64 {
-        signature.params.push(AbiParam::new(types::I64));
-    }
-    for _ in function.parameters() {
-        signature.params.push(AbiParam::new(types::I64));
-    }
-    if function.result().width() <= 64 {
-        signature.returns.push(AbiParam::new(types::I64));
-    }
-    signature
-}
-
-fn operation_signature<M: Module>(module: &M, specification: &OperationSpecification) -> Signature {
-    let mut signature = module.make_signature();
-    for _ in 0..specification.argument_widths().len() + 1 {
-        signature.params.push(AbiParam::new(types::I64));
-    }
-    signature
-}
-
-fn operation_symbol(specification: &OperationSpecification) -> String {
-    format!("lap_extern_{}", specification.name().replace('.', "_"))
-}
-
-fn lower_function<M: Module>(
-    module: &mut M,
-    context: &mut Context,
-    builder_context: &mut FunctionBuilderContext,
-    function: &Function,
-    symbols: &ProgramSymbols,
-) -> Result<(), CodegenError> {
-    context.func.signature = function_signature(module, function);
-    let mut builder = FunctionBuilder::new(&mut context.func, builder_context);
-    let entry = builder.create_block();
-    builder.append_block_params_for_function_params(entry);
-    builder.switch_to_block(entry);
-    builder.seal_block(entry);
-    let parameters = builder.block_params(entry).to_vec();
-    {
-        let mut lowering = Lowering::new(&mut builder, module, function, symbols, &parameters)?;
-        lowering.lower_body()?;
-    }
-    builder.finalize(module.target_config());
-    Ok(())
-}
-
-fn inline_program(program: &Program) -> Program {
-    Program::new(
-        program
-            .functions()
-            .iter()
-            .map(|function| inline_function(program, function))
-            .collect(),
-    )
-}
-
-fn inline_function(program: &Program, function: &Function) -> Function {
-    let mut budget = INLINE_BUDGET;
-    let mut expanding = vec![function.label().text().to_string()];
-    let body = inline_block(program, function.body(), &mut expanding, &mut budget);
-    Function::new(
-        function.label().clone(),
-        function.parameters().to_vec(),
-        function.result().clone(),
-        function.slots().to_vec(),
-        body,
-    )
-}
-
-fn inline_block(
-    program: &Program,
-    block: &Block,
-    expanding: &mut Vec<String>,
-    budget: &mut usize,
-) -> Block {
-    let statements = block
-        .statements()
-        .iter()
-        .map(|statement| match statement {
-            Statement::Bind { slot, value } => Statement::Bind {
-                slot: *slot,
-                value: inline_value(program, value, expanding, budget),
-            },
-            Statement::Store { reference, value } => Statement::Store {
-                reference: inline_value(program, reference, expanding, budget),
-                value: inline_value(program, value, expanding, budget),
-            },
-            Statement::Evaluate { value } => Statement::Evaluate {
-                value: inline_value(program, value, expanding, budget),
-            },
-        })
-        .collect();
-    let result = block
-        .result()
-        .map(|result| Box::new(inline_value(program, result, expanding, budget)));
-    Block::new(statements, result)
-}
-
-fn inline_value(
-    program: &Program,
-    value: &Value,
-    expanding: &mut Vec<String>,
-    budget: &mut usize,
-) -> Value {
-    match value {
-        Value::Call(label, arguments) => {
-            let arguments: Vec<Value> = arguments
-                .iter()
-                .map(|argument| inline_value(program, argument, expanding, budget))
-                .collect();
-            let name = label.text();
-            if !expanding.iter().any(|active| active == name) {
-                if let Some(inlined) =
-                    inline_call_value(program, name, &arguments, expanding, budget)
-                {
-                    expanding.push(name.to_string());
-                    let rewritten = inline_value(program, &inlined, expanding, budget);
-                    expanding.pop();
-                    return rewritten;
-                }
-            }
-            Value::Call(label.clone(), arguments)
-        }
-        Value::Constant(bits) => Value::Constant(bits.clone()),
-        Value::Nand(left, right) => Value::Nand(
-            Box::new(inline_value(program, left, expanding, budget)),
-            Box::new(inline_value(program, right, expanding, budget)),
-        ),
-        Value::Intrinsic(intrinsic, arguments) => Value::Intrinsic(
-            *intrinsic,
-            arguments
-                .iter()
-                .map(|argument| inline_value(program, argument, expanding, budget))
-                .collect(),
-        ),
-        Value::Collection(elements) => Value::Collection(
-            elements
-                .iter()
-                .map(|element| inline_value(program, element, expanding, budget))
-                .collect(),
-        ),
-        Value::Element { collection, index } => Value::Element {
-            collection: Box::new(inline_value(program, collection, expanding, budget)),
-            index: *index,
-        },
-        Value::Reference { .. } => value.clone(),
-        Value::Load(reference) => Value::Load(Box::new(inline_value(
-            program, reference, expanding, budget,
-        ))),
-        Value::Extern(operation, arguments) => Value::Extern(
-            *operation,
-            arguments
-                .iter()
-                .map(|argument| inline_value(program, argument, expanding, budget))
-                .collect(),
-        ),
-        Value::Branch(condition, then, otherwise) => Value::Branch(
-            Box::new(inline_value(program, condition, expanding, budget)),
-            inline_block(program, then, expanding, budget),
-            inline_block(program, otherwise, expanding, budget),
-        ),
-    }
-}
-
-fn inline_call_value(
-    program: &Program,
-    label: &str,
-    arguments: &[Value],
-    expanding: &mut Vec<String>,
-    budget: &mut usize,
-) -> Option<Value> {
-    let callee = program
-        .functions()
-        .iter()
-        .find(|function| function.label().text() == label)?;
-    if callee.parameters().len() != arguments.len() {
-        return None;
-    }
-    if arguments.iter().any(|argument| !value_is_pure(argument)) {
-        return None;
-    }
-    let mut bindings = Vec::new();
-    for (parameter, argument) in callee.parameters().iter().zip(arguments) {
-        bindings.push(InlineBinding {
-            parameter: parameter.slot(),
-            parameter_type: callee.slots().get(parameter.slot().index())?.clone(),
-            argument: argument.clone(),
-        });
-    }
-    let result = substitute_body(
-        program,
-        callee,
-        callee.body(),
-        &mut bindings,
-        expanding,
-        budget,
-    )?;
-    if !value_is_inline_safe(&result) {
-        return None;
-    }
-    let size = value_size(&result);
-    if size > INLINE_SIZE_LIMIT || size > *budget {
-        return None;
-    }
-    *budget -= size;
-    Some(result)
-}
-
-fn substitute_body(
-    program: &Program,
-    callee: &Function,
-    block: &Block,
-    bindings: &mut Vec<InlineBinding>,
-    expanding: &mut Vec<String>,
-    budget: &mut usize,
-) -> Option<Value> {
-    let saved = bindings.len();
-    for statement in block.statements() {
-        let Statement::Bind { slot, value } = statement else {
-            bindings.truncate(saved);
-            return None;
-        };
-        let substituted = substitute_parameters(value, bindings.as_slice())?;
-        let inlined = inline_value(program, &substituted, expanding, budget);
-        if !value_is_pure(&inlined) {
-            bindings.truncate(saved);
-            return None;
-        }
-        bindings.push(InlineBinding {
-            parameter: *slot,
-            parameter_type: callee.slots().get(slot.index())?.clone(),
-            argument: inlined,
-        });
-    }
-    let result = block.result()?;
-    let substituted = substitute_parameters(result, bindings.as_slice());
-    bindings.truncate(saved);
-    substituted
-}
-
 fn emitted_labels(program: &Program) -> HashSet<&str> {
     if !program
         .functions()
@@ -396,685 +184,530 @@ fn emitted_labels(program: &Program) -> HashSet<&str> {
             .map(|function| function.label().text())
             .collect();
     }
-    let mut labels = HashSet::new();
+    let mut reached = HashSet::new();
     let mut pending = vec!["main"];
     while let Some(label) = pending.pop() {
-        if !labels.insert(label) {
+        if !reached.insert(label) {
             continue;
         }
-        let function = match program
+        let Some(function) = program
             .functions()
             .iter()
             .find(|function| function.label().text() == label)
-        {
-            Some(function) => function,
-            None => continue,
+        else {
+            continue;
         };
-        let mut calls = Vec::new();
-        collect_block_calls(function.body(), &mut calls);
-        for call in calls {
-            if !labels.contains(call) {
-                pending.push(call);
-            }
-        }
+        collect_calls_block(function.body(), &mut pending);
     }
-    labels
+    reached
 }
 
-fn collect_value_calls<'program>(value: &'program Value, calls: &mut Vec<&'program str>) {
+fn collect_calls_block<'program>(block: &'program Block, pending: &mut Vec<&'program str>) {
+    for statement in block.statements() {
+        match statement {
+            Statement::Bind { value, .. } => collect_calls_value(value, pending),
+            Statement::Store { reference, value } => {
+                collect_calls_value(reference, pending);
+                collect_calls_value(value, pending);
+            }
+            Statement::Evaluate { value } => collect_calls_value(value, pending),
+        }
+    }
+    if let Some(result) = block.result() {
+        collect_calls_value(result, pending);
+    }
+}
+
+fn collect_calls_value<'program>(value: &'program Value, pending: &mut Vec<&'program str>) {
     match value {
         Value::Call(label, arguments) => {
-            calls.push(label.text());
+            pending.push(label.text());
             for argument in arguments {
-                collect_value_calls(argument, calls);
+                collect_calls_value(argument, pending);
             }
         }
         Value::Nand(left, right) => {
-            collect_value_calls(left, calls);
-            collect_value_calls(right, calls);
+            collect_calls_value(left, pending);
+            collect_calls_value(right, pending);
         }
         Value::Intrinsic(_, arguments)
         | Value::Collection(arguments)
         | Value::Extern(_, arguments) => {
             for argument in arguments {
-                collect_value_calls(argument, calls);
+                collect_calls_value(argument, pending);
             }
         }
-        Value::Element { collection, .. } => collect_value_calls(collection, calls),
-        Value::Load(reference) => collect_value_calls(reference, calls),
-        Value::Reference { .. } | Value::Constant(_) => {}
+        Value::Element { collection, .. } => collect_calls_value(collection, pending),
+        Value::Load(reference) => collect_calls_value(reference, pending),
         Value::Branch(condition, then, otherwise) => {
-            collect_value_calls(condition, calls);
-            collect_block_calls(then, calls);
-            collect_block_calls(otherwise, calls);
+            collect_calls_value(condition, pending);
+            collect_calls_block(then, pending);
+            collect_calls_block(otherwise, pending);
         }
+        Value::Constant(_) | Value::Reference { .. } => {}
     }
 }
 
-fn collect_block_calls<'program>(block: &'program Block, calls: &mut Vec<&'program str>) {
-    for statement in block.statements() {
-        match statement {
-            Statement::Bind { value, .. } => collect_value_calls(value, calls),
-            Statement::Store { reference, value } => {
-                collect_value_calls(reference, calls);
-                collect_value_calls(value, calls);
-            }
-            Statement::Evaluate { value } => collect_value_calls(value, calls),
-        }
-    }
-    if let Some(result) = block.result() {
-        collect_value_calls(result, calls);
+fn operation_symbol(specification: &lapc_extern::OperationSpecification) -> String {
+    format!("lap_extern_{}", specification.name().replace('.', "_"))
+}
+
+fn c_name(label: &str) -> String {
+    if label == "main" {
+        "lap_main".to_string()
+    } else {
+        format!("lapc_{}", label.replace('.', "_"))
     }
 }
 
-fn single_assignment_slots(function: &Function) -> Vec<bool> {
-    let mut taken = Vec::new();
-    let mut bound = Vec::new();
-    collect_block_targets(function.body(), &mut taken, &mut bound);
-    let mut counts = vec![0usize; function.slots().len()];
-    for slot in &bound {
-        if let Some(count) = counts.get_mut(slot.index()) {
-            *count += 1;
-        }
+fn declaration(function: &Function) -> String {
+    let wide = function.result().width() > 64;
+    let mut parameters = Vec::new();
+    if wide {
+        parameters.push("uint64_t *out".to_string());
     }
-    function
-        .slots()
-        .iter()
-        .enumerate()
-        .map(|(index, type_)| {
-            let slot = Slot::new(index);
-            !type_.is_reference()
-                && !taken.contains(&slot)
-                && counts[index] == 1
-                && !function
-                    .parameters()
-                    .iter()
-                    .any(|parameter| parameter.slot() == slot)
-        })
-        .collect()
-}
-
-fn promotable_parameters(function: &Function) -> Vec<Slot> {
-    let mut taken = Vec::new();
-    let mut bound = Vec::new();
-    collect_block_targets(function.body(), &mut taken, &mut bound);
-    function
-        .parameters()
-        .iter()
-        .map(|parameter| parameter.slot())
-        .filter(|slot| {
-            function.slots().get(slot.index()).is_some_and(|type_| {
-                !type_.is_reference()
-                    && type_.width() <= 64
-                    && !taken.contains(slot)
-                    && !bound.contains(slot)
-            })
-        })
-        .collect()
-}
-
-fn element_word(
-    words: &[(CraneliftValue, usize)],
-    offset: usize,
-    width: usize,
-) -> Option<CraneliftValue> {
-    let mut start = 0;
-    for (word, element_width) in words {
-        if start == offset && *element_width == width {
-            return Some(*word);
-        }
-        start += element_width;
-    }
-    None
-}
-
-fn collect_value_targets(value: &Value, taken: &mut Vec<Slot>, bound: &mut Vec<Slot>) {
-    match value {
-        Value::Load(reference) => {
-            if !matches!(reference.as_ref(), Value::Reference { .. }) {
-                collect_value_targets(reference, taken, bound);
-            }
-        }
-        Value::Reference { slot, .. } => taken.push(*slot),
-        Value::Nand(left, right) => {
-            collect_value_targets(left, taken, bound);
-            collect_value_targets(right, taken, bound);
-        }
-        Value::Intrinsic(_, arguments)
-        | Value::Call(_, arguments)
-        | Value::Extern(_, arguments)
-        | Value::Collection(arguments) => {
-            for argument in arguments {
-                collect_value_targets(argument, taken, bound);
-            }
-        }
-        Value::Element { collection, .. } => collect_value_targets(collection, taken, bound),
-        Value::Branch(condition, then, otherwise) => {
-            collect_value_targets(condition, taken, bound);
-            collect_block_targets(then, taken, bound);
-            collect_block_targets(otherwise, taken, bound);
-        }
-        Value::Constant(_) => {}
-    }
-}
-
-fn collect_block_targets(block: &Block, taken: &mut Vec<Slot>, bound: &mut Vec<Slot>) {
-    for statement in block.statements() {
-        match statement {
-            Statement::Bind { slot, value } => {
-                bound.push(*slot);
-                collect_value_targets(value, taken, bound);
-            }
-            Statement::Store { reference, value } => {
-                collect_value_targets(reference, taken, bound);
-                collect_value_targets(value, taken, bound);
-            }
-            Statement::Evaluate { value } => collect_value_targets(value, taken, bound),
-        }
-    }
-    if let Some(result) = block.result() {
-        collect_value_targets(result, taken, bound);
-    }
-}
-
-struct ProgramSymbols<'program> {
-    functions: HashMap<&'program str, FunctionSymbol<'program>>,
-}
-
-struct FunctionSymbol<'program> {
-    function: &'program Function,
-    identifier: FuncId,
-}
-
-#[derive(Clone, Copy)]
-enum Lowered {
-    Word(CraneliftValue),
-    Slot(CraneliftValue),
-}
-
-#[derive(Clone, Copy)]
-enum BitPointer {
-    Byte { address: CraneliftValue, bit: u8 },
-    Bit(CraneliftValue),
-}
-
-#[derive(Clone)]
-struct InlineBinding {
-    parameter: Slot,
-    parameter_type: Type,
-    argument: Value,
-}
-
-#[derive(Clone, Copy)]
-enum WideOperation {
-    Nand,
-    Not,
-    And,
-    Or,
-    Xor,
-    Add,
-    Sub,
-}
-
-struct Lowering<'builder, 'function, 'program, M: Module> {
-    builder: &'builder mut FunctionBuilder<'function>,
-    module: &'builder mut M,
-    function: &'program Function,
-    symbols: &'builder ProgramSymbols<'program>,
-    slots: Vec<StackSlot>,
-    parameter_values: Vec<CraneliftValue>,
-    output_pointer: Option<CraneliftValue>,
-    pointer_type: CraneliftType,
-    body_block: Option<CraneliftBlock>,
-    promoted_values: Vec<Option<CraneliftValue>>,
-    promoted_collections: Vec<Option<Vec<(CraneliftValue, usize)>>>,
-    single_assignment: Vec<bool>,
-}
-
-impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'program, M> {
-    fn new(
-        builder: &'builder mut FunctionBuilder<'function>,
-        module: &'builder mut M,
-        function: &'program Function,
-        symbols: &'builder ProgramSymbols<'program>,
-        parameters: &[CraneliftValue],
-    ) -> Result<Self, CodegenError> {
-        let pointer_type = module.target_config().pointer_type();
-        let mut slots = Vec::new();
-        for type_ in function.slots() {
-            slots.push(create_stack_slot(
-                builder,
-                byte_size(type_.width()) + STACK_SLOT_SLACK,
-            )?);
-        }
-        let wide_result = function.result().width() > 64;
-        let output_pointer = if wide_result {
-            parameters.first().copied()
+    for parameter in function.parameters() {
+        let index = parameter.slot().index();
+        let type_ = &function.slots()[index];
+        if type_.is_reference() {
+            parameters.push(format!("uint64_t *p{index}"));
+            parameters.push(format!("uint64_t pb{index}"));
+        } else if type_.width() > 64 {
+            parameters.push(format!("const uint64_t *p{index}"));
         } else {
-            None
-        };
-        let parameter_values = if wide_result {
-            parameters[1..].to_vec()
-        } else {
-            parameters.to_vec()
-        };
-        Ok(Self {
-            builder,
-            module,
+            parameters.push(format!("uint64_t p{index}"));
+        }
+    }
+    let result = if wide { "void" } else { "uint64_t" };
+    let storage = if function.label().text() == "main" {
+        ""
+    } else {
+        "static "
+    };
+    format!(
+        "{storage}{result} {}({})",
+        c_name(function.label().text()),
+        parameters.join(", ")
+    )
+}
+
+fn definition(program: &Program, function: &Function) -> Result<String, String> {
+    let mut emitter = Emitter::new(program, function);
+    emitter.emit()?;
+    Ok(emitter.output)
+}
+
+struct Emitter<'program> {
+    program: &'program Program,
+    function: &'program Function,
+    output: String,
+    indent: usize,
+    temporaries: usize,
+}
+
+enum Emitted {
+    Word(String),
+    Pointer(String),
+    Reference { base: String, bit: String },
+}
+
+impl<'program> Emitter<'program> {
+    fn new(program: &'program Program, function: &'program Function) -> Self {
+        Self {
+            program,
             function,
-            symbols,
-            slots,
-            parameter_values,
-            output_pointer,
-            pointer_type,
-            body_block: None,
-            promoted_values: vec![None; function.slots().len()],
-            promoted_collections: vec![None; function.slots().len()],
-            single_assignment: single_assignment_slots(function),
-        })
+            output: String::new(),
+            indent: 1,
+            temporaries: 0,
+        }
     }
 
-    fn lower_body(&mut self) -> Result<(), CodegenError> {
-        let function = self.function;
-        let parameters = function.parameters().to_vec();
-        let promoted = promotable_parameters(function);
-        let mut initial_arguments = Vec::new();
-        for (index, parameter) in parameters.iter().enumerate() {
-            let parameter_type = function
-                .slots()
-                .get(parameter.slot().index())
-                .ok_or_else(|| CodegenError::new("a parameter has no slot"))?
-                .clone();
-            let incoming = self
-                .parameter_values
-                .get(index)
-                .copied()
-                .ok_or_else(|| CodegenError::new("a parameter has no value"))?;
-            let storage = self.storage(parameter.slot())?;
-            if parameter_type.is_reference() || parameter_type.width() <= 64 {
-                let word = if parameter_type.is_reference() {
-                    incoming
-                } else {
-                    self.mask(incoming, parameter_type.width())
-                };
-                if promoted.contains(&parameter.slot()) {
-                    initial_arguments.push(BlockArg::Value(word));
-                } else {
-                    self.store_word(storage, word);
-                }
+    fn emit(&mut self) -> Result<(), String> {
+        let result_type = self.function.result().clone();
+        self.line(declaration(self.function));
+        self.line("{");
+        for (index, type_) in self.function.slots().iter().enumerate() {
+            if type_.is_reference() {
+                self.line(format!("uint64_t *s{index} = 0;"));
+                self.line(format!("uint64_t sb{index} = 0;"));
             } else {
-                let destination = self.slot_pointer(storage);
-                let source = BitPointer::Byte {
-                    address: incoming,
-                    bit: 0,
-                };
-                self.copy_bits(source, destination, parameter_type.width())?;
+                self.line(format!(
+                    "uint64_t s{index}[{}] = {{0}};",
+                    words(type_.width())
+                ));
             }
         }
-        let result_type = function.result().clone();
-        let body_block = self.builder.create_block();
-        for _ in &promoted {
-            self.builder.append_block_param(body_block, types::I64);
+        for parameter in self.function.parameters() {
+            let index = parameter.slot().index();
+            let type_ = self.function.slots()[index].clone();
+            if type_.is_reference() {
+                self.line(format!("s{index} = p{index};"));
+                self.line(format!("sb{index} = pb{index};"));
+            } else if type_.width() > 64 {
+                self.line(format!("lap_copy(s{index}, p{index}, {});", type_.width()));
+            } else {
+                self.line(format!(
+                    "s{index}[0] = p{index} & lap_mask({});",
+                    type_.width()
+                ));
+            }
         }
-        let promoted_block_values = self.builder.block_params(body_block).to_vec();
-        for (slot, value) in promoted.iter().zip(&promoted_block_values) {
-            self.promoted_values[slot.index()] = Some(*value);
-        }
-        self.builder.ins().jump(body_block, &initial_arguments);
-        self.builder.switch_to_block(body_block);
-        self.body_block = Some(body_block);
-        let result = self.lower_block(function.body(), &result_type, true)?;
-        self.builder.seal_block(body_block);
-        let result = match result {
-            Some(result) => result,
-            None => return Ok(()),
-        };
-        if result_type.width() > 64 {
-            let output_pointer = self
-                .output_pointer
-                .ok_or_else(|| CodegenError::new("a wide result needs an out pointer"))?;
-            match result {
-                Lowered::Slot(address) => {
-                    let source = BitPointer::Byte { address, bit: 0 };
-                    let destination = BitPointer::Byte {
-                        address: output_pointer,
-                        bit: 0,
-                    };
-                    self.copy_bits(source, destination, result_type.width())?;
+        self.line("body:;");
+        let result = self.block(self.function.body(), &result_type, true)?;
+        match result {
+            Some(Emitted::Word(word)) => self.line(format!("return {word};")),
+            Some(Emitted::Pointer(pointer)) => {
+                self.line(format!(
+                    "lap_copy(out, {pointer}, {});",
+                    result_type.width()
+                ));
+                self.line("return;");
+            }
+            Some(Emitted::Reference { .. }) => {
+                return Err("a reference result is not supported".to_string());
+            }
+            None => {
+                if result_type.width() > 64 {
+                    self.line("return;");
+                } else {
+                    self.line("return 0;");
                 }
-                Lowered::Word(_) => return Err(CodegenError::new("a wide result was expected")),
-            }
-            self.builder.ins().return_(&[]);
-        } else {
-            match result {
-                Lowered::Word(word) => {
-                    self.builder.ins().return_(&[word]);
-                }
-                Lowered::Slot(_) => return Err(CodegenError::new("a word result was expected")),
             }
         }
+        self.line("}");
         Ok(())
     }
 
-    fn lower_block(
+    fn line(&mut self, text: impl AsRef<str>) {
+        let indent = "  ".repeat(self.indent);
+        let _ = writeln!(self.output, "{indent}{}", text.as_ref());
+    }
+
+    fn temporary_word(&mut self) -> String {
+        let name = format!("t{}", self.temporaries);
+        self.temporaries += 1;
+        self.line(format!("uint64_t {name} = 0;"));
+        name
+    }
+
+    fn temporary_array(&mut self, width: usize) -> String {
+        let name = format!("t{}", self.temporaries);
+        self.temporaries += 1;
+        self.line(format!("uint64_t {name}[{}] = {{0}};", words(width)));
+        name
+    }
+
+    fn block(
         &mut self,
         block: &Block,
         expected: &Type,
         tail: bool,
-    ) -> Result<Option<Lowered>, CodegenError> {
+    ) -> Result<Option<Emitted>, String> {
         for statement in block.statements() {
-            match statement {
-                Statement::Bind { slot, value } => {
-                    let type_ = self.slot_type(*slot)?.clone();
-                    if !self.promote_binding(*slot, value, &type_)? {
-                        let lowered = self.lower_value(value, &type_)?;
-                        let storage = self.storage(*slot)?;
-                        self.write_slot(storage, lowered, type_.width())?;
-                    }
-                }
-                Statement::Store { reference, value } => {
-                    let reference_type = self.type_of(reference)?;
-                    let inner = match reference_type {
-                        Type::Reference(inner) => *inner,
-                        _ => return Err(CodegenError::new("a store needs a reference")),
-                    };
-                    let pointer = self.lower_pointer(reference)?;
-                    let lowered = self.lower_value(value, &inner)?;
-                    self.write_bits(pointer, lowered, inner.width())?;
-                }
-                Statement::Evaluate { value } => {
-                    let type_ = self.type_of(value)?;
-                    self.lower_value(value, &type_)?;
-                }
-            }
+            self.statement(statement)?;
         }
         match block.result() {
-            Some(value) => self.lower_result(value, expected, tail),
-            None => Ok(Some(Lowered::Word(
-                self.builder.ins().iconst(types::I64, 0),
-            ))),
+            Some(value) => self.result(value, expected, tail),
+            None => Ok(None),
         }
     }
 
-    fn lower_result(
+    fn result(
         &mut self,
         value: &Value,
         expected: &Type,
         tail: bool,
-    ) -> Result<Option<Lowered>, CodegenError> {
+    ) -> Result<Option<Emitted>, String> {
         if tail {
-            match value {
-                Value::Call(label, arguments) => {
-                    if self.lower_self_tail_call(label.text(), arguments, expected)? {
-                        return Ok(None);
+            if let Value::Call(label, arguments) = value {
+                if label.text() == self.function.label().text()
+                    && self.tail_arguments_are_safe(arguments)
+                {
+                    self.tail_call(arguments)?;
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(self.value(value, expected, tail)?))
+    }
+
+    fn tail_arguments_are_safe(&self, arguments: &[Value]) -> bool {
+        arguments.iter().all(|argument| match argument {
+            Value::Reference { slot, .. } => self.slot_is_reference_parameter(*slot),
+            _ => true,
+        })
+    }
+
+    fn slot_is_reference_parameter(&self, slot: Slot) -> bool {
+        self.function.slots()[slot.index()].is_reference()
+            && self
+                .function
+                .parameters()
+                .iter()
+                .any(|parameter| parameter.slot() == slot)
+    }
+
+    fn tail_call(&mut self, arguments: &[Value]) -> Result<(), String> {
+        let parameters = self.function.parameters().to_vec();
+        let mut assignments = Vec::new();
+        for (parameter, argument) in parameters.iter().zip(arguments) {
+            let index = parameter.slot().index();
+            let type_ = self.function.slots()[index].clone();
+            if type_.is_reference() {
+                let (base, bit) = self.reference_parts(argument)?;
+                let base_temporary = self.temporary_pointer();
+                let bit_temporary = self.temporary_word();
+                self.line(format!("{base_temporary} = {base};"));
+                self.line(format!("{bit_temporary} = {bit};"));
+                assignments.push(format!("s{index} = {base_temporary};"));
+                assignments.push(format!("sb{index} = {bit_temporary};"));
+            } else if type_.width() > 64 {
+                let pointer = self.pointer(argument, &type_)?;
+                let temporary = self.temporary_array(type_.width());
+                self.line(format!(
+                    "lap_copy({temporary}, {pointer}, {});",
+                    type_.width()
+                ));
+                assignments.push(format!(
+                    "lap_copy(s{index}, {temporary}, {});",
+                    type_.width()
+                ));
+            } else {
+                let word = self.word(argument, &type_)?;
+                let temporary = self.temporary_word();
+                self.line(format!("{temporary} = {word};"));
+                assignments.push(format!("s{index}[0] = {temporary};"));
+            }
+        }
+        for assignment in assignments {
+            self.line(assignment);
+        }
+        self.line("goto body;");
+        Ok(())
+    }
+
+    fn temporary_pointer(&mut self) -> String {
+        let name = format!("t{}", self.temporaries);
+        self.temporaries += 1;
+        self.line(format!("uint64_t *{name} = 0;"));
+        name
+    }
+
+    fn statement(&mut self, statement: &Statement) -> Result<(), String> {
+        match statement {
+            Statement::Bind { slot, value } => {
+                let type_ = self.function.slots()[slot.index()].clone();
+                if type_.is_reference() {
+                    let (base, bit) = self.reference_parts(value)?;
+                    self.line(format!("s{} = {base};", slot.index()));
+                    self.line(format!("sb{} = {bit};", slot.index()));
+                } else if type_.width() > 64 {
+                    let pointer = self.pointer(value, &type_)?;
+                    self.line(format!(
+                        "lap_copy(s{}, {pointer}, {});",
+                        slot.index(),
+                        type_.width()
+                    ));
+                } else {
+                    let word = self.word(value, &type_)?;
+                    self.line(format!("s{}[0] = {word};", slot.index()));
+                }
+                Ok(())
+            }
+            Statement::Store { reference, value } => {
+                let (base, bit) = self.reference_parts(reference)?;
+                let type_ = self.type_of(value)?;
+                if type_.width() > 64 {
+                    let pointer = self.pointer(value, &type_)?;
+                    for index in 0..type_.width().div_ceil(64) {
+                        self.line(format!(
+                            "lap_store({base}, ({bit}) + {}, 64, {pointer}[{index}]);",
+                            index * 64
+                        ));
                     }
+                } else {
+                    let word = self.word(value, &type_)?;
+                    self.line(format!(
+                        "lap_store({base}, {bit}, {}, {word});",
+                        type_.width()
+                    ));
                 }
-                Value::Branch(condition, then, otherwise) => {
-                    return self.lower_branch(condition, then, otherwise, expected, true);
+                Ok(())
+            }
+            Statement::Evaluate { value } => {
+                let type_ = self.type_of(value)?;
+                if type_.width() > 64 {
+                    let pointer = self.pointer(value, &type_)?;
+                    self.line(format!("(void){pointer};"));
+                } else {
+                    let word = self.word(value, &type_)?;
+                    self.line(format!("(void)({word});"));
                 }
-                _ => {}
+                Ok(())
             }
         }
-        Ok(Some(self.lower_value(value, expected)?))
     }
 
-    fn lower_value(&mut self, value: &Value, expected: &Type) -> Result<Lowered, CodegenError> {
+    fn word(&mut self, value: &Value, expected: &Type) -> Result<String, String> {
+        match self.value(value, expected, false)? {
+            Emitted::Word(word) => Ok(word),
+            Emitted::Pointer(_) | Emitted::Reference { .. } => {
+                Err("a word was expected".to_string())
+            }
+        }
+    }
+
+    fn pointer(&mut self, value: &Value, expected: &Type) -> Result<String, String> {
+        match self.value(value, expected, false)? {
+            Emitted::Pointer(pointer) => Ok(pointer),
+            Emitted::Word(_) | Emitted::Reference { .. } => {
+                Err("a pointer was expected".to_string())
+            }
+        }
+    }
+
+    fn reference_parts(&mut self, value: &Value) -> Result<(String, String), String> {
         match value {
-            Value::Constant(bits) => self.lower_constant(bits, expected),
-            Value::Nand(left, right) => self.lower_nand(left, right, expected),
-            Value::Intrinsic(intrinsic, arguments) => {
-                self.lower_intrinsic(*intrinsic, arguments, expected)
-            }
-            Value::Collection(elements) => self.lower_collection(elements, expected),
-            Value::Element { collection, index } => {
-                self.lower_element(collection, *index, expected)
-            }
             Value::Reference { slot, bit_offset } => {
-                if !expected.is_reference() {
-                    return Err(CodegenError::new("a reference has the wrong type"));
+                let index = slot.index();
+                if self.function.slots()[index].is_reference() {
+                    let bit = if *bit_offset == 0 {
+                        format!("sb{index}")
+                    } else {
+                        format!("(sb{index} + {bit_offset})")
+                    };
+                    Ok((format!("s{index}"), bit))
+                } else {
+                    Ok((format!("s{index}"), bit_offset.to_string()))
                 }
-                let pointer = self.lower_reference(*slot, *bit_offset)?;
-                Ok(Lowered::Word(self.pointer_as_bit(pointer)))
             }
-            Value::Load(reference) => self.lower_load(reference, expected),
-            Value::Call(label, arguments) => self.lower_call(label.text(), arguments, expected),
-            Value::Extern(operation, arguments) => {
-                self.lower_extern(*operation, arguments, expected)
+            _ => Err("a reference was expected".to_string()),
+        }
+    }
+
+    fn value(&mut self, value: &Value, expected: &Type, tail: bool) -> Result<Emitted, String> {
+        if expected.is_reference() {
+            let (base, bit) = self.reference_parts(value)?;
+            return Ok(Emitted::Reference { base, bit });
+        }
+        match value {
+            Value::Constant(bits) => self.constant(bits.bits(), expected.width()),
+            Value::Nand(left, right) => {
+                if expected.width() > 64 {
+                    let name = self.temporary_array(expected.width());
+                    let left_pointer = self.pointer(left, expected)?;
+                    let right_pointer = self.pointer(right, expected)?;
+                    self.line(format!(
+                        "lap_wide_nand({name}, {left_pointer}, {right_pointer}, {});",
+                        expected.width()
+                    ));
+                    return Ok(Emitted::Pointer(name));
+                }
+                let left_word = self.word(left, expected)?;
+                let right_word = self.word(right, expected)?;
+                Ok(Emitted::Word(format!(
+                    "((~(({left_word}) & ({right_word}))) & lap_mask({}))",
+                    expected.width()
+                )))
             }
+            Value::Intrinsic(intrinsic, arguments) => {
+                self.intrinsic(*intrinsic, arguments, expected)
+            }
+            Value::Collection(elements) => self.collection(elements, expected),
+            Value::Element { collection, index } => self.element(collection, *index, expected),
+            Value::Reference { .. } => Err("a bare reference is not supported".to_string()),
+            Value::Load(reference) => self.load(reference, expected),
+            Value::Call(label, arguments) => self.call(label.text(), arguments, expected),
+            Value::Extern(operation, arguments) => self.external(*operation, arguments, expected),
             Value::Branch(condition, then, otherwise) => {
-                match self.lower_branch(condition, then, otherwise, expected, false)? {
-                    Some(lowered) => Ok(lowered),
-                    None => Err(CodegenError::new("a branch produced no value")),
-                }
+                self.branch(condition, then, otherwise, expected, tail)
             }
         }
     }
 
-    fn lower_word(&mut self, value: &Value, width: usize) -> Result<CraneliftValue, CodegenError> {
-        let type_ = self.type_of(value)?;
-        if type_.width() != width {
-            return Err(CodegenError::new("an operand has the wrong width"));
-        }
-        match self.lower_value(value, &type_)? {
-            Lowered::Word(word) => Ok(word),
-            Lowered::Slot(_) => Err(CodegenError::new("a word was expected")),
-        }
-    }
-
-    fn lower_constant(
-        &mut self,
-        bits: &BitVector,
-        expected: &Type,
-    ) -> Result<Lowered, CodegenError> {
-        let width = bits.width();
-        if width != expected.width() {
-            return Err(CodegenError::new("a constant has the wrong width"));
-        }
+    fn constant(&mut self, bits: &[bool], width: usize) -> Result<Emitted, String> {
         if width <= 64 {
-            let word = bits_to_word(bits.bits(), 0, width);
-            Ok(Lowered::Word(self.builder.ins().iconst(types::I64, word)))
-        } else {
-            let slot = self.allocate_value_slot(width)?;
-            let destination = self.slot_pointer(slot);
-            let mut offset = 0;
-            while offset < width {
-                let chunk = (width - offset).min(64);
-                let word = bits_to_word(bits.bits(), offset, chunk);
-                let pointer = self.pointer_offset(destination, offset);
-                let constant = self.builder.ins().iconst(types::I64, word);
-                self.store_bits(pointer, constant, chunk)?;
-                offset += chunk;
-            }
-            Ok(Lowered::Slot(self.builder.ins().stack_addr(
-                self.pointer_type,
-                slot,
-                0,
-            )))
+            return Ok(Emitted::Word(bits_to_word(bits, width).to_string()));
         }
+        let name = self.temporary_array(width);
+        let mut offset = 0;
+        while offset < width {
+            let chunk = (width - offset).min(64);
+            let word = bits_to_word(&bits[offset..], chunk);
+            self.line(format!("{name}[{}] = {word};", offset / 64));
+            offset += chunk;
+        }
+        Ok(Emitted::Pointer(name))
     }
 
-    fn lower_nand(
-        &mut self,
-        left: &Value,
-        right: &Value,
-        expected: &Type,
-    ) -> Result<Lowered, CodegenError> {
-        let width = expected.width();
-        if width <= 64 {
-            let left_word = self.lower_word(left, width)?;
-            let right_word = self.lower_word(right, width)?;
-            let banded = self.builder.ins().band(left_word, right_word);
-            let word = self.builder.ins().bnot(banded);
-            Ok(Lowered::Word(self.mask(word, width)))
-        } else {
-            let left_value = self.lower_wide_argument(left, width)?;
-            let right_value = self.lower_wide_argument(right, width)?;
-            self.lower_wide_operation(WideOperation::Nand, &[left_value, right_value], width)
-        }
-    }
-
-    fn lower_intrinsic(
+    fn intrinsic(
         &mut self,
         intrinsic: Intrinsic,
         arguments: &[Value],
         expected: &Type,
-    ) -> Result<Lowered, CodegenError> {
-        if arguments.len() != intrinsic.arity() {
-            return Err(CodegenError::new("an intrinsic has the wrong arity"));
-        }
+    ) -> Result<Emitted, String> {
         if intrinsic == Intrinsic::DivMod {
-            return self.lower_div_mod(arguments, expected);
+            return self.divide(arguments, expected);
         }
-        let result_width = expected.width();
-        let operand_width = if intrinsic.is_comparison() {
-            self.type_of(&arguments[0])?.width()
-        } else {
-            result_width
-        };
-        if intrinsic == Intrinsic::Select && operand_width != 1 {
-            return Err(CodegenError::new("a select needs a bit condition"));
-        }
-        if operand_width <= 64 {
-            let mut words = Vec::new();
+        let width = expected.width();
+        if width > 64 {
+            let helper = match intrinsic {
+                Intrinsic::Not => "lap_wide_not",
+                Intrinsic::And => "lap_wide_and",
+                Intrinsic::Or => "lap_wide_or",
+                Intrinsic::Xor => "lap_wide_xor",
+                Intrinsic::Add => "lap_wide_add",
+                Intrinsic::Sub => "lap_wide_sub",
+                _ => return Err("a wide intrinsic is not supported".to_string()),
+            };
+            let name = self.temporary_array(width);
+            let mut arguments_text = vec![name.clone()];
             for argument in arguments {
-                words.push(self.lower_word(argument, operand_width)?);
+                let type_ = self.type_of(argument)?;
+                arguments_text.push(self.pointer(argument, &type_)?);
             }
-            let word = match intrinsic {
-                Intrinsic::Not => self.builder.ins().bnot(words[0]),
-                Intrinsic::And => self.builder.ins().band(words[0], words[1]),
-                Intrinsic::Or => self.builder.ins().bor(words[0], words[1]),
-                Intrinsic::Xor => self.builder.ins().bxor(words[0], words[1]),
-                Intrinsic::Add => self.builder.ins().iadd(words[0], words[1]),
-                Intrinsic::Sub => self.builder.ins().isub(words[0], words[1]),
-                Intrinsic::Mul => self.lower_multiply(words[0], words[1], arguments),
-                Intrinsic::Inc => self.builder.ins().iadd_imm_u(words[0], 1),
-                Intrinsic::Dec => {
-                    let one = self.builder.ins().iconst(types::I64, 1);
-                    self.builder.ins().isub(words[0], one)
-                }
-                Intrinsic::ShiftLeftOne => self.builder.ins().ishl_imm_u(words[0], 1),
-                Intrinsic::ShiftRightOne => self.builder.ins().ushr_imm_u(words[0], 1),
-                Intrinsic::Eq => {
-                    let flag = self.builder.ins().icmp(IntCC::Equal, words[0], words[1]);
-                    self.builder.ins().uextend(types::I64, flag)
-                }
-                Intrinsic::Lt => {
-                    let flag = self
-                        .builder
-                        .ins()
-                        .icmp(IntCC::UnsignedLessThan, words[0], words[1]);
-                    self.builder.ins().uextend(types::I64, flag)
-                }
-                Intrinsic::IsZero => {
-                    let zero = self.builder.ins().iconst(types::I64, 0);
-                    let flag = self.builder.ins().icmp(IntCC::Equal, words[0], zero);
-                    self.builder.ins().uextend(types::I64, flag)
-                }
-                Intrinsic::Select => self.builder.ins().select(words[0], words[1], words[2]),
-                Intrinsic::DivMod => {
-                    return Err(CodegenError::new(
-                        "a division is lowered before word operations",
-                    ));
-                }
-            };
-            Ok(Lowered::Word(self.mask(word, result_width)))
-        } else {
-            let mut values = Vec::new();
-            for argument in arguments {
-                values.push(self.lower_wide_argument(argument, operand_width)?);
-            }
-            let operation = match intrinsic {
-                Intrinsic::Not => WideOperation::Not,
-                Intrinsic::And => WideOperation::And,
-                Intrinsic::Or => WideOperation::Or,
-                Intrinsic::Xor => WideOperation::Xor,
-                Intrinsic::Add => WideOperation::Add,
-                Intrinsic::Sub => WideOperation::Sub,
-                _ => {
-                    return Err(CodegenError::new(
-                        "an intrinsic is only defined for widths up to 64",
-                    ));
-                }
-            };
-            self.lower_wide_operation(operation, &values, operand_width)
+            arguments_text.push(width.to_string());
+            self.line(format!("{helper}({});", arguments_text.join(", ")));
+            return Ok(Emitted::Pointer(name));
         }
+        let mut words = Vec::new();
+        for argument in arguments {
+            let type_ = self.type_of(argument)?;
+            words.push(self.word(argument, &type_)?);
+        }
+        let expression = match intrinsic {
+            Intrinsic::Not => format!("~({})", words[0]),
+            Intrinsic::And => format!("({}) & ({})", words[0], words[1]),
+            Intrinsic::Or => format!("({}) | ({})", words[0], words[1]),
+            Intrinsic::Xor => format!("({}) ^ ({})", words[0], words[1]),
+            Intrinsic::Add => format!("({}) + ({})", words[0], words[1]),
+            Intrinsic::Sub => format!("({}) - ({})", words[0], words[1]),
+            Intrinsic::Mul => format!("({}) * ({})", words[0], words[1]),
+            Intrinsic::Inc => format!("({}) + 1", words[0]),
+            Intrinsic::Dec => format!("({}) - 1", words[0]),
+            Intrinsic::ShiftLeftOne => format!("({}) << 1", words[0]),
+            Intrinsic::ShiftRightOne => format!("({}) >> 1", words[0]),
+            Intrinsic::Eq => format!("(({}) == ({}))", words[0], words[1]),
+            Intrinsic::Lt => format!("(({}) < ({}))", words[0], words[1]),
+            Intrinsic::IsZero => format!("(({}) == 0)", words[0]),
+            Intrinsic::Select => format!("(({}) ? ({}) : ({}))", words[0], words[1], words[2]),
+            Intrinsic::DivMod => {
+                return Err("a division is lowered before word operations".to_string());
+            }
+        };
+        Ok(Emitted::Word(format!(
+            "(({expression}) & lap_mask({width}))"
+        )))
     }
 
-    fn lower_multiply(
-        &mut self,
-        left: CraneliftValue,
-        right: CraneliftValue,
-        arguments: &[Value],
-    ) -> CraneliftValue {
-        let Some((constant, value)) = constant_operand(arguments, left, right) else {
-            return self.builder.ins().imul(left, right);
-        };
-        if constant == 0 {
-            return self.builder.ins().iconst(types::I64, 0);
+    fn divide(&mut self, arguments: &[Value], expected: &Type) -> Result<Emitted, String> {
+        if arguments.len() != 2 {
+            return Err("a division has the wrong arity".to_string());
         }
-        let Some(plan) = multiply_plan(constant) else {
-            return self.builder.ins().imul(left, right);
-        };
-        let mut positive: Option<CraneliftValue> = None;
-        let mut negative: Option<CraneliftValue> = None;
-        for term in &plan.terms {
-            let (is_negative, shift) = match term {
-                MultiplyTerm::Add(shift) => (false, *shift),
-                MultiplyTerm::Subtract(shift) => (true, *shift),
-            };
-            let shifted = if shift == 0 {
-                value
-            } else {
-                self.builder.ins().ishl_imm_u(value, i64::from(shift))
-            };
-            let accumulator = if is_negative {
-                &mut negative
-            } else {
-                &mut positive
-            };
-            *accumulator = Some(match *accumulator {
-                Some(current) => self.builder.ins().iadd(current, shifted),
-                None => shifted,
-            });
-        }
-        let mut result = match (positive, negative) {
-            (Some(positive), Some(negative)) => self.builder.ins().isub(positive, negative),
-            (Some(positive), None) => positive,
-            (None, Some(negative)) => {
-                let zero = self.builder.ins().iconst(types::I64, 0);
-                self.builder.ins().isub(zero, negative)
-            }
-            (None, None) => value,
-        };
-        if plan.shift > 0 {
-            result = self.builder.ins().ishl_imm_u(result, i64::from(plan.shift));
-        }
-        result
-    }
-
-    fn lower_wide_argument(
-        &mut self,
-        value: &Value,
-        width: usize,
-    ) -> Result<Lowered, CodegenError> {
-        let type_ = self.type_of(value)?;
-        if type_.width() != width {
-            return Err(CodegenError::new("an operand has the wrong width"));
-        }
-        self.lower_value(value, &type_)
-    }
-
-    fn lower_div_mod(
-        &mut self,
-        arguments: &[Value],
-        expected: &Type,
-    ) -> Result<Lowered, CodegenError> {
         let operand_type = self.type_of(&arguments[0])?;
         let operand_width = operand_type.width();
         if operand_width > 64 {
-            return Err(CodegenError::new(
-                "a division is only defined for widths up to 64",
-            ));
+            return Err("a division is only defined for widths up to 64".to_string());
         }
         let paired = matches!(
             expected,
@@ -1084,1183 +717,312 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
                     && elements[1] == operand_type
         );
         if !paired {
-            return Err(CodegenError::new("a division has the wrong type"));
+            return Err("a division has the wrong type".to_string());
         }
-        let value = self.lower_word(&arguments[0], operand_width)?;
-        let divisor = self.lower_word(&arguments[1], operand_width)?;
-        let (quotient, remainder) = self.divide(value, divisor, &arguments[1])?;
-        let total = 2 * operand_width;
-        if total <= 64 {
-            let high = self
-                .builder
-                .ins()
-                .ishl_imm_u(remainder, operand_width as i64);
-            let word = self.builder.ins().bor(quotient, high);
-            Ok(Lowered::Word(self.mask(word, total)))
-        } else {
-            let slot = self.allocate_value_slot(total)?;
-            let destination = self.slot_pointer(slot);
-            self.store_bits(destination, quotient, operand_width)?;
-            let remainder_pointer = self.pointer_offset(destination, operand_width);
-            self.store_bits(remainder_pointer, remainder, operand_width)?;
-            Ok(Lowered::Slot(self.builder.ins().stack_addr(
-                self.pointer_type,
-                slot,
-                0,
-            )))
-        }
-    }
-
-    fn divide(
-        &mut self,
-        value: CraneliftValue,
-        divisor: CraneliftValue,
-        divisor_value: &Value,
-    ) -> Result<(CraneliftValue, CraneliftValue), CodegenError> {
-        if let Value::Constant(bits) = divisor_value {
-            return self.divide_by_constant(value, bits);
-        }
-        let zero = self.builder.ins().iconst(types::I64, 0);
-        let one = self.builder.ins().iconst(types::I64, 1);
-        let is_zero = self.builder.ins().icmp(IntCC::Equal, divisor, zero);
-        let safe = self.builder.ins().select(is_zero, one, divisor);
-        let quotient = self.builder.ins().udiv(value, safe);
-        let product = self.builder.ins().imul(quotient, safe);
-        let remainder = self.builder.ins().isub(value, product);
-        Ok((
-            self.builder.ins().select(is_zero, zero, quotient),
-            self.builder.ins().select(is_zero, zero, remainder),
-        ))
-    }
-
-    fn divide_by_constant(
-        &mut self,
-        value: CraneliftValue,
-        bits: &BitVector,
-    ) -> Result<(CraneliftValue, CraneliftValue), CodegenError> {
-        let divisor = bits_to_word(bits.bits(), 0, bits.width()) as u64;
-        let zero = self.builder.ins().iconst(types::I64, 0);
-        if divisor == 0 {
-            return Ok((zero, zero));
-        }
-        if divisor == 1 {
-            return Ok((value, zero));
-        }
-        if divisor.is_power_of_two() {
-            let shift = divisor.trailing_zeros() as i64;
-            let quotient = self.builder.ins().ushr_imm_u(value, shift);
-            let remainder = self.builder.ins().band_imm_u(value, (divisor - 1) as i64);
-            return Ok((quotient, remainder));
-        }
-        if let Some((magic, shift)) = magic_division(divisor) {
-            let magic_constant = self.builder.ins().iconst(types::I64, magic as i64);
-            let high = self.builder.ins().umulhi(value, magic_constant);
-            let quotient = self.builder.ins().ushr_imm_u(high, i64::from(shift));
-            let divisor_constant = self.builder.ins().iconst(types::I64, divisor as i64);
-            let product = self.builder.ins().imul(quotient, divisor_constant);
-            let remainder = self.builder.ins().isub(value, product);
-            return Ok((quotient, remainder));
-        }
-        let divisor_constant = self.builder.ins().iconst(types::I64, divisor as i64);
-        let quotient = self.builder.ins().udiv(value, divisor_constant);
-        let product = self.builder.ins().imul(quotient, divisor_constant);
-        let remainder = self.builder.ins().isub(value, product);
-        Ok((quotient, remainder))
-    }
-
-    fn lower_wide_operation(
-        &mut self,
-        operation: WideOperation,
-        arguments: &[Lowered],
-        width: usize,
-    ) -> Result<Lowered, CodegenError> {
-        let slot = self.allocate_value_slot(width)?;
-        let destination = self.slot_pointer(slot);
-        let mut carry = self.builder.ins().iconst(types::I64, 0);
-        let mut offset = 0;
-        while offset < width {
-            let chunk = (width - offset).min(64);
-            let word = match operation {
-                WideOperation::Nand => {
-                    let left = self.load_chunk(arguments[0], offset, chunk)?;
-                    let right = self.load_chunk(arguments[1], offset, chunk)?;
-                    let banded = self.builder.ins().band(left, right);
-                    self.builder.ins().bnot(banded)
-                }
-                WideOperation::Not => {
-                    let value = self.load_chunk(arguments[0], offset, chunk)?;
-                    self.builder.ins().bnot(value)
-                }
-                WideOperation::And => {
-                    let left = self.load_chunk(arguments[0], offset, chunk)?;
-                    let right = self.load_chunk(arguments[1], offset, chunk)?;
-                    self.builder.ins().band(left, right)
-                }
-                WideOperation::Or => {
-                    let left = self.load_chunk(arguments[0], offset, chunk)?;
-                    let right = self.load_chunk(arguments[1], offset, chunk)?;
-                    self.builder.ins().bor(left, right)
-                }
-                WideOperation::Xor => {
-                    let left = self.load_chunk(arguments[0], offset, chunk)?;
-                    let right = self.load_chunk(arguments[1], offset, chunk)?;
-                    self.builder.ins().bxor(left, right)
-                }
-                WideOperation::Add => {
-                    let left = self.load_chunk(arguments[0], offset, chunk)?;
-                    let right = self.load_chunk(arguments[1], offset, chunk)?;
-                    let (sum, overflow) = self.builder.ins().uadd_overflow(left, right);
-                    let (sum, carry_overflow) = self.builder.ins().uadd_overflow(sum, carry);
-                    let overflowed = self.builder.ins().bor(overflow, carry_overflow);
-                    carry = self.builder.ins().uextend(types::I64, overflowed);
-                    sum
-                }
-                WideOperation::Sub => {
-                    let left = self.load_chunk(arguments[0], offset, chunk)?;
-                    let right = self.load_chunk(arguments[1], offset, chunk)?;
-                    let (difference, underflow) = self.builder.ins().usub_overflow(left, right);
-                    let (difference, borrow_underflow) =
-                        self.builder.ins().usub_overflow(difference, carry);
-                    let underflowed = self.builder.ins().bor(underflow, borrow_underflow);
-                    carry = self.builder.ins().uextend(types::I64, underflowed);
-                    difference
-                }
-            };
-            let masked = self.mask(word, chunk);
-            let pointer = self.pointer_offset(destination, offset);
-            self.store_bits(pointer, masked, chunk)?;
-            offset += chunk;
-        }
-        Ok(Lowered::Slot(self.builder.ins().stack_addr(
-            self.pointer_type,
-            slot,
-            0,
-        )))
-    }
-
-    fn load_chunk(
-        &mut self,
-        lowered: Lowered,
-        offset: usize,
-        width: usize,
-    ) -> Result<CraneliftValue, CodegenError> {
-        match lowered {
-            Lowered::Slot(address) => {
-                let base = BitPointer::Byte { address, bit: 0 };
-                let pointer = self.pointer_offset(base, offset);
-                self.load_bits(pointer, width)
-            }
-            Lowered::Word(word) => {
-                let shifted = if offset == 0 {
-                    word
-                } else {
-                    self.builder.ins().ushr_imm_u(word, offset as i64)
-                };
-                Ok(self.mask(shifted, width))
-            }
-        }
-    }
-
-    fn lower_collection(
-        &mut self,
-        elements: &[Value],
-        expected: &Type,
-    ) -> Result<Lowered, CodegenError> {
-        let element_types = match expected {
-            Type::Collection(types) if types.len() == elements.len() => types,
-            _ => return Err(CodegenError::new("a collection has the wrong type")),
-        };
+        let value = self.word(&arguments[0], &operand_type)?;
+        let divisor = self.word(&arguments[1], &operand_type)?;
+        let value_name = self.temporary_word();
+        let divisor_name = self.temporary_word();
+        self.line(format!("{value_name} = {value};"));
+        self.line(format!("{divisor_name} = {divisor};"));
+        let quotient = format!("(({divisor_name}) == 0 ? 0 : (({value_name}) / ({divisor_name})))");
+        let remainder =
+            format!("(({divisor_name}) == 0 ? 0 : (({value_name}) % ({divisor_name})))");
         let width = expected.width();
         if width <= 64 {
-            let mut word = self.builder.ins().iconst(types::I64, 0);
+            return Ok(Emitted::Word(format!(
+                "((({quotient}) | (({remainder}) << {operand_width})) & lap_mask({width}))"
+            )));
+        }
+        let name = self.temporary_array(width);
+        self.line(format!(
+            "lap_store({name}, 0, {operand_width}, {quotient});"
+        ));
+        self.line(format!(
+            "lap_store({name}, {operand_width}, {operand_width}, {remainder});"
+        ));
+        Ok(Emitted::Pointer(name))
+    }
+
+    fn collection(&mut self, elements: &[Value], expected: &Type) -> Result<Emitted, String> {
+        let types = match expected {
+            Type::Collection(types) if types.len() == elements.len() => types.clone(),
+            _ => return Err("a collection has the wrong type".to_string()),
+        };
+        if expected.width() <= 64 {
+            let mut word = "0".to_string();
             let mut offset = 0;
-            for (element, element_type) in elements.iter().zip(element_types) {
-                let element_word = self.lower_word(element, element_type.width())?;
+            for (element, element_type) in elements.iter().zip(&types) {
+                let element_word = self.word(element, element_type)?;
                 let shifted = if offset == 0 {
                     element_word
                 } else {
-                    self.builder.ins().ishl_imm_u(element_word, offset as i64)
+                    format!("(({element_word}) << {offset})")
                 };
-                word = self.builder.ins().bor(word, shifted);
+                word = format!("(({word}) | ({shifted}))");
                 offset += element_type.width();
             }
-            Ok(Lowered::Word(self.mask(word, width)))
-        } else {
-            let slot = self.allocate_value_slot(width)?;
-            let destination = self.slot_pointer(slot);
-            let mut offset = 0;
-            for (element, element_type) in elements.iter().zip(element_types) {
-                let lowered = self.lower_value(element, element_type)?;
-                let pointer = self.pointer_offset(destination, offset);
-                self.write_bits(pointer, lowered, element_type.width())?;
-                offset += element_type.width();
-            }
-            Ok(Lowered::Slot(self.builder.ins().stack_addr(
-                self.pointer_type,
-                slot,
-                0,
-            )))
+            return Ok(Emitted::Word(format!(
+                "(({word}) & lap_mask({}))",
+                expected.width()
+            )));
         }
-    }
-
-    fn lower_element(
-        &mut self,
-        operand: &Value,
-        index: usize,
-        expected: &Type,
-    ) -> Result<Lowered, CodegenError> {
-        let operand_type = self.type_of(operand)?;
-        let (offset, element_type) = element_at(&operand_type, index)?;
-        let width = element_type.width();
-        if width != expected.width() {
-            return Err(CodegenError::new("an element has the wrong width"));
-        }
-        if let Value::Load(reference) = operand {
-            if let Value::Reference {
-                slot,
-                bit_offset: 0,
-            } = reference.as_ref()
-            {
-                if let Some(words) = self.promoted_collection(*slot) {
-                    if let Some(word) = element_word(&words, offset, width) {
-                        return Ok(Lowered::Word(word));
-                    }
-                }
-            }
-        }
-        if width <= 64 {
-            if let Value::Load(reference) = operand {
-                if !self.is_promoted_reference(reference) {
-                    let pointer = self.lower_pointer(reference)?;
-                    let pointer = self.pointer_offset(pointer, offset);
-                    return Ok(Lowered::Word(self.load_bits(pointer, width)?));
-                }
-            }
-        }
-        let lowered = self.lower_value(operand, &operand_type)?;
-        match lowered {
-            Lowered::Word(word) => {
-                let shifted = self.builder.ins().ushr_imm_u(word, offset as i64);
-                Ok(Lowered::Word(self.mask(shifted, width)))
-            }
-            Lowered::Slot(address) => {
-                let base = BitPointer::Byte { address, bit: 0 };
-                let pointer = self.pointer_offset(base, offset);
-                if width <= 64 {
-                    Ok(Lowered::Word(self.load_bits(pointer, width)?))
-                } else {
-                    let slot = self.allocate_value_slot(width)?;
-                    let destination = self.slot_pointer(slot);
-                    self.copy_bits(pointer, destination, width)?;
-                    Ok(Lowered::Slot(self.builder.ins().stack_addr(
-                        self.pointer_type,
-                        slot,
-                        0,
-                    )))
-                }
-            }
-        }
-    }
-
-    fn lower_reference(&mut self, slot: Slot, offset: usize) -> Result<BitPointer, CodegenError> {
-        let slot_type = self.slot_type(slot)?;
-        let storage = self.storage(slot)?;
-        let pointed_type = self.storage_type(slot)?;
-        self.type_at_bit_offset(&pointed_type, offset)?;
-        let pointer = if slot_type.is_reference() {
-            BitPointer::Bit(self.load_word(storage))
-        } else {
-            BitPointer::Byte {
-                address: self.builder.ins().stack_addr(self.pointer_type, storage, 0),
-                bit: 0,
-            }
-        };
-        Ok(self.pointer_offset(pointer, offset))
-    }
-
-    fn lower_pointer(&mut self, value: &Value) -> Result<BitPointer, CodegenError> {
-        match value {
-            Value::Reference { slot, bit_offset } => self.lower_reference(*slot, *bit_offset),
-            other => Ok(BitPointer::Bit(self.lower_word(other, 64)?)),
-        }
-    }
-
-    fn lower_load(&mut self, reference: &Value, expected: &Type) -> Result<Lowered, CodegenError> {
-        let reference_type = self.type_of(reference)?;
-        let inner = match reference_type {
-            Type::Reference(inner) => *inner,
-            _ => return Err(CodegenError::new("a load needs a reference")),
-        };
-        if inner.width() != expected.width() {
-            return Err(CodegenError::new("a load has the wrong width"));
-        }
-        if let Value::Reference { slot, bit_offset } = reference {
-            if *bit_offset == 0 {
-                if let Some(value) = self.promoted_values.get(slot.index()).copied().flatten() {
-                    return Ok(Lowered::Word(value));
-                }
-                if let Some(words) = self.promoted_collection(*slot) {
-                    return self.materialize_words(&words, inner.width());
-                }
-            }
-        }
-        let pointer = self.lower_pointer(reference)?;
-        if inner.width() <= 64 {
-            Ok(Lowered::Word(self.load_bits(pointer, inner.width())?))
-        } else {
-            let slot = self.allocate_value_slot(inner.width())?;
-            let destination = self.slot_pointer(slot);
-            self.copy_bits(pointer, destination, inner.width())?;
-            Ok(Lowered::Slot(self.builder.ins().stack_addr(
-                self.pointer_type,
-                slot,
-                0,
-            )))
-        }
-    }
-
-    fn lower_call(
-        &mut self,
-        label: &str,
-        arguments: &[Value],
-        expected: &Type,
-    ) -> Result<Lowered, CodegenError> {
-        let symbol = self
-            .symbols
-            .functions
-            .get(label)
-            .ok_or_else(|| CodegenError::new("a callee is not defined"))?;
-        let callee = symbol.function;
-        let identifier = symbol.identifier;
-        if callee.parameters().len() != arguments.len() {
-            return Err(CodegenError::new("a call has the wrong arity"));
-        }
-        if callee.result().width() != expected.width() {
-            return Err(CodegenError::new("a call has the wrong width"));
-        }
-        let mut parameter_types = Vec::new();
-        for parameter in callee.parameters() {
-            let type_ = callee
-                .slots()
-                .get(parameter.slot().index())
-                .ok_or_else(|| CodegenError::new("a parameter has no slot"))?;
-            parameter_types.push(type_.clone());
-        }
-        let result_width = callee.result().width();
-        let mut words = Vec::new();
-        let result_slot = if result_width > 64 {
-            let slot = self.allocate_value_slot(result_width)?;
-            words.push(self.builder.ins().stack_addr(self.pointer_type, slot, 0));
-            Some(slot)
-        } else {
-            None
-        };
-        for (argument, parameter_type) in arguments.iter().zip(&parameter_types) {
-            let lowered = self.lower_value(argument, parameter_type)?;
-            match lowered {
-                Lowered::Word(word) => words.push(word),
-                Lowered::Slot(address) => {
-                    let width = parameter_type.width();
-                    let temporary = self.allocate_value_slot(width)?;
-                    let destination = self.slot_pointer(temporary);
-                    let source = BitPointer::Byte { address, bit: 0 };
-                    self.copy_bits(source, destination, width)?;
-                    let pointer = self
-                        .builder
-                        .ins()
-                        .stack_addr(self.pointer_type, temporary, 0);
-                    words.push(pointer);
-                }
-            }
-        }
-        let function_reference = self
-            .module
-            .declare_func_in_func(identifier, self.builder.func);
-        let call = self.builder.ins().call(function_reference, &words);
-        if let Some(slot) = result_slot {
-            Ok(Lowered::Slot(self.builder.ins().stack_addr(
-                self.pointer_type,
-                slot,
-                0,
-            )))
-        } else {
-            Ok(Lowered::Word(self.builder.inst_results(call)[0]))
-        }
-    }
-
-    fn lower_self_tail_call(
-        &mut self,
-        label: &str,
-        arguments: &[Value],
-        expected: &Type,
-    ) -> Result<bool, CodegenError> {
-        if label != self.function.label().text() {
-            return Ok(false);
-        }
-        if expected.width() != self.function.result().width() {
-            return Ok(false);
-        }
-        let parameters = self.function.parameters().to_vec();
-        if parameters.len() != arguments.len() {
-            return Ok(false);
-        }
-        let mut parameter_types = Vec::new();
-        for parameter in &parameters {
-            parameter_types.push(self.slot_type(parameter.slot())?.clone());
-        }
-        for argument in arguments {
-            if !self.tail_argument_is_safe(argument) {
-                return Ok(false);
-            }
-        }
-        let mut lowered = Vec::new();
-        for (argument, parameter_type) in arguments.iter().zip(&parameter_types) {
-            lowered.push(self.lower_value(argument, parameter_type)?);
-        }
-        let mut block_arguments = Vec::new();
-        for (parameter, (value, parameter_type)) in
-            parameters.iter().zip(lowered.iter().zip(&parameter_types))
-        {
-            if self.is_promoted_slot(parameter.slot()) {
-                match value {
-                    Lowered::Word(word) => block_arguments
-                        .push(BlockArg::Value(self.mask(*word, parameter_type.width()))),
-                    Lowered::Slot(_) => {
-                        return Err(CodegenError::new("a promoted parameter needs a word"));
-                    }
+        let name = self.temporary_array(expected.width());
+        let mut offset = 0;
+        for (element, element_type) in elements.iter().zip(&types) {
+            if element_type.width() > 64 {
+                let pointer = self.pointer(element, element_type)?;
+                for index in 0..element_type.width().div_ceil(64) {
+                    self.line(format!(
+                        "lap_store({name}, {}, 64, {pointer}[{index}]);",
+                        offset + index * 64
+                    ));
                 }
             } else {
-                let storage = self.storage(parameter.slot())?;
-                self.write_slot(storage, *value, parameter_type.width())?;
+                let element_word = self.word(element, element_type)?;
+                self.line(format!(
+                    "lap_store({name}, {offset}, {}, {element_word});",
+                    element_type.width()
+                ));
             }
+            offset += element_type.width();
         }
-        let body_block = self
-            .body_block
-            .ok_or_else(|| CodegenError::new("a tail call needs a body"))?;
-        self.builder.ins().jump(body_block, &block_arguments);
-        Ok(true)
+        Ok(Emitted::Pointer(name))
     }
 
-    fn is_promoted_slot(&self, slot: Slot) -> bool {
-        self.promoted_values
-            .get(slot.index())
-            .copied()
-            .flatten()
-            .is_some()
-    }
-
-    fn is_promotable_local(&self, slot: Slot) -> bool {
-        self.single_assignment
-            .get(slot.index())
-            .copied()
-            .unwrap_or(false)
-    }
-
-    fn promote_binding(
+    fn element(
         &mut self,
-        slot: Slot,
-        value: &Value,
-        type_: &Type,
-    ) -> Result<bool, CodegenError> {
-        if !self.is_promotable_local(slot) {
-            return Ok(false);
+        collection: &Value,
+        index: usize,
+        expected: &Type,
+    ) -> Result<Emitted, String> {
+        let collection_type = self.type_of(collection)?;
+        let (offset, element_type) = element_at(&collection_type, index)?;
+        if element_type.width() != expected.width() {
+            return Err("an element has the wrong width".to_string());
         }
-        if type_.width() <= 64 {
-            let lowered = self.lower_value(value, type_)?;
-            return match lowered {
-                Lowered::Word(word) => {
-                    self.promoted_values[slot.index()] = Some(word);
-                    Ok(true)
+        if element_type.width() <= 64 {
+            return match self.value(collection, &collection_type, false)? {
+                Emitted::Word(word) => {
+                    let shifted = if offset == 0 {
+                        word
+                    } else {
+                        format!("(({word}) >> {offset})")
+                    };
+                    Ok(Emitted::Word(format!(
+                        "(({shifted}) & lap_mask({}))",
+                        element_type.width()
+                    )))
                 }
-                Lowered::Slot(_) => Err(CodegenError::new("a promoted binding needs a word")),
+                Emitted::Pointer(pointer) => Ok(Emitted::Word(format!(
+                    "lap_load({pointer}, {offset}, {})",
+                    element_type.width()
+                ))),
+                Emitted::Reference { .. } => {
+                    Err("an element of a reference is not supported".to_string())
+                }
             };
         }
-        let Some(words) = self.lower_collection_words(value, type_)? else {
-            return Ok(false);
-        };
-        self.promoted_collections[slot.index()] = Some(words);
-        Ok(true)
+        let pointer = self.pointer(collection, &collection_type)?;
+        if offset % 64 == 0 {
+            return Ok(Emitted::Pointer(format!("({pointer} + {})", offset / 64)));
+        }
+        let name = self.temporary_array(element_type.width());
+        for index in 0..element_type.width().div_ceil(64) {
+            self.line(format!(
+                "{name}[{index}] = lap_load({pointer}, {}, 64);",
+                offset + index * 64
+            ));
+        }
+        Ok(Emitted::Pointer(name))
     }
 
-    fn lower_collection_words(
+    fn load(&mut self, reference: &Value, expected: &Type) -> Result<Emitted, String> {
+        let (base, bit) = self.reference_parts(reference)?;
+        if expected.width() <= 64 {
+            return Ok(Emitted::Word(format!(
+                "lap_load({base}, {bit}, {})",
+                expected.width()
+            )));
+        }
+        let name = self.temporary_array(expected.width());
+        for index in 0..expected.width().div_ceil(64) {
+            self.line(format!(
+                "{name}[{index}] = lap_load({base}, ({bit}) + {}, 64);",
+                index * 64
+            ));
+        }
+        Ok(Emitted::Pointer(name))
+    }
+
+    fn call(
         &mut self,
-        value: &Value,
-        type_: &Type,
-    ) -> Result<Option<Vec<(CraneliftValue, usize)>>, CodegenError> {
-        if let (Value::Collection(elements), Type::Collection(types)) = (value, type_) {
-            if elements.len() != types.len() || types.iter().any(|type_| type_.width() > 64) {
-                return Ok(None);
-            }
-            let mut words = Vec::new();
-            for (element, element_type) in elements.iter().zip(types) {
-                let word = self.lower_word(element, element_type.width())?;
-                words.push((word, element_type.width()));
-            }
-            return Ok(Some(words));
-        }
-        if let Value::Load(reference) = value {
-            if let Value::Reference {
-                slot,
-                bit_offset: 0,
-            } = reference.as_ref()
-            {
-                if let Some(words) = self.promoted_collection(*slot) {
-                    if words.iter().map(|(_, width)| width).sum::<usize>() == type_.width() {
-                        return Ok(Some(words));
-                    }
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    fn promoted_collection(&self, slot: Slot) -> Option<Vec<(CraneliftValue, usize)>> {
-        self.promoted_collections
-            .get(slot.index())
-            .cloned()
-            .flatten()
-    }
-
-    fn materialize_words(
-        &mut self,
-        words: &[(CraneliftValue, usize)],
-        width: usize,
-    ) -> Result<Lowered, CodegenError> {
-        let slot = self.allocate_value_slot(width)?;
-        let destination = self.slot_pointer(slot);
-        let mut offset = 0;
-        for (word, element_width) in words {
-            let pointer = self.pointer_offset(destination, offset);
-            self.store_bits(pointer, *word, *element_width)?;
-            offset += element_width;
-        }
-        Ok(Lowered::Slot(self.builder.ins().stack_addr(
-            self.pointer_type,
-            slot,
-            0,
-        )))
-    }
-
-    fn is_promoted_reference(&self, value: &Value) -> bool {
-        match value {
-            Value::Reference { slot, .. } => self.is_promoted_slot(*slot),
-            _ => false,
-        }
-    }
-
-    fn tail_argument_is_safe(&self, argument: &Value) -> bool {
-        match argument {
-            Value::Reference { slot, .. } => self.slot_is_reference_parameter(*slot),
-            _ => true,
-        }
-    }
-
-    fn slot_is_reference_parameter(&self, slot: Slot) -> bool {
-        self.function
-            .parameters()
-            .iter()
-            .any(|parameter| parameter.slot() == slot)
-            && self
-                .slot_type(slot)
-                .map(|type_| type_.is_reference())
-                .unwrap_or(false)
-    }
-
-    fn lower_extern(
-        &mut self,
-        operation: Operation,
+        label: &str,
         arguments: &[Value],
         expected: &Type,
-    ) -> Result<Lowered, CodegenError> {
-        let specification = lookup_operation(operation.code())
-            .ok_or_else(|| CodegenError::new("an operation is unknown"))?;
-        if specification.argument_widths().len() != arguments.len() {
-            return Err(CodegenError::new("an operation has the wrong arity"));
-        }
-        let payload_width: usize = specification.payload_widths().iter().sum();
-        if payload_width > 64 {
-            return Err(CodegenError::new("an operation has a wide payload"));
-        }
-        let result_type = extern_result_type(specification);
-        if result_type.width() != expected.width() {
-            return Err(CodegenError::new("an operation has the wrong width"));
-        }
+    ) -> Result<Emitted, String> {
+        let callee = self
+            .program
+            .functions()
+            .iter()
+            .find(|function| function.label().text() == label)
+            .ok_or_else(|| format!("a callee is not defined: {label}"))?;
         let mut words = Vec::new();
-        for (argument, width) in arguments.iter().zip(specification.argument_widths()) {
-            words.push(self.lower_word(argument, *width)?);
-        }
-        let output_slot = self.allocate_stack_slot(EXTERN_OUTPUT_SIZE)?;
-        let output_address = self
-            .builder
-            .ins()
-            .stack_addr(self.pointer_type, output_slot, 0);
-        let signature = operation_signature(self.module, specification);
-        let identifier = self
-            .module
-            .declare_function(
-                &operation_symbol(specification),
-                Linkage::Import,
-                &signature,
-            )
-            .map_err(|error| CodegenError::new(error.to_string()))?;
-        let function_reference = self
-            .module
-            .declare_func_in_func(identifier, self.builder.func);
-        words.push(output_address);
-        self.builder.ins().call(function_reference, &words);
-        let status = self
-            .builder
-            .ins()
-            .load(types::I64, memory_flags(), output_address, 0);
-        let payload = self
-            .builder
-            .ins()
-            .load(types::I64, memory_flags(), output_address, 8);
-        let total = 1 + payload_width;
-        if total <= 64 {
-            let shifted = self.builder.ins().ishl_imm_u(payload, 1);
-            let word = self.builder.ins().bor(status, shifted);
-            Ok(Lowered::Word(self.mask(word, total)))
+        let wide = callee.result().width() > 64;
+        let out = if wide {
+            let name = self.temporary_array(expected.width());
+            words.push(name);
+            true
         } else {
-            let slot = self.allocate_value_slot(total)?;
-            let destination = self.slot_pointer(slot);
-            self.store_bits(destination, status, 1)?;
-            let payload_pointer = self.pointer_offset(destination, 1);
-            self.store_bits(payload_pointer, payload, payload_width)?;
-            Ok(Lowered::Slot(self.builder.ins().stack_addr(
-                self.pointer_type,
-                slot,
-                0,
-            )))
+            false
+        };
+        let parameter_types: Vec<Type> = callee
+            .parameters()
+            .iter()
+            .map(|parameter| callee.slots()[parameter.slot().index()].clone())
+            .collect();
+        for (argument, parameter_type) in arguments.iter().zip(&parameter_types) {
+            if parameter_type.is_reference() {
+                let (base, bit) = self.reference_parts(argument)?;
+                words.push(base);
+                words.push(bit);
+            } else if parameter_type.width() > 64 {
+                let pointer = self.pointer(argument, parameter_type)?;
+                words.push(pointer);
+            } else {
+                let word = self.word(argument, parameter_type)?;
+                words.push(word);
+            }
+        }
+        let call = format!("{}({})", c_name(label), words.join(", "));
+        if out {
+            self.line(format!("{call};"));
+            Ok(Emitted::Pointer(words[0].clone()))
+        } else {
+            Ok(Emitted::Word(call))
         }
     }
 
-    fn lower_branch(
+    fn external(
+        &mut self,
+        operation: lapc_extern::Operation,
+        arguments: &[Value],
+        expected: &Type,
+    ) -> Result<Emitted, String> {
+        let specification = lapc_extern::lookup(operation.code())
+            .ok_or_else(|| "an operation is unknown".to_string())?;
+        let mut words = Vec::new();
+        for argument in arguments {
+            let type_ = self.type_of(argument)?;
+            words.push(self.word(argument, &type_)?);
+        }
+        let out = self.temporary_array(64);
+        self.line(format!("{out}[0] = 0;"));
+        self.line(format!("{out}[1] = 0;"));
+        words.push(out.clone());
+        self.line(format!(
+            "{}({});",
+            operation_symbol(specification),
+            words.join(", ")
+        ));
+        let payload_width: usize = specification.payload_widths().iter().sum();
+        if expected.width() <= 64 {
+            return Ok(Emitted::Word(format!(
+                "((({out}[0] & 1)) | (({out}[1] & lap_mask({payload_width})) << 1)) & lap_mask({})",
+                expected.width()
+            )));
+        }
+        let name = self.temporary_array(expected.width());
+        self.line(format!("lap_store({name}, 0, 1, {out}[0] & 1);"));
+        self.line(format!("lap_store({name}, 1, {payload_width}, {out}[1]);"));
+        Ok(Emitted::Pointer(name))
+    }
+
+    fn branch(
         &mut self,
         condition: &Value,
         then: &Block,
         otherwise: &Block,
         expected: &Type,
         tail: bool,
-    ) -> Result<Option<Lowered>, CodegenError> {
-        let condition_word = self.lower_word(condition, 1)?;
-        let wide = expected.width() > 64;
-        let result_type = if wide { self.pointer_type } else { types::I64 };
-        let then_block = self.builder.create_block();
-        let else_block = self.builder.create_block();
-        let merge_block = self.builder.create_block();
-        self.builder.append_block_param(merge_block, result_type);
-        self.builder
-            .ins()
-            .brif(condition_word, then_block, &[], else_block, &[]);
-        self.builder.switch_to_block(then_block);
-        self.builder.seal_block(then_block);
-        let then_result = self.lower_block(then, expected, tail)?;
-        if let Some(then_result) = then_result {
-            let argument = self.result_argument(then_result, wide)?;
-            self.builder
-                .ins()
-                .jump(merge_block, &[BlockArg::Value(argument)]);
+    ) -> Result<Emitted, String> {
+        let condition_word = self.word(condition, &Type::Bit)?;
+        let target = self.temporary(expected);
+        self.line(format!("if ({condition_word}) {{"));
+        self.indent += 1;
+        if let Some(value) = self.block(then, expected, tail)? {
+            self.assign(&target, value, expected)?;
         }
-        self.builder.switch_to_block(else_block);
-        self.builder.seal_block(else_block);
-        let else_result = self.lower_block(otherwise, expected, tail)?;
-        if let Some(else_result) = else_result {
-            let argument = self.result_argument(else_result, wide)?;
-            self.builder
-                .ins()
-                .jump(merge_block, &[BlockArg::Value(argument)]);
+        self.indent -= 1;
+        self.line("} else {");
+        self.indent += 1;
+        if let Some(value) = self.block(otherwise, expected, tail)? {
+            self.assign(&target, value, expected)?;
         }
-        self.builder.switch_to_block(merge_block);
-        self.builder.seal_block(merge_block);
-        if then_result.is_none() && else_result.is_none() {
-            self.builder.ins().trap(TrapCode::unwrap_user(1));
-            return Ok(None);
-        }
-        let parameter = self.builder.block_params(merge_block)[0];
-        Ok(Some(if wide {
-            Lowered::Slot(parameter)
+        self.indent -= 1;
+        self.line("}");
+        Ok(target)
+    }
+
+    fn temporary(&mut self, expected: &Type) -> Emitted {
+        if expected.is_reference() {
+            let base = self.temporary_pointer();
+            let bit = self.temporary_word();
+            Emitted::Reference { base, bit }
+        } else if expected.width() > 64 {
+            Emitted::Pointer(self.temporary_array(expected.width()))
         } else {
-            Lowered::Word(parameter)
-        }))
-    }
-
-    fn result_argument(
-        &mut self,
-        lowered: Lowered,
-        wide: bool,
-    ) -> Result<CraneliftValue, CodegenError> {
-        match (lowered, wide) {
-            (Lowered::Word(word), false) => Ok(word),
-            (Lowered::Slot(address), true) => Ok(address),
-            _ => Err(CodegenError::new("a branch arm has the wrong shape")),
+            Emitted::Word(self.temporary_word())
         }
     }
 
-    fn write_bits(
-        &mut self,
-        pointer: BitPointer,
-        lowered: Lowered,
-        width: usize,
-    ) -> Result<(), CodegenError> {
-        match lowered {
-            Lowered::Word(word) => self.store_bits(pointer, word, width),
-            Lowered::Slot(address) => {
-                let source = BitPointer::Byte { address, bit: 0 };
-                self.copy_bits(source, pointer, width)
-            }
-        }
-    }
-
-    fn write_slot(
-        &mut self,
-        slot: StackSlot,
-        lowered: Lowered,
-        width: usize,
-    ) -> Result<(), CodegenError> {
-        let destination = self.slot_pointer(slot);
-        self.write_bits(destination, lowered, width)
-    }
-
-    fn load_bits(
-        &mut self,
-        pointer: BitPointer,
-        width: usize,
-    ) -> Result<CraneliftValue, CodegenError> {
-        if width == 0 {
-            return Ok(self.builder.ins().iconst(types::I64, 0));
-        }
-        if width > 64 {
-            return Err(CodegenError::new("a word load is too wide"));
-        }
-        match pointer {
-            BitPointer::Byte { address, bit } => {
-                let bit = usize::from(bit);
-                if bit == 0 {
-                    match width {
-                        64 => {
-                            return Ok(self.builder.ins().load(
-                                types::I64,
-                                memory_flags(),
-                                address,
-                                0,
-                            ));
-                        }
-                        32 => {
-                            return Ok(self.builder.ins().uload32(memory_flags(), address, 0));
-                        }
-                        16 => {
-                            return Ok(self.builder.ins().uload16(
-                                types::I64,
-                                memory_flags(),
-                                address,
-                                0,
-                            ));
-                        }
-                        8 => {
-                            return Ok(self.builder.ins().uload8(
-                                types::I64,
-                                memory_flags(),
-                                address,
-                                0,
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-                let low = self
-                    .builder
-                    .ins()
-                    .load(types::I64, memory_flags(), address, 0);
-                if bit + width <= 64 {
-                    let shifted = if bit == 0 {
-                        low
-                    } else {
-                        self.builder.ins().ushr_imm_u(low, bit as i64)
-                    };
-                    Ok(self.mask(shifted, width))
-                } else {
-                    let high = self
-                        .builder
-                        .ins()
-                        .uload8(types::I64, memory_flags(), address, 8);
-                    let low_shifted = self.builder.ins().ushr_imm_u(low, bit as i64);
-                    let high_shifted = self.builder.ins().ishl_imm_u(high, (64 - bit) as i64);
-                    let combined = self.builder.ins().bor(low_shifted, high_shifted);
-                    Ok(self.mask(combined, width))
-                }
-            }
-            BitPointer::Bit(value) => {
-                let byte_pointer = self.builder.ins().ushr_imm_u(value, 3);
-                let shift = self.builder.ins().band_imm_u(value, 7);
-                let low = self
-                    .builder
-                    .ins()
-                    .load(types::I64, memory_flags(), byte_pointer, 0);
-                let high = self
-                    .builder
-                    .ins()
-                    .uload8(types::I64, memory_flags(), byte_pointer, 8);
-                let low_shifted = self.builder.ins().ushr(low, shift);
-                let negated = self.builder.ins().ineg(shift);
-                let high_shifted = self.builder.ins().ishl(high, negated);
-                let combined = self.builder.ins().bor(low_shifted, high_shifted);
-                let aligned = self.builder.ins().icmp_imm_u(IntCC::Equal, shift, 0);
-                let selected = self.builder.ins().select(aligned, low, combined);
-                Ok(self.mask(selected, width))
-            }
-        }
-    }
-
-    fn store_bits(
-        &mut self,
-        pointer: BitPointer,
-        word: CraneliftValue,
-        width: usize,
-    ) -> Result<(), CodegenError> {
-        if width == 0 {
-            return Ok(());
-        }
-        if width > 64 {
-            return Err(CodegenError::new("a word store is too wide"));
-        }
-        match pointer {
-            BitPointer::Byte { address, bit } => {
-                let bit = usize::from(bit);
-                match (bit, width) {
-                    (0, 64) => {
-                        self.builder.ins().store(memory_flags(), word, address, 0);
-                        return Ok(());
-                    }
-                    (0, 32) => {
-                        self.builder
-                            .ins()
-                            .istore32(memory_flags(), word, address, 0);
-                        return Ok(());
-                    }
-                    (0, 16) => {
-                        self.builder
-                            .ins()
-                            .istore16(memory_flags(), word, address, 0);
-                        return Ok(());
-                    }
-                    (0, 8) => {
-                        self.builder.ins().istore8(memory_flags(), word, address, 0);
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-                let low_mask = if bit + width >= 64 {
-                    (!0u64) << bit
-                } else {
-                    ((1u64 << width) - 1) << bit
-                };
-                let low = self
-                    .builder
-                    .ins()
-                    .load(types::I64, memory_flags(), address, 0);
-                let low_mask_constant = self.builder.ins().iconst(types::I64, low_mask as i64);
-                let inverted_low_mask = self.builder.ins().bnot(low_mask_constant);
-                let cleared_low = self.builder.ins().band(low, inverted_low_mask);
-                let inserted_low = if bit == 0 {
-                    word
-                } else {
-                    self.builder.ins().ishl_imm_u(word, bit as i64)
-                };
-                let new_low = self.builder.ins().bor(cleared_low, inserted_low);
-                self.builder
-                    .ins()
-                    .store(memory_flags(), new_low, address, 0);
-                if bit + width > 64 {
-                    let high = self
-                        .builder
-                        .ins()
-                        .uload8(types::I64, memory_flags(), address, 8);
-                    let high_mask = (1u64 << (bit + width - 64)) - 1;
-                    let high_mask_constant =
-                        self.builder.ins().iconst(types::I64, high_mask as i64);
-                    let inverted_high_mask = self.builder.ins().bnot(high_mask_constant);
-                    let cleared_high = self.builder.ins().band(high, inverted_high_mask);
-                    let shifted_word = self.builder.ins().ushr_imm_u(word, (64 - bit) as i64);
-                    let inserted_high = self.builder.ins().band(shifted_word, high_mask_constant);
-                    let new_high = self.builder.ins().bor(cleared_high, inserted_high);
-                    self.builder
-                        .ins()
-                        .istore8(memory_flags(), new_high, address, 8);
-                }
+    fn assign(&mut self, target: &Emitted, value: Emitted, expected: &Type) -> Result<(), String> {
+        match (target, value) {
+            (Emitted::Word(target), Emitted::Word(value)) => {
+                self.line(format!("{target} = {value};"));
                 Ok(())
             }
-            BitPointer::Bit(value) => {
-                let byte_pointer = self.builder.ins().ushr_imm_u(value, 3);
-                let shift = self.builder.ins().band_imm_u(value, 7);
-                let low = self
-                    .builder
-                    .ins()
-                    .load(types::I64, memory_flags(), byte_pointer, 0);
-                let low_mask_constant =
-                    self.builder.ins().iconst(types::I64, mask_immediate(width));
-                let low_mask = self.builder.ins().ishl(low_mask_constant, shift);
-                let inverted_low_mask = self.builder.ins().bnot(low_mask);
-                let cleared_low = self.builder.ins().band(low, inverted_low_mask);
-                let inserted_low = self.builder.ins().ishl(word, shift);
-                let new_low = self.builder.ins().bor(cleared_low, inserted_low);
-                self.builder
-                    .ins()
-                    .store(memory_flags(), new_low, byte_pointer, 0);
-                let high = self
-                    .builder
-                    .ins()
-                    .uload8(types::I64, memory_flags(), byte_pointer, 8);
-                let extra = self.builder.ins().iadd_imm_s(shift, width as i64 - 64);
-                let positive = self
-                    .builder
-                    .ins()
-                    .icmp_imm_s(IntCC::SignedGreaterThan, extra, 0);
-                let zero = self.builder.ins().iconst(types::I64, 0);
-                let clamped = self.builder.ins().select(positive, extra, zero);
-                let one = self.builder.ins().iconst(types::I64, 1);
-                let shifted_one = self.builder.ins().ishl(one, clamped);
-                let high_mask = self.builder.ins().isub(shifted_one, one);
-                let negated = self.builder.ins().ineg(shift);
-                let shifted_word = self.builder.ins().ushr(word, negated);
-                let inserted_high = self.builder.ins().band(shifted_word, high_mask);
-                let inverted_high_mask = self.builder.ins().bnot(high_mask);
-                let cleared_high = self.builder.ins().band(high, inverted_high_mask);
-                let new_high = self.builder.ins().bor(cleared_high, inserted_high);
-                self.builder
-                    .ins()
-                    .istore8(memory_flags(), new_high, byte_pointer, 8);
+            (Emitted::Pointer(target), Emitted::Pointer(value)) => {
+                self.line(format!(
+                    "lap_copy({target}, {value}, {});",
+                    expected.width()
+                ));
                 Ok(())
             }
-        }
-    }
-
-    fn copy_bits(
-        &mut self,
-        source: BitPointer,
-        destination: BitPointer,
-        width: usize,
-    ) -> Result<(), CodegenError> {
-        let chunk_count = width / 64;
-        let remainder = width % 64;
-        if chunk_count > 0 && chunk_count <= COPY_UNROLL_LIMIT {
-            for index in 0..chunk_count {
-                let offset = index * 64;
-                let source_pointer = self.pointer_offset(source, offset);
-                let chunk = self.load_bits(source_pointer, 64)?;
-                let destination_pointer = self.pointer_offset(destination, offset);
-                self.store_bits(destination_pointer, chunk, 64)?;
+            (
+                Emitted::Reference { base, bit },
+                Emitted::Reference {
+                    base: value_base,
+                    bit: value_bit,
+                },
+            ) => {
+                self.line(format!("{base} = {value_base};"));
+                self.line(format!("{bit} = {value_bit};"));
+                Ok(())
             }
-        } else if chunk_count > 0 {
-            match (source, destination) {
-                (
-                    BitPointer::Byte {
-                        address: source_address,
-                        bit: source_bit,
-                    },
-                    BitPointer::Byte {
-                        address: destination_address,
-                        bit: destination_bit,
-                    },
-                ) => {
-                    let loop_block = self.builder.create_block();
-                    let body_block = self.builder.create_block();
-                    let done_block = self.builder.create_block();
-                    self.builder.append_block_param(loop_block, types::I64);
-                    let zero = self.builder.ins().iconst(types::I64, 0);
-                    self.builder
-                        .ins()
-                        .jump(loop_block, &[BlockArg::Value(zero)]);
-                    self.builder.switch_to_block(loop_block);
-                    let index = self.builder.block_params(loop_block)[0];
-                    let condition = self.builder.ins().icmp_imm_u(
-                        IntCC::UnsignedLessThan,
-                        index,
-                        chunk_count as i64,
-                    );
-                    self.builder
-                        .ins()
-                        .brif(condition, body_block, &[], done_block, &[]);
-                    self.builder.switch_to_block(body_block);
-                    self.builder.seal_block(body_block);
-                    let offset = self.builder.ins().ishl_imm_u(index, 3);
-                    let source_pointer = BitPointer::Byte {
-                        address: self.builder.ins().iadd(source_address, offset),
-                        bit: source_bit,
-                    };
-                    let source_chunk = self.load_bits(source_pointer, 64)?;
-                    let destination_pointer = BitPointer::Byte {
-                        address: self.builder.ins().iadd(destination_address, offset),
-                        bit: destination_bit,
-                    };
-                    self.store_bits(destination_pointer, source_chunk, 64)?;
-                    let next = self.builder.ins().iadd_imm_u(index, 1);
-                    self.builder
-                        .ins()
-                        .jump(loop_block, &[BlockArg::Value(next)]);
-                    self.builder.seal_block(loop_block);
-                    self.builder.switch_to_block(done_block);
-                    self.builder.seal_block(done_block);
-                }
-                (source, destination) => {
-                    let source = self.pointer_as_bit(source);
-                    let destination = self.pointer_as_bit(destination);
-                    let loop_block = self.builder.create_block();
-                    let body_block = self.builder.create_block();
-                    let done_block = self.builder.create_block();
-                    self.builder.append_block_param(loop_block, types::I64);
-                    let zero = self.builder.ins().iconst(types::I64, 0);
-                    self.builder
-                        .ins()
-                        .jump(loop_block, &[BlockArg::Value(zero)]);
-                    self.builder.switch_to_block(loop_block);
-                    let index = self.builder.block_params(loop_block)[0];
-                    let condition = self.builder.ins().icmp_imm_u(
-                        IntCC::UnsignedLessThan,
-                        index,
-                        chunk_count as i64,
-                    );
-                    self.builder
-                        .ins()
-                        .brif(condition, body_block, &[], done_block, &[]);
-                    self.builder.switch_to_block(body_block);
-                    self.builder.seal_block(body_block);
-                    let offset = self.builder.ins().ishl_imm_u(index, 6);
-                    let source_pointer = self.builder.ins().iadd(source, offset);
-                    let source_chunk = self.load_bits(BitPointer::Bit(source_pointer), 64)?;
-                    let destination_pointer = self.builder.ins().iadd(destination, offset);
-                    self.store_bits(BitPointer::Bit(destination_pointer), source_chunk, 64)?;
-                    let next = self.builder.ins().iadd_imm_u(index, 1);
-                    self.builder
-                        .ins()
-                        .jump(loop_block, &[BlockArg::Value(next)]);
-                    self.builder.seal_block(loop_block);
-                    self.builder.switch_to_block(done_block);
-                    self.builder.seal_block(done_block);
-                }
-            }
-        }
-        if remainder > 0 {
-            let offset = chunk_count * 64;
-            let source_pointer = self.pointer_offset(source, offset);
-            let source_chunk = self.load_bits(source_pointer, remainder)?;
-            let destination_pointer = self.pointer_offset(destination, offset);
-            self.store_bits(destination_pointer, source_chunk, remainder)?;
-        }
-        Ok(())
-    }
-
-    fn mask(&mut self, word: CraneliftValue, width: usize) -> CraneliftValue {
-        if width >= 64 {
-            word
-        } else {
-            self.builder.ins().band_imm_u(word, mask_immediate(width))
+            _ => Err("a branch arm has the wrong shape".to_string()),
         }
     }
 
-    fn slot_pointer(&mut self, slot: StackSlot) -> BitPointer {
-        BitPointer::Byte {
-            address: self.builder.ins().stack_addr(self.pointer_type, slot, 0),
-            bit: 0,
-        }
-    }
-
-    fn pointer_offset(&mut self, pointer: BitPointer, bits: usize) -> BitPointer {
-        match pointer {
-            BitPointer::Byte { address, bit } => {
-                let total = usize::from(bit) + bits;
-                BitPointer::Byte {
-                    address: if total / 8 == 0 {
-                        address
-                    } else {
-                        self.builder.ins().iadd_imm_u(address, (total / 8) as i64)
-                    },
-                    bit: (total % 8) as u8,
-                }
-            }
-            BitPointer::Bit(value) => BitPointer::Bit(if bits == 0 {
-                value
-            } else {
-                self.builder.ins().iadd_imm_u(value, bits as i64)
-            }),
-        }
-    }
-
-    fn pointer_as_bit(&mut self, pointer: BitPointer) -> CraneliftValue {
-        match pointer {
-            BitPointer::Byte { address, bit } => {
-                let shifted = self.builder.ins().ishl_imm_u(address, 3);
-                if bit == 0 {
-                    shifted
-                } else {
-                    self.builder.ins().iadd_imm_u(shifted, i64::from(bit))
-                }
-            }
-            BitPointer::Bit(value) => value,
-        }
-    }
-
-    fn store_word(&mut self, slot: StackSlot, word: CraneliftValue) {
-        let address = self.builder.ins().stack_addr(self.pointer_type, slot, 0);
-        self.builder.ins().store(memory_flags(), word, address, 0);
-    }
-
-    fn load_word(&mut self, slot: StackSlot) -> CraneliftValue {
-        let address = self.builder.ins().stack_addr(self.pointer_type, slot, 0);
-        self.builder
-            .ins()
-            .load(types::I64, memory_flags(), address, 0)
-    }
-
-    fn allocate_stack_slot(&mut self, size: usize) -> Result<StackSlot, CodegenError> {
-        create_stack_slot(self.builder, size)
-    }
-
-    fn allocate_value_slot(&mut self, width: usize) -> Result<StackSlot, CodegenError> {
-        self.allocate_stack_slot(byte_size(width) + STACK_SLOT_SLACK)
-    }
-
-    fn storage(&self, slot: Slot) -> Result<StackSlot, CodegenError> {
-        self.slots
-            .get(slot.index())
-            .copied()
-            .ok_or_else(|| CodegenError::new("a slot is out of range"))
-    }
-
-    fn slot_type(&self, slot: Slot) -> Result<&'program Type, CodegenError> {
-        let function = self.function;
-        function
-            .slots()
-            .get(slot.index())
-            .ok_or_else(|| CodegenError::new("a slot is out of range"))
-    }
-
-    fn storage_type(&self, slot: Slot) -> Result<Type, CodegenError> {
-        match self.slot_type(slot)? {
-            Type::Reference(inner) => Ok((**inner).clone()),
-            other => Ok(other.clone()),
-        }
-    }
-
-    fn type_of(&self, value: &Value) -> Result<Type, CodegenError> {
+    fn type_of(&self, value: &Value) -> Result<Type, String> {
         match value {
             Value::Constant(bits) => Ok(flat_type(bits.width())),
             Value::Nand(left, _) => self.type_of(left),
             Value::Intrinsic(intrinsic, arguments) => {
                 if *intrinsic == Intrinsic::DivMod {
-                    let operand = match arguments.first() {
-                        Some(argument) => self.type_of(argument)?,
-                        None => return Err(CodegenError::new("an intrinsic has no arguments")),
-                    };
+                    let operand = arguments
+                        .first()
+                        .ok_or_else(|| "an intrinsic has no arguments".to_string())?;
+                    let operand = self.type_of(operand)?;
                     return Ok(Type::Collection(vec![operand.clone(), operand]));
                 }
                 if intrinsic.is_comparison() {
                     return Ok(Type::Bit);
                 }
-                match arguments.first() {
-                    Some(argument) => self.type_of(argument),
-                    None => Err(CodegenError::new("an intrinsic has no arguments")),
-                }
+                let argument = arguments
+                    .first()
+                    .ok_or_else(|| "an intrinsic has no arguments".to_string())?;
+                self.type_of(argument)
             }
             Value::Collection(elements) => {
                 let mut types = Vec::new();
@@ -2270,21 +1032,33 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
                 Ok(Type::Collection(types))
             }
             Value::Element { collection, index } => {
-                let operand_type = self.type_of(collection)?;
-                Ok(element_at(&operand_type, *index)?.1)
+                let collection_type = self.type_of(collection)?;
+                Ok(element_at(&collection_type, *index)?.1)
             }
             Value::Reference { slot, bit_offset } => {
                 let storage = self.storage_type(*slot)?;
-                Ok(Type::Reference(Box::new(
-                    self.type_at_bit_offset(&storage, *bit_offset)?,
-                )))
+                Ok(Type::Reference(Box::new(type_at_bit_offset(
+                    &storage,
+                    *bit_offset,
+                )?)))
             }
-            Value::Load(reference) => self.accessed_type(reference),
-            Value::Call(label, _) => Ok(self.callee(label.text())?.result().clone()),
+            Value::Load(reference) => match self.type_of(reference)? {
+                Type::Reference(inner) => Ok(*inner),
+                _ => Err("a load needs a reference".to_string()),
+            },
+            Value::Call(label, _) => {
+                let callee = self
+                    .program
+                    .functions()
+                    .iter()
+                    .find(|function| function.label().text() == label.text())
+                    .ok_or_else(|| format!("a callee is not defined: {}", label.text()))?;
+                Ok(callee.result().clone())
+            }
             Value::Extern(operation, _) => {
-                let specification = lookup_operation(operation.code())
-                    .ok_or_else(|| CodegenError::new("an operation is unknown"))?;
-                Ok(extern_result_type(specification))
+                let specification = lapc_extern::lookup(operation.code())
+                    .ok_or_else(|| "an operation is unknown".to_string())?;
+                Ok(lapc_ir::extern_result_type(specification))
             }
             Value::Branch(_, then, otherwise) => {
                 if let Some(result) = then.result() {
@@ -2298,188 +1072,41 @@ impl<'builder, 'function, 'program, M: Module> Lowering<'builder, 'function, 'pr
         }
     }
 
-    fn accessed_type(&self, reference: &Value) -> Result<Type, CodegenError> {
-        match self.type_of(reference)? {
-            Type::Reference(inner) => Ok(*inner),
-            _ => Err(CodegenError::new("a load needs a reference")),
+    fn storage_type(&self, slot: Slot) -> Result<Type, String> {
+        match &self.function.slots()[slot.index()] {
+            Type::Reference(inner) => Ok((**inner).clone()),
+            other => Ok(other.clone()),
         }
     }
+}
 
-    fn type_at_bit_offset(&self, type_: &Type, offset: usize) -> Result<Type, CodegenError> {
-        if offset == 0 {
-            return Ok(type_.clone());
-        }
-        match type_ {
-            Type::Collection(elements) => {
-                let mut remaining = offset;
-                for element in elements {
-                    let width = element.width();
-                    if remaining < width {
-                        return self.type_at_bit_offset(element, remaining);
-                    }
-                    remaining -= width;
+fn type_at_bit_offset(type_: &Type, offset: usize) -> Result<Type, String> {
+    if offset == 0 {
+        return Ok(type_.clone());
+    }
+    match type_ {
+        Type::Collection(elements) => {
+            let mut remaining = offset;
+            for element in elements {
+                let width = element.width();
+                if remaining < width {
+                    return type_at_bit_offset(element, remaining);
                 }
-                Err(CodegenError::new("a bit offset is out of range"))
+                remaining -= width;
             }
-            _ => Err(CodegenError::new("a bit offset is out of range")),
+            Err("a bit offset is out of range".to_string())
         }
-    }
-
-    fn callee(&self, label: &str) -> Result<&'program Function, CodegenError> {
-        self.symbols
-            .functions
-            .get(label)
-            .map(|symbol| symbol.function)
-            .ok_or_else(|| CodegenError::new("a callee is not defined"))
+        _ => Err("a bit offset needs a collection".to_string()),
     }
 }
 
-fn substitute_parameters(value: &Value, bindings: &[InlineBinding]) -> Option<Value> {
-    match value {
-        Value::Constant(bits) => Some(Value::Constant(bits.clone())),
-        Value::Nand(left, right) => Some(Value::Nand(
-            Box::new(substitute_parameters(left, bindings)?),
-            Box::new(substitute_parameters(right, bindings)?),
-        )),
-        Value::Intrinsic(intrinsic, arguments) => Some(Value::Intrinsic(
-            *intrinsic,
-            substitute_arguments(arguments, bindings)?,
-        )),
-        Value::Collection(elements) => {
-            Some(Value::Collection(substitute_arguments(elements, bindings)?))
-        }
-        Value::Element { collection, index } => Some(Value::Element {
-            collection: Box::new(substitute_parameters(collection, bindings)?),
-            index: *index,
-        }),
-        Value::Reference { slot, bit_offset } => {
-            let binding = bindings.iter().find(|binding| binding.parameter == *slot)?;
-            if *bit_offset != 0 || !binding.parameter_type.is_reference() {
-                return None;
-            }
-            Some(binding.argument.clone())
-        }
-        Value::Load(reference) => {
-            if let Value::Reference { slot, bit_offset } = reference.as_ref() {
-                if let Some(binding) = bindings.iter().find(|binding| binding.parameter == *slot) {
-                    if *bit_offset != 0 {
-                        return None;
-                    }
-                    if binding.parameter_type.is_reference() {
-                        return Some(Value::Load(Box::new(binding.argument.clone())));
-                    }
-                    return Some(binding.argument.clone());
-                }
-            }
-            Some(Value::Load(Box::new(substitute_parameters(
-                reference, bindings,
-            )?)))
-        }
-        Value::Call(label, arguments) => Some(Value::Call(
-            label.clone(),
-            substitute_arguments(arguments, bindings)?,
-        )),
-        Value::Extern(operation, arguments) => Some(Value::Extern(
-            *operation,
-            substitute_arguments(arguments, bindings)?,
-        )),
-        Value::Branch(condition, then, otherwise) => Some(Value::Branch(
-            Box::new(substitute_parameters(condition, bindings)?),
-            substitute_block(then, bindings)?,
-            substitute_block(otherwise, bindings)?,
-        )),
-    }
-}
-
-fn substitute_arguments(arguments: &[Value], bindings: &[InlineBinding]) -> Option<Vec<Value>> {
-    arguments
-        .iter()
-        .map(|argument| substitute_parameters(argument, bindings))
-        .collect()
-}
-
-fn substitute_block(block: &Block, bindings: &[InlineBinding]) -> Option<Block> {
-    if !block.statements().is_empty() {
-        return None;
-    }
-    let result = match block.result() {
-        Some(result) => Some(Box::new(substitute_parameters(result, bindings)?)),
-        None => None,
-    };
-    Some(Block::new(Vec::new(), result))
-}
-
-fn value_is_inline_safe(value: &Value) -> bool {
-    match value {
-        Value::Constant(_) | Value::Reference { .. } => true,
-        Value::Nand(left, right) => value_is_inline_safe(left) && value_is_inline_safe(right),
-        Value::Intrinsic(_, arguments)
-        | Value::Call(_, arguments)
-        | Value::Extern(_, arguments) => arguments.iter().all(value_is_inline_safe),
-        Value::Collection(elements) => elements.iter().all(value_is_inline_safe),
-        Value::Element { collection, .. } => value_is_inline_safe(collection),
-        Value::Load(reference) => value_is_inline_safe(reference),
-        Value::Branch(condition, then, otherwise) => {
-            value_is_inline_safe(condition)
-                && block_is_inline_safe(then)
-                && block_is_inline_safe(otherwise)
-        }
-    }
-}
-
-fn block_is_inline_safe(block: &Block) -> bool {
-    block.statements().is_empty()
-        && block
-            .result()
-            .map_or(true, |result| value_is_inline_safe(result))
-}
-
-fn value_is_pure(value: &Value) -> bool {
-    match value {
-        Value::Constant(_) | Value::Reference { .. } => true,
-        Value::Nand(left, right) => value_is_pure(left) && value_is_pure(right),
-        Value::Intrinsic(_, arguments) => arguments.iter().all(value_is_pure),
-        Value::Collection(elements) => elements.iter().all(value_is_pure),
-        Value::Element { collection, .. } => value_is_pure(collection),
-        Value::Load(reference) => value_is_pure(reference),
-        Value::Branch(condition, then, otherwise) => {
-            value_is_pure(condition) && block_is_pure(then) && block_is_pure(otherwise)
-        }
-        Value::Call(_, _) | Value::Extern(_, _) => false,
-    }
-}
-
-fn block_is_pure(block: &Block) -> bool {
-    block.statements().is_empty() && block.result().map_or(true, |result| value_is_pure(result))
-}
-
-fn value_size(value: &Value) -> usize {
-    match value {
-        Value::Constant(_) | Value::Reference { .. } => 1,
-        Value::Nand(left, right) => 1 + value_size(left) + value_size(right),
-        Value::Intrinsic(_, arguments)
-        | Value::Call(_, arguments)
-        | Value::Extern(_, arguments) => 1 + arguments.iter().map(value_size).sum::<usize>(),
-        Value::Collection(elements) => 1 + elements.iter().map(value_size).sum::<usize>(),
-        Value::Element { collection, .. } => 1 + value_size(collection),
-        Value::Load(reference) => 1 + value_size(reference),
-        Value::Branch(condition, then, otherwise) => {
-            1 + value_size(condition) + block_size(then) + block_size(otherwise)
-        }
-    }
-}
-
-fn block_size(block: &Block) -> usize {
-    block.statements().len() + block.result().map_or(0, value_size)
-}
-
-fn element_at(type_: &Type, index: usize) -> Result<(usize, Type), CodegenError> {
+fn element_at(type_: &Type, index: usize) -> Result<(usize, Type), String> {
     let elements = type_
         .elements()
-        .ok_or_else(|| CodegenError::new("an element needs a collection"))?;
+        .ok_or_else(|| "an element needs a collection".to_string())?;
     let element = elements
         .get(index)
-        .ok_or_else(|| CodegenError::new("an element is out of range"))?;
+        .ok_or_else(|| "an element is out of range".to_string())?;
     let offset = elements.iter().take(index).map(Type::width).sum();
     Ok((offset, element.clone()))
 }
@@ -2492,152 +1119,192 @@ fn flat_type(width: usize) -> Type {
     }
 }
 
-fn byte_size(width: usize) -> usize {
-    width.div_ceil(8)
+fn words(width: usize) -> usize {
+    width.div_ceil(64) + 1
 }
 
-fn create_stack_slot(
-    builder: &mut FunctionBuilder,
-    size: usize,
-) -> Result<StackSlot, CodegenError> {
-    let size = u32::try_from(size).map_err(|_| CodegenError::new("a value is too large"))?;
-    Ok(builder.create_sized_stack_slot(StackSlotData::new(
-        StackSlotKind::ExplicitSlot,
-        size,
-        STACK_SLOT_ALIGNMENT_SHIFT,
-    )))
-}
-
-fn mask_immediate(width: usize) -> i64 {
-    if width >= 64 {
-        -1
-    } else {
-        ((1u64 << width) - 1) as i64
-    }
-}
-
-fn magic_division(divisor: u64) -> Option<(u64, u32)> {
-    if divisor <= 1 || divisor.is_power_of_two() {
-        return None;
-    }
-    let shift = divisor.ilog2();
-    let power = 1u128 << (64 + shift);
-    let divisor = u128::from(divisor);
-    let error = (divisor - power % divisor) % divisor;
-    if error > 1u128 << shift {
-        return None;
-    }
-    Some(((power / divisor + 1) as u64, shift))
-}
-
-const MAXIMUM_MULTIPLY_TERMS: usize = 4;
-
-enum MultiplyTerm {
-    Add(u32),
-    Subtract(u32),
-}
-
-struct MultiplyPlan {
-    terms: Vec<MultiplyTerm>,
-    shift: u32,
-}
-
-fn constant_operand(
-    arguments: &[Value],
-    left: CraneliftValue,
-    right: CraneliftValue,
-) -> Option<(u64, CraneliftValue)> {
-    match (&arguments[0], &arguments[1]) {
-        (Value::Constant(bits), _) => {
-            Some((bits_to_word(bits.bits(), 0, bits.width()) as u64, right))
-        }
-        (_, Value::Constant(bits)) => {
-            Some((bits_to_word(bits.bits(), 0, bits.width()) as u64, left))
-        }
-        _ => None,
-    }
-}
-
-fn multiply_plan(constant: u64) -> Option<MultiplyPlan> {
-    if constant == 0 {
-        return None;
-    }
-    let shift = constant.trailing_zeros();
-    let odd = constant >> shift;
-    let mut terms = Vec::new();
-    if odd == 1 {
-        terms.push(MultiplyTerm::Add(0));
-    } else {
-        let mut position = 0u32;
-        while position < 64 {
-            let zeros = (odd >> position).trailing_zeros();
-            position += zeros;
-            if position >= 64 {
-                break;
-            }
-            let ones = (odd >> position).trailing_ones();
-            let high = position + ones;
-            if ones == 1 {
-                terms.push(MultiplyTerm::Add(position));
-            } else {
-                if high < 64 {
-                    terms.push(MultiplyTerm::Add(high));
-                }
-                terms.push(MultiplyTerm::Subtract(position));
-            }
-            position = high;
-        }
-        if terms.len() > MAXIMUM_MULTIPLY_TERMS {
-            return None;
-        }
-    }
-    Some(MultiplyPlan { terms, shift })
-}
-
-fn bits_to_word(bits: &[bool], offset: usize, width: usize) -> i64 {
+fn bits_to_word(bits: &[bool], width: usize) -> u64 {
     let mut word = 0u64;
-    for index in 0..width {
-        if bits[offset + index] {
+    for (index, bit) in bits.iter().take(width).enumerate() {
+        if *bit {
             word |= 1u64 << index;
         }
     }
-    word as i64
-}
-
-fn extern_result_type(specification: &OperationSpecification) -> Type {
-    let mut elements = vec![Type::Bit];
-    for width in specification.payload_widths() {
-        elements.push(flat_type(*width));
-    }
-    Type::Collection(elements)
-}
-
-fn export_name(label: &str) -> String {
-    if label == "main" {
-        "lap_main".to_string()
-    } else {
-        label.to_string()
-    }
-}
-
-fn function_linkage(label: &str) -> Linkage {
-    if label == "main" {
-        Linkage::Export
-    } else {
-        Linkage::Local
-    }
-}
-
-fn memory_flags() -> MemFlagsData {
-    MemFlagsData::new().with_endianness(Endianness::Little)
+    word
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use cranelift_jit::{JITBuilder, JITModule};
+    use super::{Compiler, bits_to_word, c_name, emit_c, find_compiler, flat_type};
+
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use lapc_ast::Label;
-    use lapc_ir::Parameter;
+    use lapc_ir::{BitVector, Block, Function, Parameter, Program, Slot, Statement, Type, Value};
+
+    const RUNTIME_SOURCE: &str = include_str!("../../../runtime/lap_runtime.c");
+
+    fn compiler() -> Option<&'static Compiler> {
+        static COMPILER: OnceLock<Option<Compiler>> = OnceLock::new();
+        COMPILER.get_or_init(|| find_compiler().ok()).as_ref()
+    }
+
+    static NUMBER: AtomicUsize = AtomicUsize::new(0);
+
+    fn temporary_directory(name: &str) -> PathBuf {
+        let number = NUMBER.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "lapc-codegen-{}-{number}-{name}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("the test directory is created");
+        directory
+    }
+
+    enum Argument {
+        Word(u64),
+        Wide(Vec<u64>),
+        Reference { storage: Vec<u64>, bit: u64 },
+    }
+
+    fn word_list(words: &[u64]) -> String {
+        words
+            .iter()
+            .map(|word| format!("0x{word:x}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn driver_source(function: &Function, label: &str, arguments: &[Argument]) -> String {
+        let mut source = String::from(
+            "\n#include <stdio.h>\n#include <stdbool.h>\n#include <stdint.h>\n\
+         extern bool lap_runtime_start(int, char **);\n\
+         extern void lap_runtime_finish(void);\n",
+        );
+        let mut words = Vec::new();
+        for (index, argument) in arguments.iter().enumerate() {
+            let name = format!("a{index}");
+            let type_ = &function.slots()[function.parameters()[index].slot().index()];
+            match argument {
+                Argument::Word(word) => {
+                    assert!(
+                        !type_.is_reference() && type_.width() <= 64,
+                        "a word argument"
+                    );
+                    words.push(word.to_string());
+                }
+                Argument::Wide(values) => {
+                    assert!(
+                        !type_.is_reference() && type_.width() > 64,
+                        "a wide argument"
+                    );
+                    source.push_str(&format!(
+                        "static const uint64_t {name}[] = {{{}}};\n",
+                        word_list(values)
+                    ));
+                    words.push(name);
+                }
+                Argument::Reference { storage, bit } => {
+                    assert!(type_.is_reference(), "a reference argument");
+                    source.push_str(&format!(
+                        "static uint64_t {name}[] = {{{}}};\n",
+                        word_list(storage)
+                    ));
+                    words.push(name);
+                    words.push(bit.to_string());
+                }
+            }
+        }
+        let wide = function.result().width() > 64;
+        if wide {
+            source.push_str(&format!(
+                "static uint64_t out[{}] = {{0}};\n",
+                function.result().width().div_ceil(64)
+            ));
+            words.insert(0, String::from("out"));
+        }
+        source.push_str("int main(void) {\n  lap_runtime_start(0, 0);\n");
+        let call = format!("{}({})", c_name(label), words.join(", "));
+        if wide {
+            source.push_str(&format!("  {call};\n"));
+            source.push_str(&format!(
+                "  fwrite(out, 1, {}, stdout);\n",
+                function.result().width().div_ceil(8)
+            ));
+        } else {
+            source.push_str(&format!("  uint64_t result = {call};\n"));
+            source.push_str("  fwrite(&result, 1, 8, stdout);\n");
+        }
+        source.push_str("  lap_runtime_finish();\n  return 0;\n}\n");
+        source
+    }
+
+    fn run(program: &Program, label: &str, arguments: &[Argument]) -> Option<Vec<u8>> {
+        let compiler = compiler()?;
+        let function = program
+            .functions()
+            .iter()
+            .find(|function| function.label().text() == label)
+            .expect("the callee is defined");
+        let mut source = emit_c(program).expect("the program emits");
+        source.push_str(&driver_source(function, label, arguments));
+        let directory = temporary_directory(label);
+        let program_path = directory.join("program.c");
+        let runtime_path = directory.join("lap_runtime.c");
+        let binary = directory.join(format!("program{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&program_path, source).expect("the program is written");
+        fs::write(&runtime_path, RUNTIME_SOURCE).expect("the runtime is written");
+        let output = compiler
+            .command()
+            .arg("-std=c17")
+            .arg("-O2")
+            .arg("-o")
+            .arg(&binary)
+            .arg(&program_path)
+            .arg(&runtime_path)
+            .stdout(Stdio::null())
+            .output()
+            .expect("the C compiler runs");
+        assert!(
+            output.status.success(),
+            "the generated C compiles: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new(&binary).output().expect("the program runs");
+        assert!(
+            output.status.success(),
+            "the program exits successfully: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = fs::remove_dir_all(&directory);
+        Some(output.stdout)
+    }
+
+    fn run_word(program: &Program, label: &str) -> Option<u64> {
+        let bytes = run(program, label, &[])?;
+        Some(u64::from_le_bytes(
+            bytes[..8].try_into().expect("eight bytes"),
+        ))
+    }
+
+    fn run_word_call(program: &Program, label: &str, arguments: &[Argument]) -> Option<u64> {
+        let bytes = run(program, label, arguments)?;
+        Some(u64::from_le_bytes(
+            bytes[..8].try_into().expect("eight bytes"),
+        ))
+    }
+
+    fn run_wide(program: &Program, label: &str) -> Option<Vec<u8>> {
+        run(program, label, &[])
+    }
+
+    fn run_wide_call(program: &Program, label: &str, arguments: &[Argument]) -> Option<Vec<u8>> {
+        run(program, label, arguments)
+    }
 
     fn bit(value: bool) -> Value {
         Value::Constant(BitVector::new(vec![value]))
@@ -2665,93 +1332,9 @@ mod tests {
         Block::new(statements, None)
     }
 
-    fn constant_program(value: bool) -> Program {
-        Program::new(vec![function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![],
-            block(vec![], bit(value)),
-        )])
+    fn constant_function(label: &str, result: Type, value: Value) -> Function {
+        function(label, vec![], result, vec![], block(vec![], value))
     }
-
-    extern "C" fn test_extern0(out: *mut u64) {
-        report_extern(out);
-    }
-
-    extern "C" fn test_extern1(_argument0: u64, out: *mut u64) {
-        report_extern(out);
-    }
-
-    extern "C" fn test_extern2(_argument0: u64, _argument1: u64, out: *mut u64) {
-        report_extern(out);
-    }
-
-    extern "C" fn test_extern3(_argument0: u64, _argument1: u64, _argument2: u64, out: *mut u64) {
-        report_extern(out);
-    }
-
-    extern "C" fn test_extern4(
-        _argument0: u64,
-        _argument1: u64,
-        _argument2: u64,
-        _argument3: u64,
-        out: *mut u64,
-    ) {
-        report_extern(out);
-    }
-
-    fn report_extern(out: *mut u64) {
-        unsafe {
-            *out = 1;
-            *out.add(1) = 42;
-        }
-    }
-
-    fn test_extern(argument_count: usize) -> *const u8 {
-        match argument_count {
-            0 => test_extern0 as *const u8,
-            1 => test_extern1 as *const u8,
-            2 => test_extern2 as *const u8,
-            3 => test_extern3 as *const u8,
-            _ => test_extern4 as *const u8,
-        }
-    }
-
-    fn compile_for_execution(program: &Program) -> (JITModule, HashMap<String, FuncId>) {
-        let mut builder = JITBuilder::new(default_libcall_names()).expect("the host is supported");
-        for specification in lapc_extern::OPERATIONS {
-            let symbol = operation_symbol(specification);
-            builder.symbol(
-                symbol.as_str(),
-                test_extern(specification.argument_widths().len()),
-            );
-        }
-        let mut module = JITModule::new(builder);
-        let identifiers = lower_program(&mut module, program).expect("the program lowers");
-        module
-            .finalize_definitions()
-            .expect("the functions finalize");
-        (module, identifiers)
-    }
-
-    fn entry(module: &JITModule, identifiers: &HashMap<String, FuncId>, label: &str) -> *const u8 {
-        module.get_finalized_function(identifiers[label])
-    }
-
-    fn run_word(program: &Program, label: &str) -> i64 {
-        let (module, identifiers) = compile_for_execution(program);
-        let function: extern "C" fn() -> i64 =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, label)) };
-        function()
-    }
-
-    fn compile_source(source: &str) -> Program {
-        let program = lapc_parse::parse_program(source).expect("the source parses");
-        lapc_check::check_program(&program).expect("the program checks")
-    }
-
-    const WIDE_BUFFER_BYTES: usize = 256;
 
     fn pattern_bits(width: usize, seed: usize) -> Vec<bool> {
         (0..width).map(|index| (index * 7 + seed) % 5 < 2).collect()
@@ -2767,101 +1350,32 @@ mod tests {
         bytes
     }
 
-    fn wide_input(values: &[bool]) -> Vec<u8> {
-        let mut bytes = packed_bytes(values);
-        bytes.resize(bytes.len() + 8, 0);
-        bytes
+    fn compile_source(source: &str) -> Program {
+        let program = lapc_parse::parse_program(source).expect("the source parses");
+        let program = lapc_check::check_program(&program).expect("the program checks");
+        lapc_erase::erase_intrinsics(program)
     }
 
-    fn run_wide(program: &Program, label: &str) -> Vec<u8> {
-        let (module, identifiers) = compile_for_execution(program);
-        let function: extern "C" fn(*mut u8) =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, label)) };
-        let mut buffer = [0u8; WIDE_BUFFER_BYTES];
-        function(buffer.as_mut_ptr());
-        buffer.to_vec()
-    }
-
-    fn run_wide_one(program: &Program, label: &str, argument: &[u8]) -> Vec<u8> {
-        let (module, identifiers) = compile_for_execution(program);
-        let function: extern "C" fn(*mut u8, *const u8) =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, label)) };
-        let mut buffer = [0u8; WIDE_BUFFER_BYTES];
-        function(buffer.as_mut_ptr(), argument.as_ptr());
-        buffer.to_vec()
-    }
-
-    fn run_wide_two(program: &Program, label: &str, first: &[u8], second: &[u8]) -> Vec<u8> {
-        let (module, identifiers) = compile_for_execution(program);
-        let function: extern "C" fn(*mut u8, *const u8, *const u8) =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, label)) };
-        let mut buffer = [0u8; WIDE_BUFFER_BYTES];
-        function(buffer.as_mut_ptr(), first.as_ptr(), second.as_ptr());
-        buffer.to_vec()
-    }
-
-    fn nand_word(left: u128, right: u128, width: usize) -> u128 {
-        !(left & right) & mask_wide(width)
-    }
-
-    fn expected_intrinsic(intrinsic: Intrinsic, arguments: &[Vec<bool>]) -> Vec<bool> {
-        let left = arguments[0].as_slice();
-        let right = arguments.get(1).map(Vec::as_slice).unwrap_or(&[]);
-        match intrinsic {
-            Intrinsic::Not => left.iter().map(|value| !value).collect(),
-            Intrinsic::And => left
-                .iter()
-                .zip(right)
-                .map(|(left, right)| left & right)
-                .collect(),
-            Intrinsic::Or => left
-                .iter()
-                .zip(right)
-                .map(|(left, right)| left | right)
-                .collect(),
-            Intrinsic::Xor => left
-                .iter()
-                .zip(right)
-                .map(|(left, right)| left ^ right)
-                .collect(),
-            Intrinsic::Add => add_values(left, right),
-            Intrinsic::Sub => sub_values(left, right),
-            Intrinsic::Mul => mul_values(left, right),
-            Intrinsic::Inc => add_values(left, &bits_of_value(1, left.len())),
-            Intrinsic::Dec => sub_values(left, &bits_of_value(1, left.len())),
-            Intrinsic::ShiftLeftOne => shift_left(left, 1),
-            Intrinsic::ShiftRightOne => shift_right(left, 1),
-            Intrinsic::Eq => vec![left == right],
-            Intrinsic::Lt => vec![unsigned_less_than(left, right)],
-            Intrinsic::IsZero => vec![left.iter().all(|bit| !bit)],
-            Intrinsic::Select => {
-                let when_one = arguments[1].as_slice();
-                let when_zero = arguments[2].as_slice();
-                left.iter()
-                    .zip(when_one)
-                    .zip(when_zero)
-                    .map(|((flag, one), zero)| if *flag { *one } else { *zero })
-                    .collect()
-            }
-            Intrinsic::DivMod => {
-                let divisor = value_of(right);
-                let (quotient, remainder) = if divisor == 0 {
-                    (0, 0)
-                } else {
-                    (value_of(left) / divisor, value_of(left) % divisor)
-                };
-                let mut result = bits_of_value(quotient, left.len());
-                result.extend(bits_of_value(remainder, left.len()));
-                result
-            }
+    fn mask_wide(width: usize) -> u128 {
+        if width >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << width) - 1
         }
     }
 
-    fn expected_nand(left: &[bool], right: &[bool]) -> Vec<bool> {
-        left.iter()
-            .zip(right)
-            .map(|(left, right)| !(left & right))
-            .collect()
+    fn value_of(values: &[bool]) -> u128 {
+        let mut value = 0u128;
+        for (index, bit) in values.iter().enumerate() {
+            if *bit {
+                value |= 1u128 << index;
+            }
+        }
+        value
+    }
+
+    fn bits_of_value(value: u128, width: usize) -> Vec<bool> {
+        (0..width).map(|index| (value >> index) & 1 == 1).collect()
     }
 
     fn add_values(left: &[bool], right: &[bool]) -> Vec<bool> {
@@ -2917,458 +1431,312 @@ mod tests {
         false
     }
 
-    fn mask_wide(width: usize) -> u128 {
-        if width >= 128 {
-            u128::MAX
-        } else {
-            (1u128 << width) - 1
-        }
-    }
-
-    fn value_of(values: &[bool]) -> u128 {
-        let mut value = 0u128;
-        for (index, bit) in values.iter().enumerate() {
-            if *bit {
-                value |= 1u128 << index;
+    fn expected_intrinsic(intrinsic: lapc_ir::Intrinsic, arguments: &[Vec<bool>]) -> Vec<bool> {
+        let left = arguments[0].as_slice();
+        let right = arguments.get(1).map(Vec::as_slice).unwrap_or(&[]);
+        match intrinsic {
+            lapc_ir::Intrinsic::Not => left.iter().map(|value| !value).collect(),
+            lapc_ir::Intrinsic::And => left
+                .iter()
+                .zip(right)
+                .map(|(left, right)| left & right)
+                .collect(),
+            lapc_ir::Intrinsic::Or => left
+                .iter()
+                .zip(right)
+                .map(|(left, right)| left | right)
+                .collect(),
+            lapc_ir::Intrinsic::Xor => left
+                .iter()
+                .zip(right)
+                .map(|(left, right)| left ^ right)
+                .collect(),
+            lapc_ir::Intrinsic::Add => add_values(left, right),
+            lapc_ir::Intrinsic::Sub => sub_values(left, right),
+            lapc_ir::Intrinsic::Mul => mul_values(left, right),
+            lapc_ir::Intrinsic::Inc => add_values(left, &bits_of_value(1, left.len())),
+            lapc_ir::Intrinsic::Dec => sub_values(left, &bits_of_value(1, left.len())),
+            lapc_ir::Intrinsic::ShiftLeftOne => shift_left(left, 1),
+            lapc_ir::Intrinsic::ShiftRightOne => shift_right(left, 1),
+            lapc_ir::Intrinsic::Eq => vec![left == right],
+            lapc_ir::Intrinsic::Lt => vec![unsigned_less_than(left, right)],
+            lapc_ir::Intrinsic::IsZero => vec![left.iter().all(|bit| !bit)],
+            lapc_ir::Intrinsic::Select => {
+                let when_one = arguments[1].as_slice();
+                let when_zero = arguments[2].as_slice();
+                left.iter()
+                    .zip(when_one)
+                    .zip(when_zero)
+                    .map(|((flag, one), zero)| if *flag { *one } else { *zero })
+                    .collect()
+            }
+            lapc_ir::Intrinsic::DivMod => {
+                let divisor = value_of(right);
+                let (quotient, remainder) = if divisor == 0 {
+                    (0, 0)
+                } else {
+                    (value_of(left) / divisor, value_of(left) % divisor)
+                };
+                let mut result = bits_of_value(quotient, left.len());
+                result.extend(bits_of_value(remainder, left.len()));
+                result
             }
         }
-        value
     }
 
-    fn bits_of_value(value: u128, width: usize) -> Vec<bool> {
-        (0..width).map(|index| (value >> index) & 1 == 1).collect()
-    }
-
-    fn constant_function(label: &str, result: Type, value: Value) -> Function {
-        function(label, vec![], result, vec![], block(vec![], value))
-    }
-
-    fn assert_wide_result(program: &Program, label: &str, values: &[bool]) {
-        let expected = packed_bytes(values);
-        let wide = run_wide(program, label);
-        assert_eq!(&wide[..expected.len()], &expected[..], "for {label}");
-    }
-
-    #[test]
-    fn jit_runs_an_element_of_mixed_widths() {
-        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nmain = () BIT { both: [[BIT, BIT], BIT] = [[BIT.ZERO, BIT.ONE], BIT.ZERO]\n [pair, flag] = both\n flag }\n";
-        let program = compile_source(source);
-        assert_eq!(run_word(&program, "main"), 0);
-    }
-
-    #[test]
-    fn emit_object_returns_bytes() {
-        let program = constant_program(true);
-        let object = emit_object(&program).expect("the object emits");
-        assert!(!object.is_empty());
-    }
-
-    #[test]
-    fn jit_runs_a_constant() {
-        let program = constant_program(true);
-        let (module, identifiers) = compile_for_execution(&program);
-        let main: extern "C" fn() -> i64 =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, "main")) };
-        assert_eq!(main(), 1);
-    }
-
-    #[test]
-    fn jit_runs_nand() {
-        let value = Value::Nand(Box::new(bit(true)), Box::new(bit(false)));
-        let program = Program::new(vec![function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![],
-            block(vec![], value),
-        )]);
-        let (module, identifiers) = compile_for_execution(&program);
-        let main: extern "C" fn() -> i64 =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, "main")) };
-        assert_eq!(main(), 1);
-    }
-
-    #[test]
-    fn jit_runs_nand_of_zeros() {
-        let value = Value::Nand(Box::new(bit(false)), Box::new(bit(false)));
-        let program = Program::new(vec![function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![],
-            block(vec![], value),
-        )]);
-        let (module, identifiers) = compile_for_execution(&program);
-        let main: extern "C" fn() -> i64 =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, "main")) };
-        assert_eq!(main(), 1);
-    }
-
-    fn entry_source() -> String {
-        let mut source = String::from("unsafe extern \"C\" { fn lap_main() -> u64; }\n");
-        for specification in lapc_extern::OPERATIONS {
-            let symbol = operation_symbol(specification);
-            let arguments: Vec<String> = (0..specification.argument_widths().len())
-                .map(|index| format!("_argument{index}: u64"))
-                .chain(std::iter::once(String::from("out: *mut u64")))
-                .collect();
-            source.push_str(&format!(
-                "#[unsafe(export_name = \"{symbol}\")]\npub extern \"C\" fn stub_{symbol}({}) {{\n    unsafe {{ *out = 1; *out.add(1) = 42; }}\n}}\n",
-                arguments.join(", "),
-            ));
-        }
-        source.push_str("fn main() { std::process::exit((unsafe { lap_main() } & 1) as i32); }\n");
-        source
-    }
-
-    fn link_and_run(name: &str, object: &[u8], entry: &str) -> i32 {
-        let directory =
-            std::env::temp_dir().join(format!("lapc-codegen-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).expect("the directory is created");
-        let object_path = directory.join("program.o");
-        let entry_path = directory.join("entry.rs");
-        let binary = directory.join(format!("program{}", std::env::consts::EXE_SUFFIX));
-        std::fs::write(&object_path, object).expect("the object is written");
-        std::fs::write(&entry_path, entry).expect("the entry is written");
-        let mut command = std::process::Command::new("rustc");
-        command
-            .arg("--edition=2024")
-            .arg("-o")
-            .arg(&binary)
-            .arg(&entry_path);
-        if cfg!(target_os = "linux") {
-            command.arg("-C").arg("relocation-model=static");
-        }
-        let status = command
-            .arg("-C")
-            .arg(format!("link-arg={}", object_path.display()))
-            .status()
-            .expect("the compiler runs");
-        assert!(status.success(), "the object links");
-        std::process::Command::new(&binary)
-            .status()
-            .expect("the program runs")
-            .code()
-            .expect("the program exits with a status")
-    }
-
-    fn run_object(program: &Program, name: &str) -> i32 {
-        let object = emit_object(program).expect("the object emits");
-        link_and_run(name, &object, &entry_source())
-    }
-
-    #[test]
-    fn the_emitted_object_runs() {
-        let value = Value::Nand(Box::new(bit(false)), Box::new(bit(false)));
-        let program = Program::new(vec![function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![],
-            block(vec![], value),
-        )]);
-        assert_eq!(run_object(&program, "nand"), 1);
-    }
-
-    #[test]
-    fn the_emitted_object_runs_a_binding() {
-        let value = Value::Load(Box::new(Value::Reference {
-            slot: Slot::new(0),
-            bit_offset: 0,
-        }));
-        let program = Program::new(vec![function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![Type::Bit],
-            Block::new(
-                vec![Statement::Bind {
-                    slot: Slot::new(0),
-                    value: bit(true),
-                }],
-                Some(Box::new(value)),
-            ),
-        )]);
-        assert_eq!(run_object(&program, "binding"), 1);
-    }
-
-    #[test]
-    fn jit_runs_intrinsics() {
-        let result = Type::Collection(vec![Type::Bit; 8]);
-        let value = Value::Intrinsic(
-            Intrinsic::Add,
-            vec![
-                bits(&[true, false, false, false, false, false, false, false]),
-                bits(&[false, true, false, false, false, false, false, false]),
-            ],
-        );
-        let program = Program::new(vec![function(
-            "add",
-            vec![],
-            result,
-            vec![],
-            block(vec![], value),
-        )]);
-        let (module, identifiers) = compile_for_execution(&program);
-        let add: extern "C" fn() -> i64 =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, "add")) };
-        assert_eq!(add(), 3);
-    }
-
-    #[test]
-    fn jit_runs_collection_and_element() {
-        let collection = Value::Collection(vec![bit(true), bit(false), bit(true)]);
-        let value = Value::Element {
-            collection: Box::new(collection),
-            index: 2,
+    fn assert_word(program: &Program, label: &str, expected: u64) {
+        let Some(result) = run_word(program, label) else {
+            return;
         };
-        let program = Program::new(vec![function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![],
-            block(vec![], value),
+        assert_eq!(result, expected, "for {label}");
+    }
+
+    fn assert_wide(program: &Program, label: &str, values: &[bool]) {
+        let Some(result) = run_wide(program, label) else {
+            return;
+        };
+        assert_eq!(result, packed_bytes(values), "for {label}");
+    }
+
+    #[test]
+    fn runs_constants_at_every_width_boundary() {
+        for width in [0usize, 1, 2, 7, 8, 63, 64, 65, 127, 128, 129, 192, 1000] {
+            let values = pattern_bits(width, 1);
+            let program = Program::new(vec![constant_function(
+                "constant",
+                flat_type(width),
+                bits(&values),
+            )]);
+            if width <= 64 {
+                assert_word(&program, "constant", bits_to_word(&values, width));
+            } else {
+                assert_wide(&program, "constant", &values);
+            }
+        }
+    }
+
+    #[test]
+    fn runs_nand_at_every_width_boundary() {
+        for width in [0usize, 1, 2, 7, 8, 63, 64, 65, 127, 128, 129, 192, 1000] {
+            let left = pattern_bits(width, 1);
+            let right = pattern_bits(width, 3);
+            let expected: Vec<bool> = left
+                .iter()
+                .zip(&right)
+                .map(|(left, right)| !(left & right))
+                .collect();
+            let value = Value::Nand(Box::new(bits(&left)), Box::new(bits(&right)));
+            let program = Program::new(vec![constant_function("nand", flat_type(width), value)]);
+            if width <= 64 {
+                assert_word(&program, "nand", bits_to_word(&expected, width));
+            } else {
+                assert_wide(&program, "nand", &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn runs_every_intrinsic_at_every_width_boundary() {
+        let intrinsics = [
+            lapc_ir::Intrinsic::Not,
+            lapc_ir::Intrinsic::And,
+            lapc_ir::Intrinsic::Or,
+            lapc_ir::Intrinsic::Xor,
+            lapc_ir::Intrinsic::Add,
+            lapc_ir::Intrinsic::Sub,
+        ];
+        for width in [0usize, 1, 2, 8, 63, 64, 65, 128, 192, 1000] {
+            let mut elements = Vec::new();
+            let mut expected = Vec::new();
+            for intrinsic in intrinsics {
+                let left = pattern_bits(width, 2);
+                let right = pattern_bits(width, 4);
+                let argument_bits = if intrinsic == lapc_ir::Intrinsic::Not {
+                    vec![left.clone()]
+                } else {
+                    vec![left.clone(), right.clone()]
+                };
+                let arguments: Vec<Value> = argument_bits.iter().map(|bits_| bits(bits_)).collect();
+                elements.push(Value::Intrinsic(intrinsic, arguments));
+                expected.extend(expected_intrinsic(intrinsic, &argument_bits));
+            }
+            let program = Program::new(vec![constant_function(
+                "intrinsic",
+                Type::Collection(vec![flat_type(width); intrinsics.len()]),
+                Value::Collection(elements),
+            )]);
+            if expected.len() <= 64 {
+                assert_word(
+                    &program,
+                    "intrinsic",
+                    bits_to_word(&expected, expected.len()),
+                );
+            } else {
+                assert_wide(&program, "intrinsic", &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn runs_every_new_intrinsic() {
+        let intrinsics = [
+            lapc_ir::Intrinsic::Mul,
+            lapc_ir::Intrinsic::Inc,
+            lapc_ir::Intrinsic::Dec,
+            lapc_ir::Intrinsic::ShiftLeftOne,
+            lapc_ir::Intrinsic::ShiftRightOne,
+            lapc_ir::Intrinsic::Eq,
+            lapc_ir::Intrinsic::Lt,
+            lapc_ir::Intrinsic::IsZero,
+        ];
+        for width in [1usize, 2, 4, 8, 16, 32, 63, 64] {
+            let mut elements = Vec::new();
+            let mut types = Vec::new();
+            let mut expected = Vec::new();
+            for intrinsic in intrinsics {
+                let left = pattern_bits(width, 2);
+                let right = pattern_bits(width, 4);
+                let argument_bits = match intrinsic.arity() {
+                    1 => vec![left.clone()],
+                    _ => vec![left.clone(), right.clone()],
+                };
+                let arguments: Vec<Value> = argument_bits.iter().map(|bits_| bits(bits_)).collect();
+                let result = if intrinsic.is_comparison() {
+                    Type::Bit
+                } else {
+                    flat_type(width)
+                };
+                elements.push(Value::Intrinsic(intrinsic, arguments));
+                types.push(result);
+                expected.extend(expected_intrinsic(intrinsic, &argument_bits));
+            }
+            let program = Program::new(vec![constant_function(
+                "intrinsic",
+                Type::Collection(types),
+                Value::Collection(elements),
+            )]);
+            if expected.len() <= 64 {
+                assert_word(
+                    &program,
+                    "intrinsic",
+                    bits_to_word(&expected, expected.len()),
+                );
+            } else {
+                assert_wide(&program, "intrinsic", &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn multiplies_by_a_constant() {
+        let constants = [0u128, 1, 2, 3, 5, 7, 9, 11, 25, 100, 255];
+        for width in [0usize, 1, 2, 4, 8, 16, 32, 63, 64] {
+            let left = pattern_bits(width, 2);
+            let mut elements = Vec::new();
+            let mut expected = Vec::new();
+            for constant in constants {
+                let right = bits_of_value(constant & mask_wide(width), width);
+                elements.push(Value::Intrinsic(
+                    lapc_ir::Intrinsic::Mul,
+                    vec![bits(&left), bits(&right)],
+                ));
+                expected.extend(mul_values(&left, &right));
+            }
+            let program = Program::new(vec![constant_function(
+                "multiply",
+                Type::Collection(vec![flat_type(width); constants.len()]),
+                Value::Collection(elements),
+            )]);
+            if expected.len() <= 64 {
+                assert_word(
+                    &program,
+                    "multiply",
+                    bits_to_word(&expected, expected.len()),
+                );
+            } else {
+                assert_wide(&program, "multiply", &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn runs_select() {
+        for (flag, when_one, when_zero) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            let value = Value::Intrinsic(
+                lapc_ir::Intrinsic::Select,
+                vec![bit(flag), bit(when_one), bit(when_zero)],
+            );
+            let program = Program::new(vec![constant_function("select", Type::Bit, value)]);
+            let expected = if flag { when_one } else { when_zero };
+            assert_word(&program, "select", u64::from(expected));
+        }
+    }
+
+    #[test]
+    fn masks_a_word_at_width_64() {
+        let invert = Program::new(vec![constant_function(
+            "operation",
+            flat_type(64),
+            Value::Intrinsic(lapc_ir::Intrinsic::Not, vec![bits(&[false; 64])]),
         )]);
-        let (module, identifiers) = compile_for_execution(&program);
-        let main: extern "C" fn() -> i64 =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, "main")) };
-        assert_eq!(main(), 1);
-    }
-
-    #[test]
-    fn jit_runs_reference_and_store() {
-        let toggle = function(
-            "toggle",
-            vec![Parameter::new(Slot::new(0))],
-            Type::Collection(vec![]),
-            vec![Type::Reference(Box::new(Type::Bit))],
-            empty_block(vec![Statement::Store {
-                reference: Value::Reference {
-                    slot: Slot::new(0),
-                    bit_offset: 0,
-                },
-                value: bit(true),
-            }]),
-        );
-        let main = function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![Type::Bit, Type::Collection(vec![])],
-            block(
-                vec![
-                    Statement::Bind {
-                        slot: Slot::new(0),
-                        value: bit(false),
-                    },
-                    Statement::Bind {
-                        slot: Slot::new(1),
-                        value: Value::Call(
-                            Label::new("toggle"),
-                            vec![Value::Reference {
-                                slot: Slot::new(0),
-                                bit_offset: 0,
-                            }],
-                        ),
-                    },
-                ],
-                Value::Load(Box::new(Value::Reference {
-                    slot: Slot::new(0),
-                    bit_offset: 0,
-                })),
+        assert_word(&invert, "operation", u64::MAX);
+        let high_bit = bits_of_value(1u128 << 63, 64);
+        let wrap = Program::new(vec![constant_function(
+            "operation",
+            flat_type(64),
+            Value::Intrinsic(
+                lapc_ir::Intrinsic::Add,
+                vec![bits(&high_bit), bits(&high_bit)],
             ),
-        );
-        let program = Program::new(vec![toggle, main]);
-        let (module, identifiers) = compile_for_execution(&program);
-        let main: extern "C" fn() -> i64 =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, "main")) };
-        assert_eq!(main(), 1);
+        )]);
+        assert_word(&wrap, "operation", 0);
+        let borrow = Program::new(vec![constant_function(
+            "operation",
+            flat_type(64),
+            Value::Intrinsic(
+                lapc_ir::Intrinsic::Sub,
+                vec![bits(&[false; 64]), bits(&bits_of_value(1, 64))],
+            ),
+        )]);
+        assert_word(&borrow, "operation", u64::MAX);
     }
 
     #[test]
-    fn jit_runs_a_checked_program() {
+    fn runs_a_constant() {
+        let program = Program::new(vec![constant_function("main", Type::Bit, bit(true))]);
+        let Some(result) = run_word(&program, "main") else {
+            return;
+        };
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn runs_a_nand() {
+        let value = Value::Nand(Box::new(bit(true)), Box::new(bit(false)));
+        let program = Program::new(vec![constant_function("main", Type::Bit, value)]);
+        let Some(result) = run_word(&program, "main") else {
+            return;
+        };
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn runs_a_checked_program() {
         let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nbit.not = (a: BIT) BIT { NAND(a, a) }\nbit.toggle = (target: *BIT) [] { target = bit.not(target) }\nmain = () BIT { state: BIT = BIT.ZERO\n bit.toggle(*state)\n state }\n";
         let program = compile_source(source);
-        assert_eq!(run_word(&program, "main"), 1);
-    }
-
-    #[test]
-    fn jit_runs_branch() {
-        let value = Value::Branch(
-            Box::new(bit(true)),
-            block(vec![], bit(false)),
-            block(vec![], bit(true)),
-        );
-        let program = Program::new(vec![function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![],
-            block(vec![], value),
-        )]);
-        let (module, identifiers) = compile_for_execution(&program);
-        let main: extern "C" fn() -> i64 =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, "main")) };
-        assert_eq!(main(), 0);
-    }
-
-    #[test]
-    fn jit_runs_extern() {
-        let value = Value::Extern(Operation::new(0x0400), vec![]);
-        let result = Type::Collection(vec![Type::Bit, Type::Collection(vec![Type::Bit; 8])]);
-        let program = Program::new(vec![function(
-            "main",
-            vec![],
-            result,
-            vec![],
-            block(vec![], value),
-        )]);
-        let (module, identifiers) = compile_for_execution(&program);
-        let main: extern "C" fn() -> i64 =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, "main")) };
-        assert_eq!(main(), 85);
-    }
-
-    #[test]
-    fn jit_runs_a_wide_result() {
-        let mut values = vec![false; 65];
-        values[64] = true;
-        let result = Type::Collection(vec![Type::Bit; 65]);
-        let program = Program::new(vec![function(
-            "wide",
-            vec![],
-            result,
-            vec![],
-            block(vec![], bits(&values)),
-        )]);
-        let (module, identifiers) = compile_for_execution(&program);
-        let wide: extern "C" fn(*mut u8) =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, "wide")) };
-        let mut buffer = [0u8; 32];
-        wide(buffer.as_mut_ptr());
-        assert_eq!(buffer[0], 0);
-        assert_eq!(buffer[8], 1);
-    }
-
-    #[test]
-    fn jit_runs_a_wide_parameter() {
-        let wide = Type::Collection(vec![Type::Bit; 65]);
-        let identity = function(
-            "identity",
-            vec![Parameter::new(Slot::new(0))],
-            wide.clone(),
-            vec![wide.clone()],
-            block(
-                vec![],
-                Value::Load(Box::new(Value::Reference {
-                    slot: Slot::new(0),
-                    bit_offset: 0,
-                })),
-            ),
-        );
-        let program = Program::new(vec![identity]);
-        let (module, identifiers) = compile_for_execution(&program);
-        let identity: extern "C" fn(*mut u8, *const u8) =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, "identity")) };
-        let mut input = [0u8; 32];
-        input[8] = 1;
-        let mut output = [0u8; 32];
-        identity(output.as_mut_ptr(), input.as_ptr());
-        assert_eq!(output[0], 0);
-        assert_eq!(output[8], 1);
-    }
-
-    #[test]
-    fn jit_runs_a_wide_add() {
-        let mut left = vec![false; 65];
-        left[64] = true;
-        let mut right = vec![false; 65];
-        right[0] = true;
-        let value = Value::Intrinsic(Intrinsic::Add, vec![bits(&left), bits(&right)]);
-        let result = Type::Collection(vec![Type::Bit; 65]);
-        let program = Program::new(vec![function(
-            "add",
-            vec![],
-            result,
-            vec![],
-            block(vec![], value),
-        )]);
-        let (module, identifiers) = compile_for_execution(&program);
-        let add: extern "C" fn(*mut u8) =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, "add")) };
-        let mut buffer = [0u8; 32];
-        add(buffer.as_mut_ptr());
-        assert_eq!(buffer[0], 1);
-        assert_eq!(buffer[8], 1);
-    }
-
-    #[test]
-    fn jit_runs_a_wide_element() {
-        let mut values = vec![false; 65];
-        values[64] = true;
-        let value = Value::Element {
-            collection: Box::new(bits(&values)),
-            index: 64,
+        let Some(result) = run_word(&program, "main") else {
+            return;
         };
-        let program = Program::new(vec![function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![],
-            block(vec![], value),
-        )]);
-        let (module, identifiers) = compile_for_execution(&program);
-        let main: extern "C" fn() -> i64 =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, "main")) };
-        assert_eq!(main(), 1);
+        assert_eq!(result, 1);
     }
 
     #[test]
-    fn jit_runs_a_wide_sub() {
-        let mut left = vec![false; 65];
-        left[64] = true;
-        let mut right = vec![false; 65];
-        right[0] = true;
-        let value = Value::Intrinsic(Intrinsic::Sub, vec![bits(&left), bits(&right)]);
-        let result = Type::Collection(vec![Type::Bit; 65]);
-        let program = Program::new(vec![function(
-            "sub",
-            vec![],
-            result,
-            vec![],
-            block(vec![], value),
-        )]);
-        let (module, identifiers) = compile_for_execution(&program);
-        let sub: extern "C" fn(*mut u8) =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, "sub")) };
-        let mut buffer = [0u8; 32];
-        sub(buffer.as_mut_ptr());
-        assert_eq!(buffer[0], 0xff);
-        assert_eq!(buffer[8], 0);
-    }
-
-    #[test]
-    fn jit_runs_extern_with_a_wide_result() {
-        let value = Value::Extern(Operation::new(0x0100), vec![bits(&[false; 64])]);
-        let result = Type::Collection(vec![Type::Bit, Type::Collection(vec![Type::Bit; 64])]);
-        let program = Program::new(vec![function(
-            "main",
-            vec![],
-            result,
-            vec![],
-            block(vec![], value),
-        )]);
-        let (module, identifiers) = compile_for_execution(&program);
-        let main: extern "C" fn(*mut u8) =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, "main")) };
-        let mut buffer = [0u8; 32];
-        main(buffer.as_mut_ptr());
-        assert_eq!(buffer[0], 85);
-        assert_eq!(buffer[8], 0);
-    }
-
-    #[test]
-    fn jit_runs_a_reference_to_an_element() {
+    fn runs_a_reference_to_an_element() {
         let pair = Type::Collection(vec![Type::Bit, Type::Bit]);
         let set_middle = function(
             "set_middle",
@@ -3433,45 +1801,291 @@ mod tests {
             ),
         );
         let program = Program::new(vec![set_middle, main]);
-        let (module, identifiers) = compile_for_execution(&program);
-        let main: extern "C" fn() -> i64 =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, "main")) };
-        assert_eq!(main(), 1);
+        let Some(result) = run_word(&program, "main") else {
+            return;
+        };
+        assert_eq!(result, 1);
     }
 
     #[test]
-    fn jit_runs_a_wide_binding() {
+    fn runs_a_wide_constant() {
+        let mut values = vec![false; 65];
+        values[64] = true;
+        let program = Program::new(vec![constant_function(
+            "wide",
+            flat_type(65),
+            bits(&values),
+        )]);
+        let Some(result) = run_wide(&program, "wide") else {
+            return;
+        };
+        assert_eq!(result, packed_bytes(&values));
+    }
+
+    #[test]
+    fn runs_a_wide_parameter() {
+        let wide = Type::Collection(vec![Type::Bit; 65]);
+        let identity = function(
+            "identity",
+            vec![Parameter::new(Slot::new(0))],
+            wide.clone(),
+            vec![wide.clone()],
+            block(
+                vec![],
+                Value::Load(Box::new(Value::Reference {
+                    slot: Slot::new(0),
+                    bit_offset: 0,
+                })),
+            ),
+        );
+        let program = Program::new(vec![identity]);
+        let mut input = vec![0u64; 2];
+        input[1] = 1;
+        let Some(result) = run_wide_call(&program, "identity", &[Argument::Wide(input)]) else {
+            return;
+        };
+        assert_eq!(result, vec![0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn runs_a_wide_add() {
+        let mut left = vec![false; 65];
+        left[64] = true;
+        let mut right = vec![false; 65];
+        right[0] = true;
+        let value = Value::Intrinsic(lapc_ir::Intrinsic::Add, vec![bits(&left), bits(&right)]);
+        let program = Program::new(vec![constant_function("add", flat_type(65), value)]);
+        let Some(result) = run_wide(&program, "add") else {
+            return;
+        };
+        assert_eq!(result, vec![1, 0, 0, 0, 0, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn runs_a_wide_branch() {
         let wide = Type::Collection(vec![Type::Bit; 65]);
         let mut values = vec![false; 65];
         values[64] = true;
         let main = function(
             "main",
             vec![],
-            Type::Bit,
+            wide.clone(),
+            vec![],
+            block(
+                vec![],
+                Value::Branch(
+                    Box::new(bit(true)),
+                    block(vec![], bits(&values)),
+                    block(vec![], bits(&[false; 65])),
+                ),
+            ),
+        );
+        let program = Program::new(vec![main]);
+        let Some(result) = run_wide(&program, "main") else {
+            return;
+        };
+        assert_eq!(result, packed_bytes(&values));
+    }
+
+    #[test]
+    fn runs_a_wide_call() {
+        let wide = Type::Collection(vec![Type::Bit; 65]);
+        let mut values = vec![false; 65];
+        values[64] = true;
+        let callee = function(
+            "callee",
+            vec![Parameter::new(Slot::new(0))],
+            wide.clone(),
+            vec![wide.clone()],
+            block(
+                vec![],
+                Value::Load(Box::new(Value::Reference {
+                    slot: Slot::new(0),
+                    bit_offset: 0,
+                })),
+            ),
+        );
+        let main = function(
+            "main",
+            vec![],
+            wide.clone(),
             vec![wide.clone()],
             block(
                 vec![Statement::Bind {
                     slot: Slot::new(0),
                     value: bits(&values),
                 }],
-                Value::Element {
-                    collection: Box::new(Value::Load(Box::new(Value::Reference {
+                Value::Call(
+                    Label::new("callee"),
+                    vec![Value::Load(Box::new(Value::Reference {
                         slot: Slot::new(0),
                         bit_offset: 0,
-                    }))),
-                    index: 64,
-                },
+                    }))],
+                ),
             ),
         );
-        let program = Program::new(vec![main]);
-        let (module, identifiers) = compile_for_execution(&program);
-        let main: extern "C" fn() -> i64 =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, "main")) };
-        assert_eq!(main(), 1);
+        let program = Program::new(vec![callee, main]);
+        let Some(result) = run_wide(&program, "main") else {
+            return;
+        };
+        assert_eq!(result, packed_bytes(&values));
     }
 
     #[test]
-    fn jit_runs_a_promoted_wide_collection() {
+    fn runs_a_reference_to_a_word_at_every_offset() {
+        let values = pattern_bits(64, 1);
+        let elements: Vec<Value> = (0..64)
+            .map(|offset| {
+                Value::Load(Box::new(Value::Reference {
+                    slot: Slot::new(0),
+                    bit_offset: offset,
+                }))
+            })
+            .collect();
+        let main = function(
+            "main",
+            vec![],
+            flat_type(64),
+            vec![flat_type(64)],
+            block(
+                vec![Statement::Bind {
+                    slot: Slot::new(0),
+                    value: bits(&values),
+                }],
+                Value::Collection(elements),
+            ),
+        );
+        let program = Program::new(vec![main]);
+        let Some(result) = run_word(&program, "main") else {
+            return;
+        };
+        assert_eq!(result, bits_to_word(&values, 64));
+    }
+
+    #[test]
+    fn runs_a_reference_to_a_wide_element_at_every_offset() {
+        let values = pattern_bits(65, 3);
+        let elements: Vec<Value> = (0..65)
+            .map(|offset| {
+                Value::Load(Box::new(Value::Reference {
+                    slot: Slot::new(0),
+                    bit_offset: offset,
+                }))
+            })
+            .collect();
+        let main = function(
+            "main",
+            vec![],
+            flat_type(65),
+            vec![flat_type(65)],
+            block(
+                vec![Statement::Bind {
+                    slot: Slot::new(0),
+                    value: bits(&values),
+                }],
+                Value::Collection(elements),
+            ),
+        );
+        let program = Program::new(vec![main]);
+        let Some(result) = run_wide(&program, "main") else {
+            return;
+        };
+        assert_eq!(result, packed_bytes(&values));
+    }
+
+    #[test]
+    fn runs_a_reference_parameter_at_a_bit_offset() {
+        let read = function(
+            "read",
+            vec![Parameter::new(Slot::new(0))],
+            Type::Bit,
+            vec![Type::Reference(Box::new(Type::Bit))],
+            block(
+                vec![],
+                Value::Load(Box::new(Value::Reference {
+                    slot: Slot::new(0),
+                    bit_offset: 0,
+                })),
+            ),
+        );
+        let values = pattern_bits(64, 5);
+        let main = function(
+            "main",
+            vec![],
+            Type::Bit,
+            vec![flat_type(64)],
+            block(
+                vec![Statement::Bind {
+                    slot: Slot::new(0),
+                    value: bits(&values),
+                }],
+                Value::Call(
+                    Label::new("read"),
+                    vec![Value::Reference {
+                        slot: Slot::new(0),
+                        bit_offset: 37,
+                    }],
+                ),
+            ),
+        );
+        let program = Program::new(vec![read, main]);
+        let Some(result) = run_word(&program, "main") else {
+            return;
+        };
+        assert_eq!(result, u64::from(values[37]));
+    }
+
+    #[test]
+    fn runs_a_store_through_a_reference_parameter_at_a_bit_offset() {
+        let set = function(
+            "set",
+            vec![Parameter::new(Slot::new(0))],
+            Type::Collection(vec![]),
+            vec![Type::Reference(Box::new(Type::Bit))],
+            empty_block(vec![Statement::Store {
+                reference: Value::Reference {
+                    slot: Slot::new(0),
+                    bit_offset: 0,
+                },
+                value: bit(true),
+            }]),
+        );
+        let main = function(
+            "main",
+            vec![],
+            Type::Bit,
+            vec![flat_type(64)],
+            block(
+                vec![
+                    Statement::Bind {
+                        slot: Slot::new(0),
+                        value: bits(&[false; 64]),
+                    },
+                    Statement::Evaluate {
+                        value: Value::Call(
+                            Label::new("set"),
+                            vec![Value::Reference {
+                                slot: Slot::new(0),
+                                bit_offset: 37,
+                            }],
+                        ),
+                    },
+                ],
+                Value::Load(Box::new(Value::Reference {
+                    slot: Slot::new(0),
+                    bit_offset: 37,
+                })),
+            ),
+        );
+        let program = Program::new(vec![set, main]);
+        let Some(result) = run_word(&program, "main") else {
+            return;
+        };
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn runs_a_wide_element_of_a_wide_collection() {
         let wide = Type::Collection(vec![Type::Collection(vec![Type::Bit; 64]), Type::Bit]);
         let mut low = vec![false; 64];
         low[3] = true;
@@ -3495,14 +2109,146 @@ mod tests {
             ),
         );
         let program = Program::new(vec![main]);
-        assert_eq!(run_word(&program, "main"), 1);
+        let Some(result) = run_word(&program, "main") else {
+            return;
+        };
+        assert_eq!(result, 1);
     }
 
     #[test]
-    fn jit_runs_a_wide_collection_read_as_a_whole() {
-        let wide = Type::Collection(vec![Type::Collection(vec![Type::Bit; 64]), Type::Bit]);
-        let mut low = vec![false; 64];
-        low[3] = true;
+    fn runs_a_wide_element_at_a_bit_offset() {
+        let wide = Type::Collection(vec![Type::Bit, Type::Collection(vec![Type::Bit; 64])]);
+        let mut high = vec![false; 64];
+        high[3] = true;
+        let main = function(
+            "main",
+            vec![],
+            Type::Bit,
+            vec![wide.clone()],
+            block(
+                vec![Statement::Bind {
+                    slot: Slot::new(0),
+                    value: Value::Collection(vec![bit(true), bits(&high)]),
+                }],
+                Value::Element {
+                    collection: Box::new(Value::Element {
+                        collection: Box::new(Value::Load(Box::new(Value::Reference {
+                            slot: Slot::new(0),
+                            bit_offset: 0,
+                        }))),
+                        index: 1,
+                    }),
+                    index: 3,
+                },
+            ),
+        );
+        let program = Program::new(vec![main]);
+        let Some(result) = run_word(&program, "main") else {
+            return;
+        };
+        assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn runs_a_wide_store_at_a_bit_offset() {
+        let wide = Type::Collection(vec![Type::Bit, Type::Collection(vec![Type::Bit; 64])]);
+        let mut high = vec![false; 64];
+        high[3] = true;
+        let main = function(
+            "main",
+            vec![],
+            Type::Bit,
+            vec![
+                wide.clone(),
+                Type::Reference(Box::new(Type::Collection(vec![Type::Bit; 64]))),
+            ],
+            block(
+                vec![
+                    Statement::Bind {
+                        slot: Slot::new(0),
+                        value: Value::Collection(vec![bit(false), bits(&[false; 64])]),
+                    },
+                    Statement::Bind {
+                        slot: Slot::new(1),
+                        value: Value::Reference {
+                            slot: Slot::new(0),
+                            bit_offset: 1,
+                        },
+                    },
+                    Statement::Store {
+                        reference: Value::Reference {
+                            slot: Slot::new(1),
+                            bit_offset: 0,
+                        },
+                        value: bits(&high),
+                    },
+                ],
+                Value::Element {
+                    collection: Box::new(Value::Element {
+                        collection: Box::new(Value::Load(Box::new(Value::Reference {
+                            slot: Slot::new(0),
+                            bit_offset: 0,
+                        }))),
+                        index: 1,
+                    }),
+                    index: 3,
+                },
+            ),
+        );
+        let program = Program::new(vec![main]);
+        let Some(result) = run_word(&program, "main") else {
+            return;
+        };
+        assert_eq!(result, 1);
+    }
+
+    const COUNTING_PRELUDE: &str = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\n\
+     BIT.ZERO = NAND(BIT.ONE, BIT.ONE)\n\
+     bit.not = (a: BIT) BIT { NAND(a, a) }\n\
+     bit.and = (a: BIT, b: BIT) BIT { bit.not(NAND(a, b)) }\n\
+     U2 = [BIT, BIT]\n\
+     U2.ZERO = [BIT.ZERO, BIT.ZERO]\n\
+     U2.ONE = [BIT.ONE, BIT.ZERO]\n\
+     U2.TWO = [BIT.ZERO, BIT.ONE]\n\
+     U2.THREE = [BIT.ONE, BIT.ONE]\n\
+     u2.is.zero = (value: U2) BIT { [low, high] = value\n bit.and(bit.not(low), bit.not(high)) }\n\
+     u2.dec = (value: U2) U2 { [low, high] = value\n BRANCH (low) { [BIT.ZERO, high] } { [BIT.ONE, bit.not(high)] } }\n";
+
+    #[test]
+    fn runs_a_nand_of_zeros() {
+        let value = Value::Nand(Box::new(bit(false)), Box::new(bit(false)));
+        let program = Program::new(vec![constant_function("main", Type::Bit, value)]);
+        assert_word(&program, "main", 1);
+    }
+
+    #[test]
+    fn runs_a_bit_branch() {
+        let value = Value::Branch(
+            Box::new(bit(true)),
+            block(vec![], bit(false)),
+            block(vec![], bit(true)),
+        );
+        let program = Program::new(vec![constant_function("main", Type::Bit, value)]);
+        assert_word(&program, "main", 0);
+    }
+
+    #[test]
+    fn runs_a_wide_element() {
+        let mut values = vec![false; 65];
+        values[64] = true;
+        let value = Value::Element {
+            collection: Box::new(bits(&values)),
+            index: 64,
+        };
+        let program = Program::new(vec![constant_function("main", Type::Bit, value)]);
+        assert_word(&program, "main", 1);
+    }
+
+    #[test]
+    fn runs_a_wide_copy() {
+        let wide = flat_type(65);
+        let mut values = vec![false; 65];
+        values[64] = true;
         let main = function(
             "main",
             vec![],
@@ -3512,7 +2258,7 @@ mod tests {
                 vec![
                     Statement::Bind {
                         slot: Slot::new(0),
-                        value: Value::Collection(vec![bits(&low), bit(true)]),
+                        value: bits(&values),
                     },
                     Statement::Bind {
                         slot: Slot::new(1),
@@ -3527,72 +2273,27 @@ mod tests {
                         slot: Slot::new(1),
                         bit_offset: 0,
                     }))),
-                    index: 1,
+                    index: 64,
                 },
             ),
         );
         let program = Program::new(vec![main]);
-        assert_eq!(run_word(&program, "main"), 1);
+        assert_word(&program, "main", 1);
     }
 
     #[test]
-    fn jit_passes_a_promoted_wide_collection_to_a_call() {
-        let wide = Type::Collection(vec![Type::Collection(vec![Type::Bit; 64]), Type::Bit]);
-        let mut low = vec![false; 64];
-        low[3] = true;
-        let callee = function(
-            "callee",
-            vec![Parameter::new(Slot::new(0))],
-            Type::Bit,
-            vec![wide.clone()],
-            block(
-                vec![],
-                Value::Element {
-                    collection: Box::new(Value::Load(Box::new(Value::Reference {
-                        slot: Slot::new(0),
-                        bit_offset: 0,
-                    }))),
-                    index: 1,
-                },
-            ),
-        );
+    fn keeps_every_bit_at_width_64() {
+        let mut values = pattern_bits(64, 2);
+        values[63] = true;
         let main = function(
             "main",
             vec![],
-            Type::Bit,
-            vec![wide.clone()],
+            flat_type(64),
+            vec![flat_type(64)],
             block(
                 vec![Statement::Bind {
                     slot: Slot::new(0),
-                    value: Value::Collection(vec![bits(&low), bit(true)]),
-                }],
-                Value::Call(
-                    Label::new("callee"),
-                    vec![Value::Load(Box::new(Value::Reference {
-                        slot: Slot::new(0),
-                        bit_offset: 0,
-                    }))],
-                ),
-            ),
-        );
-        let program = Program::new(vec![callee, main]);
-        assert_eq!(run_word(&program, "main"), 1);
-    }
-
-    #[test]
-    fn emit_object_for_a_program_with_every_construct() {
-        let helper = function(
-            "helper",
-            vec![Parameter::new(Slot::new(0))],
-            Type::Bit,
-            vec![Type::Reference(Box::new(Type::Bit))],
-            block(
-                vec![Statement::Store {
-                    reference: Value::Reference {
-                        slot: Slot::new(0),
-                        bit_offset: 0,
-                    },
-                    value: bit(true),
+                    value: bits(&values),
                 }],
                 Value::Load(Box::new(Value::Reference {
                     slot: Slot::new(0),
@@ -3600,291 +2301,55 @@ mod tests {
                 })),
             ),
         );
-        let main = function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![
-                Type::Bit,
-                Type::Bit,
-                Type::Collection(vec![Type::Bit, Type::Bit]),
-            ],
-            block(
-                vec![
-                    Statement::Bind {
-                        slot: Slot::new(0),
-                        value: bit(false),
-                    },
-                    Statement::Bind {
-                        slot: Slot::new(1),
-                        value: Value::Call(
-                            Label::new("helper"),
-                            vec![Value::Reference {
-                                slot: Slot::new(0),
-                                bit_offset: 0,
-                            }],
-                        ),
-                    },
-                    Statement::Bind {
-                        slot: Slot::new(2),
-                        value: Value::Collection(vec![
-                            bit(true),
-                            Value::Nand(Box::new(bit(true)), Box::new(bit(true))),
-                        ]),
-                    },
-                ],
-                Value::Branch(
-                    Box::new(Value::Element {
-                        collection: Box::new(Value::Load(Box::new(Value::Reference {
-                            slot: Slot::new(2),
-                            bit_offset: 0,
-                        }))),
-                        index: 0,
-                    }),
-                    block(vec![], Value::Intrinsic(Intrinsic::Not, vec![bit(false)])),
-                    block(
-                        vec![],
-                        Value::Element {
-                            collection: Box::new(Value::Extern(Operation::new(0x0400), vec![])),
-                            index: 0,
-                        },
-                    ),
-                ),
-            ),
+        let program = Program::new(vec![main]);
+        assert_word(&program, "main", bits_to_word(&values, 64));
+    }
+
+    #[test]
+    fn runs_a_nand_of_wide_elements() {
+        let collection = Value::Collection(vec![bits(&pattern_bits(65, 1)), bit(true)]);
+        let value = Value::Nand(
+            Box::new(Value::Element {
+                collection: Box::new(collection.clone()),
+                index: 1,
+            }),
+            Box::new(Value::Element {
+                collection: Box::new(collection),
+                index: 1,
+            }),
         );
-        let program = Program::new(vec![helper, main]);
-        let object = emit_object(&program).expect("the object emits");
-        assert!(!object.is_empty());
-        assert_eq!(link_and_run("every-construct", &object, &entry_source()), 1);
+        let program = Program::new(vec![constant_function("nand", Type::Bit, value)]);
+        assert_word(&program, "nand", 0);
     }
 
     #[test]
-    fn jit_runs_constants_at_every_width_boundary() {
-        for width in [0usize, 1, 2, 7, 8, 63, 64, 65, 127, 128, 129, 192, 1000] {
-            let values = pattern_bits(width, 1);
-            let program = Program::new(vec![constant_function(
-                "constant",
-                flat_type(width),
-                bits(&values),
-            )]);
-            if width <= 64 {
-                assert_eq!(
-                    run_word(&program, "constant"),
-                    bits_to_word(&values, 0, width),
-                    "at width {width}"
-                );
-            } else {
-                assert_wide_result(&program, "constant", &values);
-            }
-        }
+    fn runs_a_self_tail_call_as_a_loop() {
+        let program = compile_source(&format!(
+            "{COUNTING_PRELUDE}\
+         count.down = (count: U2) BIT {{ BRANCH (u2.is.zero(count)) {{ BIT.ONE }} {{ count.down(u2.dec(count)) }} }}\n\
+         main = () BIT {{ count.down(U2.THREE) }}\n"
+        ));
+        let Some(result) = run_word(&program, "main") else {
+            return;
+        };
+        assert_eq!(result, 1);
     }
 
     #[test]
-    fn jit_keeps_every_bit_at_width_64() {
-        let mut values = pattern_bits(64, 2);
-        values[63] = true;
-        let program = Program::new(vec![function(
-            "main",
-            vec![],
-            flat_type(64),
-            vec![flat_type(64)],
-            Block::new(
-                vec![Statement::Bind {
-                    slot: Slot::new(0),
-                    value: bits(&values),
-                }],
-                Some(Box::new(Value::Load(Box::new(Value::Reference {
-                    slot: Slot::new(0),
-                    bit_offset: 0,
-                })))),
-            ),
-        )]);
-        assert_eq!(run_word(&program, "main"), bits_to_word(&values, 0, 64));
+    fn runs_a_tail_call_with_a_local_reference_as_a_call() {
+        let program = compile_source(&format!(
+            "{COUNTING_PRELUDE}\
+         count.down = (count: U2, target: *U2) BIT {{ BRANCH (u2.is.zero(count)) {{ [low, high] = target\n low }} {{ count.down(u2.dec(count), *count) }} }}\n\
+         main = () BIT {{ count: U2 = U2.THREE\n count.down(count, *count) }}\n"
+        ));
+        let Some(result) = run_word(&program, "main") else {
+            return;
+        };
+        assert_eq!(result, 1);
     }
 
     #[test]
-    fn jit_masks_a_word_at_width_64() {
-        let invert = Program::new(vec![constant_function(
-            "operation",
-            flat_type(64),
-            Value::Intrinsic(Intrinsic::Not, vec![bits(&[false; 64])]),
-        )]);
-        assert_eq!(run_word(&invert, "operation"), -1);
-        let high_bit = bits_of_value(1u128 << 63, 64);
-        let wrap = Program::new(vec![constant_function(
-            "operation",
-            flat_type(64),
-            Value::Intrinsic(Intrinsic::Add, vec![bits(&high_bit), bits(&high_bit)]),
-        )]);
-        assert_eq!(run_word(&wrap, "operation"), 0);
-        let borrow = Program::new(vec![constant_function(
-            "operation",
-            flat_type(64),
-            Value::Intrinsic(
-                Intrinsic::Sub,
-                vec![bits(&[false; 64]), bits(&bits_of_value(1, 64))],
-            ),
-        )]);
-        assert_eq!(run_word(&borrow, "operation"), -1);
-    }
-
-    #[test]
-    fn jit_runs_nand_at_every_width_boundary() {
-        for width in [0usize, 1, 2, 7, 8, 63, 64, 65, 127, 128, 129, 192, 1000] {
-            let left = pattern_bits(width, 1);
-            let right = pattern_bits(width, 3);
-            let expected = expected_nand(&left, &right);
-            let value = Value::Nand(Box::new(bits(&left)), Box::new(bits(&right)));
-            let program = Program::new(vec![constant_function("nand", flat_type(width), value)]);
-            if width <= 64 {
-                assert_eq!(
-                    run_word(&program, "nand"),
-                    bits_to_word(&expected, 0, width),
-                    "at width {width}"
-                );
-            } else {
-                assert_wide_result(&program, "nand", &expected);
-            }
-        }
-    }
-
-    #[test]
-    fn jit_runs_every_intrinsic_at_every_width_boundary() {
-        let intrinsics = [
-            Intrinsic::Not,
-            Intrinsic::And,
-            Intrinsic::Or,
-            Intrinsic::Xor,
-            Intrinsic::Add,
-            Intrinsic::Sub,
-        ];
-        for width in [0usize, 1, 2, 8, 63, 64, 65, 128, 192, 1000] {
-            for intrinsic in intrinsics {
-                let left = pattern_bits(width, 2);
-                let right = pattern_bits(width, 4);
-                let argument_bits = if intrinsic == Intrinsic::Not {
-                    vec![left.clone()]
-                } else {
-                    vec![left.clone(), right.clone()]
-                };
-                let arguments: Vec<Value> = argument_bits.iter().map(|bits_| bits(bits_)).collect();
-                let program = Program::new(vec![constant_function(
-                    "intrinsic",
-                    flat_type(width),
-                    Value::Intrinsic(intrinsic, arguments),
-                )]);
-                let expected = expected_intrinsic(intrinsic, &argument_bits);
-                if width <= 64 {
-                    assert_eq!(
-                        run_word(&program, "intrinsic"),
-                        bits_to_word(&expected, 0, width),
-                        "for {intrinsic:?} at width {width}"
-                    );
-                } else {
-                    assert_wide_result(&program, "intrinsic", &expected);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn jit_runs_every_new_intrinsic() {
-        let intrinsics = [
-            Intrinsic::Mul,
-            Intrinsic::Inc,
-            Intrinsic::Dec,
-            Intrinsic::ShiftLeftOne,
-            Intrinsic::ShiftRightOne,
-            Intrinsic::Eq,
-            Intrinsic::Lt,
-            Intrinsic::IsZero,
-        ];
-        for width in [1usize, 2, 4, 8, 16, 32, 63, 64] {
-            for intrinsic in intrinsics {
-                let left = pattern_bits(width, 2);
-                let right = pattern_bits(width, 4);
-                let argument_bits = match intrinsic.arity() {
-                    1 => vec![left.clone()],
-                    _ => vec![left.clone(), right.clone()],
-                };
-                let arguments: Vec<Value> = argument_bits.iter().map(|bits_| bits(bits_)).collect();
-                let result = if intrinsic.is_comparison() {
-                    Type::Bit
-                } else {
-                    flat_type(width)
-                };
-                let program = Program::new(vec![constant_function(
-                    "intrinsic",
-                    result,
-                    Value::Intrinsic(intrinsic, arguments),
-                )]);
-                let expected = expected_intrinsic(intrinsic, &argument_bits);
-                assert_eq!(
-                    run_word(&program, "intrinsic"),
-                    bits_to_word(&expected, 0, expected.len()),
-                    "for {intrinsic:?} at width {width}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn jit_multiplies_by_a_constant() {
-        let constants = [0u128, 1, 2, 3, 5, 7, 9, 11, 25, 100, 255];
-        for width in [0usize, 1, 2, 4, 8, 16, 32, 63, 64] {
-            let left = pattern_bits(width, 2);
-            for constant in constants {
-                let right = bits_of_value(constant & mask_wide(width), width);
-                let program = Program::new(vec![constant_function(
-                    "multiply",
-                    flat_type(width),
-                    Value::Intrinsic(Intrinsic::Mul, vec![bits(&left), bits(&right)]),
-                )]);
-                let expected = mul_values(&left, &right);
-                assert_eq!(
-                    run_word(&program, "multiply"),
-                    bits_to_word(&expected, 0, width),
-                    "for constant {constant} at width {width}"
-                );
-            }
-        }
-        for constant in [3u128, 100, u64::MAX as u128] {
-            let left = bits_of_value(constant, 64);
-            let right = pattern_bits(64, 7);
-            let program = Program::new(vec![constant_function(
-                "multiply",
-                flat_type(64),
-                Value::Intrinsic(Intrinsic::Mul, vec![bits(&left), bits(&right)]),
-            )]);
-            let expected = mul_values(&left, &right);
-            assert_eq!(
-                run_word(&program, "multiply"),
-                bits_to_word(&expected, 0, 64),
-                "for constant {constant} on the left"
-            );
-        }
-    }
-
-    #[test]
-    fn jit_runs_select() {
-        for (flag, when_one, when_zero) in [
-            (false, false, false),
-            (false, true, false),
-            (true, false, true),
-            (true, true, true),
-        ] {
-            let value = Value::Intrinsic(
-                Intrinsic::Select,
-                vec![bit(flag), bit(when_one), bit(when_zero)],
-            );
-            let program = Program::new(vec![constant_function("select", Type::Bit, value)]);
-            let expected = if flag { when_one } else { when_zero };
-            assert_eq!(run_word(&program, "select"), i64::from(expected));
-        }
-    }
-
-    #[test]
-    fn jit_runs_nand_of_structured_collections() {
+    fn runs_nand_of_structured_collections() {
         let type_ = Type::Collection(vec![
             Type::Collection(vec![Type::Bit, Type::Bit]),
             Type::Bit,
@@ -3899,11 +2364,11 @@ mod tests {
         ]);
         let value = Value::Nand(Box::new(left), Box::new(right));
         let program = Program::new(vec![constant_function("nand", type_, value)]);
-        assert_eq!(run_word(&program, "nand"), 3);
+        assert_word(&program, "nand", 3);
     }
 
     #[test]
-    fn jit_runs_an_intrinsic_of_structured_collections() {
+    fn runs_an_intrinsic_of_structured_collections() {
         let type_ = Type::Collection(vec![
             Type::Collection(vec![Type::Bit, Type::Bit]),
             Type::Bit,
@@ -3916,13 +2381,13 @@ mod tests {
             Value::Collection(vec![bit(false), bit(true)]),
             bit(true),
         ]);
-        let value = Value::Intrinsic(Intrinsic::Xor, vec![left, right]);
+        let value = Value::Intrinsic(lapc_ir::Intrinsic::Xor, vec![left, right]);
         let program = Program::new(vec![constant_function("xor", type_, value)]);
-        assert_eq!(run_word(&program, "xor"), 3);
+        assert_word(&program, "xor", 3);
     }
 
     #[test]
-    fn jit_runs_a_collection_of_structured_elements() {
+    fn runs_a_collection_of_structured_elements() {
         let type_ = Type::Collection(vec![
             Type::Collection(vec![
                 Type::Bit,
@@ -3938,11 +2403,11 @@ mod tests {
             bit(true),
         ]);
         let program = Program::new(vec![constant_function("collection", type_, value)]);
-        assert_eq!(run_word(&program, "collection"), 13);
+        assert_word(&program, "collection", 13);
     }
 
     #[test]
-    fn jit_runs_every_element_of_a_structured_collection() {
+    fn runs_every_element_of_a_structured_collection() {
         let type_ = Type::Collection(vec![
             Type::Collection(vec![Type::Bit, Type::Bit]),
             Type::Bit,
@@ -3954,40 +2419,25 @@ mod tests {
             Value::Collection(vec![bit(false), bit(true), bit(true)]),
         ]);
         let elements = type_.elements().expect("the type is a collection");
-        for (index, expected) in [(0usize, 1i64), (1, 1), (2, 6)] {
-            let value = Value::Element {
+        let mut values = Vec::new();
+        let mut expected = Vec::new();
+        for (index, element) in elements.iter().enumerate() {
+            values.push(Value::Element {
                 collection: Box::new(collection.clone()),
                 index,
-            };
-            let program = Program::new(vec![constant_function(
-                "element",
-                elements[index].clone(),
-                value,
-            )]);
-            assert_eq!(
-                run_word(&program, "element"),
-                expected,
-                "for element {index}"
-            );
+            });
+            expected.push(element.clone());
         }
+        let program = Program::new(vec![constant_function(
+            "element",
+            Type::Collection(expected),
+            Value::Collection(values),
+        )]);
+        assert_word(&program, "element", 1 | (1 << 2) | (6 << 3));
     }
 
     #[test]
-    fn jit_runs_a_wide_element_of_a_wide_collection() {
-        let wide = flat_type(65);
-        let mut values = pattern_bits(65, 6);
-        values[64] = true;
-        let collection = Value::Collection(vec![bits(&[true, false, true]), bits(&values)]);
-        let value = Value::Element {
-            collection: Box::new(collection),
-            index: 1,
-        };
-        let program = Program::new(vec![constant_function("element", wide, value)]);
-        assert_wide_result(&program, "element", &values);
-    }
-
-    #[test]
-    fn jit_runs_a_nested_element_of_mixed_widths() {
+    fn runs_a_nested_element_of_mixed_widths() {
         let collection = Value::Collection(vec![
             Value::Collection(vec![bit(true), bit(false)]),
             Value::Collection(vec![bit(true), bit(false)]),
@@ -4000,30 +2450,50 @@ mod tests {
             index: 1,
         };
         let program = Program::new(vec![constant_function("element", Type::Bit, value)]);
-        assert_eq!(run_word(&program, "element"), 0);
+        assert_word(&program, "element", 0);
     }
 
     #[test]
-    fn jit_runs_a_source_element_after_a_narrow_element() {
+    fn runs_a_source_element_after_a_narrow_element() {
         let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nmain = () BIT { bundle: [BIT, [BIT, BIT]] = [BIT.ONE, [BIT.ZERO, BIT.ONE]]\n [first, second] = bundle\n [low, high] = second\n high }\n";
-        assert_eq!(run_word(&compile_source(source), "main"), 1);
+        assert_word(&compile_source(source), "main", 1);
     }
 
     #[test]
-    fn jit_runs_a_source_element_after_a_wide_element() {
+    fn runs_a_source_element_after_a_wide_element() {
         let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nmain = () BIT { bundle: [BIT, [BIT, BIT], BIT] = [BIT.ONE, [BIT.ONE, BIT.ONE], BIT.ZERO]\n [first, second, third] = bundle\n third }\n";
-        assert_eq!(run_word(&compile_source(source), "main"), 0);
+        assert_word(&compile_source(source), "main", 0);
     }
 
     #[test]
-    fn jit_runs_an_erased_program() {
-        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nliblapc.u8.add = (a: U8, b: U8) U8 { [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO] }\nmain = () BIT { sum: U8 = liblapc.u8.add([BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ZERO], [BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO])\n [b0, b1, b2, b3, b4, b5, b6, b7] = sum\n b7 }\n";
-        let program = lapc_erase::erase_intrinsics(compile_source(source));
-        assert_eq!(run_word(&program, "main"), 1);
+    fn runs_an_element_of_mixed_widths() {
+        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nmain = () BIT { both: [[BIT, BIT], BIT] = [[BIT.ZERO, BIT.ONE], BIT.ZERO]\n [pair, flag] = both\n flag }\n";
+        assert_word(&compile_source(source), "main", 0);
     }
 
     #[test]
-    fn jit_runs_zero_width_values() {
+    fn runs_an_ignored_element() {
+        let collection = Value::Collection(vec![bit(true), bit(false)]);
+        let program = Program::new(vec![function(
+            "main",
+            vec![],
+            Type::Bit,
+            vec![],
+            block(
+                vec![Statement::Evaluate {
+                    value: Value::Element {
+                        collection: Box::new(collection),
+                        index: 0,
+                    },
+                }],
+                bit(true),
+            ),
+        )]);
+        assert_word(&program, "main", 1);
+    }
+
+    #[test]
+    fn runs_zero_width_values() {
         let empty = Type::Collection(vec![]);
         let producer = constant_function("empty", empty.clone(), Value::Collection(vec![]));
         let caller = function(
@@ -4040,13 +2510,13 @@ mod tests {
             ),
         );
         let program = Program::new(vec![producer.clone(), caller]);
-        assert_eq!(run_word(&program, "caller"), 1);
+        assert_word(&program, "caller", 1);
         let program = Program::new(vec![producer]);
-        assert_eq!(run_word(&program, "empty"), 0);
+        assert_word(&program, "empty", 0);
     }
 
     #[test]
-    fn jit_runs_a_zero_width_argument() {
+    fn runs_a_zero_width_argument() {
         let empty = Type::Collection(vec![]);
         let identity = function(
             "identity",
@@ -4075,112 +2545,11 @@ mod tests {
             ),
         );
         let program = Program::new(vec![identity, caller]);
-        assert_eq!(run_word(&program, "caller"), 1);
+        assert_word(&program, "caller", 1);
     }
 
     #[test]
-    fn jit_runs_a_reference_to_a_wide_element_at_every_offset() {
-        let wide = flat_type(65);
-        for prefix in 0usize..8 {
-            let mut stored_values = pattern_bits(65, 9);
-            stored_values[64] = true;
-            let overwritten_values: Vec<bool> = stored_values.iter().map(|value| !value).collect();
-            let padding = pattern_bits(prefix, 1);
-            let slot_type = Type::Collection(vec![
-                Type::Collection(vec![Type::Bit; prefix]),
-                wide.clone(),
-            ]);
-            let value = Value::Collection(vec![bits(&padding), bits(&overwritten_values)]);
-            let statements = vec![
-                Statement::Bind {
-                    slot: Slot::new(0),
-                    value,
-                },
-                Statement::Store {
-                    reference: Value::Reference {
-                        slot: Slot::new(0),
-                        bit_offset: prefix,
-                    },
-                    value: bits(&stored_values),
-                },
-            ];
-            let result = Value::Load(Box::new(Value::Reference {
-                slot: Slot::new(0),
-                bit_offset: 0,
-            }));
-            let program = Program::new(vec![function(
-                "probe",
-                vec![],
-                slot_type.clone(),
-                vec![slot_type],
-                block(statements, result),
-            )]);
-            let expected: Vec<bool> = padding
-                .iter()
-                .chain(stored_values.iter())
-                .copied()
-                .collect();
-            assert_wide_result(&program, "probe", &expected);
-        }
-    }
-
-    #[test]
-    fn jit_runs_a_reference_to_a_word_at_every_offset() {
-        for width in [9usize, 63, 64] {
-            for prefix in 0usize..8 {
-                let stored_values = pattern_bits(width, 4);
-                let overwritten_values: Vec<bool> =
-                    stored_values.iter().map(|value| !value).collect();
-                let padding = pattern_bits(prefix, 3);
-                let slot_type = Type::Collection(vec![
-                    Type::Collection(vec![Type::Bit; prefix]),
-                    flat_type(width),
-                ]);
-                let value = Value::Collection(vec![bits(&padding), bits(&overwritten_values)]);
-                let statements = vec![
-                    Statement::Bind {
-                        slot: Slot::new(0),
-                        value,
-                    },
-                    Statement::Store {
-                        reference: Value::Reference {
-                            slot: Slot::new(0),
-                            bit_offset: prefix,
-                        },
-                        value: bits(&stored_values),
-                    },
-                ];
-                let result = Value::Load(Box::new(Value::Reference {
-                    slot: Slot::new(0),
-                    bit_offset: 0,
-                }));
-                let program = Program::new(vec![function(
-                    "probe",
-                    vec![],
-                    slot_type.clone(),
-                    vec![slot_type],
-                    block(statements, result),
-                )]);
-                let expected: Vec<bool> = padding
-                    .iter()
-                    .chain(stored_values.iter())
-                    .copied()
-                    .collect();
-                if prefix + width <= 64 {
-                    assert_eq!(
-                        run_word(&program, "probe"),
-                        bits_to_word(&expected, 0, prefix + width),
-                        "for width {width} at prefix {prefix}"
-                    );
-                } else {
-                    assert_wide_result(&program, "probe", &expected);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn jit_runs_a_wide_call_with_two_wide_arguments() {
+    fn runs_a_wide_call_with_two_wide_arguments() {
         let wide = flat_type(65);
         let nand = function(
             "wide_nand",
@@ -4204,21 +2573,29 @@ mod tests {
         let program = Program::new(vec![nand]);
         let left = pattern_bits(65, 1);
         let right = pattern_bits(65, 3);
-        let output = run_wide_two(
+        let expected: Vec<bool> = left
+            .iter()
+            .zip(&right)
+            .map(|(left, right)| !(left & right))
+            .collect();
+        let Some(result) = run_wide_call(
             &program,
             "wide_nand",
-            &wide_input(&left),
-            &wide_input(&right),
-        );
-        let expected = bits_of_value(nand_word(value_of(&left), value_of(&right), 65), 65);
-        assert_eq!(
-            &output[..packed_bytes(&expected).len()],
-            &packed_bytes(&expected)[..]
-        );
+            &[
+                Argument::Wide(vec![value_of(&left) as u64, (value_of(&left) >> 64) as u64]),
+                Argument::Wide(vec![
+                    value_of(&right) as u64,
+                    (value_of(&right) >> 64) as u64,
+                ]),
+            ],
+        ) else {
+            return;
+        };
+        assert_eq!(result, packed_bytes(&expected));
     }
 
     #[test]
-    fn jit_runs_a_wide_call_result_as_a_wide_argument() {
+    fn runs_a_wide_call_result_as_a_wide_argument() {
         let wide = flat_type(65);
         let identity = function(
             "identity",
@@ -4243,17 +2620,20 @@ mod tests {
                 vec![],
                 Value::Call(
                     Label::new("identity"),
-                    vec![Value::Intrinsic(Intrinsic::Not, vec![bits(&values)])],
+                    vec![Value::Intrinsic(
+                        lapc_ir::Intrinsic::Not,
+                        vec![bits(&values)],
+                    )],
                 ),
             ),
         );
         let program = Program::new(vec![identity, wrapper]);
         let expected = bits_of_value(!value_of(&values) & mask_wide(65), 65);
-        assert_wide_result(&program, "wrapper", &expected);
+        assert_wide(&program, "wrapper", &expected);
     }
 
     #[test]
-    fn jit_runs_a_wide_call_from_a_wide_parameter() {
+    fn runs_a_wide_call_from_a_wide_parameter() {
         let wide = flat_type(65);
         let identity = function(
             "identity",
@@ -4287,719 +2667,21 @@ mod tests {
         let program = Program::new(vec![identity, forward]);
         let mut values = pattern_bits(65, 8);
         values[64] = true;
-        let output = run_wide_one(&program, "forward", &wide_input(&values));
-        assert_eq!(
-            &output[..packed_bytes(&values).len()],
-            &packed_bytes(&values)[..]
-        );
-    }
-
-    #[test]
-    fn jit_runs_every_erased_intrinsic() {
-        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nliblapc.bit.not = (a: BIT) BIT { NAND(a, a) }\nliblapc.bit.xor = (a: BIT, b: BIT) BIT { BIT.ZERO }\nliblapc.bit.or = (a: BIT, b: BIT) BIT { BIT.ZERO }\nliblapc.bit.and = (a: BIT, b: BIT) BIT { BIT.ZERO }\nliblapc.u8.sub = (a: U8, b: U8) U8 { [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO] }\nliblapc.u8.add = (a: U8, b: U8) U8 { [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO] }\nmain = () BIT { plain: BIT = liblapc.bit.and(liblapc.bit.not(BIT.ZERO), liblapc.bit.or(BIT.ZERO, liblapc.bit.xor(BIT.ONE, BIT.ZERO)))\n difference: U8 = liblapc.u8.sub([BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO], [BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO])\n [b0, b1, b2, b3, b4, b5, b6, b7] = difference\n NAND(plain, b7) }\n";
-        let program = lapc_erase::erase_intrinsics(compile_source(source));
-        assert_eq!(run_word(&program, "main"), 0);
-    }
-
-    #[test]
-    fn jit_runs_a_division_at_every_width_boundary() {
-        for width in [1usize, 4, 8, 9, 16, 32, 63, 64] {
-            for (value, divisor) in [
-                (7u128, 2u128),
-                (1000, 10),
-                (0, 5),
-                (5, 0),
-                (0, 0),
-                (255, 1),
-                (123456789, 1000000),
-            ] {
-                let value = value & mask_wide(width);
-                let divisor = divisor & mask_wide(width);
-                let intrinsic = Value::Intrinsic(
-                    Intrinsic::DivMod,
-                    vec![
-                        bits(&bits_of_value(value, width)),
-                        bits(&bits_of_value(divisor, width)),
-                    ],
-                );
-                let result_type = Type::Collection(vec![flat_type(width), flat_type(width)]);
-                let program = Program::new(vec![function(
-                    "divide",
-                    vec![],
-                    result_type,
-                    vec![],
-                    block(vec![], intrinsic),
-                )]);
-                let (module, identifiers) = compile_for_execution(&program);
-                let (quotient, remainder) = if width * 2 <= 64 {
-                    let divide: extern "C" fn() -> i64 =
-                        unsafe { std::mem::transmute(entry(&module, &identifiers, "divide")) };
-                    let word = divide() as u64;
-                    (
-                        u128::from(word & mask_wide(width) as u64),
-                        u128::from((word >> width) & mask_wide(width) as u64),
-                    )
-                } else {
-                    let output = run_wide(&program, "divide");
-                    let all: Vec<bool> = (0..2 * width)
-                        .map(|index| output[index / 8] >> (index % 8) & 1 == 1)
-                        .collect();
-                    (value_of(&all[..width]), value_of(&all[width..]))
-                };
-                let expected = if divisor == 0 {
-                    (0, 0)
-                } else {
-                    (value / divisor, value % divisor)
-                };
-                assert_eq!(
-                    (quotient, remainder),
-                    expected,
-                    "for width {width}, {value} divided by {divisor}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn jit_runs_a_division_by_a_runtime_divisor() {
-        for width in [4usize, 8, 16, 32, 64] {
-            let operand_type = flat_type(width);
-            let divide = function(
-                "divide",
-                vec![Parameter::new(Slot::new(0)), Parameter::new(Slot::new(1))],
-                Type::Collection(vec![operand_type.clone(), operand_type.clone()]),
-                vec![operand_type.clone(), operand_type.clone()],
-                block(
-                    vec![],
-                    Value::Intrinsic(
-                        Intrinsic::DivMod,
-                        vec![
-                            Value::Load(Box::new(Value::Reference {
-                                slot: Slot::new(0),
-                                bit_offset: 0,
-                            })),
-                            Value::Load(Box::new(Value::Reference {
-                                slot: Slot::new(1),
-                                bit_offset: 0,
-                            })),
-                        ],
-                    ),
-                ),
-            );
-            let program = Program::new(vec![divide]);
-            let (module, identifiers) = compile_for_execution(&program);
-            for (value, divisor) in [
-                (0u64, 0u64),
-                (1, 0),
-                (7, 2),
-                (255, 10),
-                (12345, 67),
-                (1 << 63, 3),
-            ] {
-                let value = u128::from(value) & mask_wide(width);
-                let divisor = u128::from(divisor) & mask_wide(width);
-                let (quotient, remainder) = if width * 2 <= 64 {
-                    let divide: extern "C" fn(i64, i64) -> i64 =
-                        unsafe { std::mem::transmute(entry(&module, &identifiers, "divide")) };
-                    let word = divide(value as i64, divisor as i64) as u64;
-                    (
-                        u128::from(word & mask_wide(width) as u64),
-                        u128::from((word >> width) & mask_wide(width) as u64),
-                    )
-                } else {
-                    let divide: extern "C" fn(*mut u8, i64, i64) =
-                        unsafe { std::mem::transmute(entry(&module, &identifiers, "divide")) };
-                    let mut buffer = [0u8; WIDE_BUFFER_BYTES];
-                    divide(buffer.as_mut_ptr(), value as i64, divisor as i64);
-                    let all: Vec<bool> = (0..2 * width)
-                        .map(|index| buffer[index / 8] >> (index % 8) & 1 == 1)
-                        .collect();
-                    (value_of(&all[..width]), value_of(&all[width..]))
-                };
-                let expected = if divisor == 0 {
-                    (0, 0)
-                } else {
-                    (value / divisor, value % divisor)
-                };
-                assert_eq!(
-                    (quotient, remainder),
-                    expected,
-                    "for width {width}, {value} divided by {divisor}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn jit_runs_an_erased_division() {
-        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nliblapc.u8.div.mod = (value: U8, divisor: U8) [U8, U8] { [[BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO], [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO]] }\nmain = () BIT { [quotient, remainder] = liblapc.u8.div.mod([BIT.ZERO, BIT.ONE, BIT.ZERO, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ZERO, BIT.ONE], [BIT.ZERO, BIT.ONE, BIT.ZERO, BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO])\n [q0, q1, q2, q3, q4, q5, q6, q7] = quotient\n [r0, r1, r2, r3, r4, r5, r6, r7] = remainder\n NAND(NAND(q4, r1), NAND(q4, r1)) }\n";
-        let program = lapc_erase::erase_intrinsics(compile_source(source));
-        assert_eq!(run_word(&program, "main"), 1);
-    }
-
-    #[test]
-    fn magic_division_is_exact() {
-        let mut divisors: Vec<u64> = (2..2000).collect();
-        divisors.extend([
-            10,
-            1000000,
-            123456789,
-            u64::from(u32::MAX),
-            (1 << 32) + 1,
-            (1 << 63) - 1,
-            (1 << 63) + 1,
-            u64::MAX,
-            u64::MAX - 1,
-            (1 << 62) + 12345,
-        ]);
-        for divisor in divisors {
-            let magic = magic_division(divisor);
-            let mut samples: Vec<u64> = vec![
-                0,
-                1,
-                divisor - 1,
-                divisor,
-                divisor.saturating_add(1),
-                u64::MAX,
-                u64::MAX - 1,
-                1 << 63,
-            ];
-            let mut state = divisor | 1;
-            for _ in 0..2000 {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                samples.push(state);
-            }
-            for sample in samples {
-                let expected = u128::from(sample) / u128::from(divisor);
-                if let Some((m, shift)) = magic {
-                    let computed = (u128::from(sample) * u128::from(m)) >> (64 + shift);
-                    assert_eq!(
-                        computed, expected,
-                        "for divisor {divisor} and sample {sample}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn constant_multiplication_plans_are_exact() {
-        let mut constants: Vec<u64> = (1..=1024).collect();
-        constants.extend([
-            u64::MAX,
-            u64::MAX - 1,
-            1 << 63,
-            (1 << 63) | 1,
-            0x0123_4567_89AB_CDEF,
-            0xAAAA_AAAA_AAAA_AAAA,
-            0x5555_5555_5555_5555,
-            0xFFFF_FFFF,
-            1 << 32,
-            (1 << 32) - 1,
-        ]);
-        for constant in constants {
-            let Some(plan) = multiply_plan(constant) else {
-                continue;
-            };
-            let mut sum = 0u64;
-            for term in &plan.terms {
-                match term {
-                    MultiplyTerm::Add(shift) => sum = sum.wrapping_add(1u64 << shift),
-                    MultiplyTerm::Subtract(shift) => sum = sum.wrapping_sub(1u64 << shift),
-                }
-            }
-            assert_eq!(sum << plan.shift, constant, "for constant {constant}");
-        }
-        for constant in [1u64, 2, 3, 5, 7, 9, 10, 11, 15, 17, 21, 25, 31, 100, 255] {
-            assert!(multiply_plan(constant).is_some(), "for constant {constant}");
-        }
-    }
-
-    #[test]
-    fn a_value_parameter_is_substituted_for_its_load() {
-        let bindings = vec![InlineBinding {
-            parameter: Slot::new(0),
-            parameter_type: flat_type(8),
-            argument: bits(&[true, false, false, false, false, false, false, false]),
-        }];
-        let load = Value::Load(Box::new(Value::Reference {
-            slot: Slot::new(0),
-            bit_offset: 0,
-        }));
-        assert_eq!(
-            substitute_parameters(&load, &bindings),
-            Some(bits(&[
-                true, false, false, false, false, false, false, false
-            ]))
-        );
-    }
-
-    #[test]
-    fn a_reference_parameter_is_dereferenced_when_substituted() {
-        let bindings = vec![InlineBinding {
-            parameter: Slot::new(0),
-            parameter_type: Type::Reference(Box::new(Type::Bit)),
-            argument: Value::Reference {
-                slot: Slot::new(3),
-                bit_offset: 0,
-            },
-        }];
-        let load = Value::Load(Box::new(Value::Reference {
-            slot: Slot::new(0),
-            bit_offset: 0,
-        }));
-        assert_eq!(
-            substitute_parameters(&load, &bindings),
-            Some(Value::Load(Box::new(Value::Reference {
-                slot: Slot::new(3),
-                bit_offset: 0
-            })))
-        );
-    }
-
-    #[test]
-    fn a_reference_to_a_value_parameter_is_not_substitutable() {
-        let bindings = vec![InlineBinding {
-            parameter: Slot::new(0),
-            parameter_type: flat_type(8),
-            argument: bit(true),
-        }];
-        let reference = Value::Reference {
-            slot: Slot::new(0),
-            bit_offset: 0,
+        let Some(result) = run_wide_call(
+            &program,
+            "forward",
+            &[Argument::Wide(vec![
+                value_of(&values) as u64,
+                (value_of(&values) >> 64) as u64,
+            ])],
+        ) else {
+            return;
         };
-        assert_eq!(substitute_parameters(&reference, &bindings), None);
+        assert_eq!(result, packed_bytes(&values));
     }
 
     #[test]
-    fn only_a_pure_argument_is_inlinable() {
-        assert!(!value_is_pure(&Value::Call(Label::new("callee"), vec![])));
-        assert!(!value_is_pure(&Value::Extern(
-            Operation::new(0x0400),
-            vec![]
-        )));
-        assert!(value_is_pure(&Value::Load(Box::new(Value::Reference {
-            slot: Slot::new(0),
-            bit_offset: 0,
-        }))));
-    }
-
-    #[test]
-    fn a_block_with_statements_is_not_inline_safe() {
-        let branch = Value::Branch(
-            Box::new(bit(true)),
-            Block::new(
-                vec![Statement::Bind {
-                    slot: Slot::new(1),
-                    value: bit(false),
-                }],
-                Some(Box::new(bit(true))),
-            ),
-            empty_block(vec![]),
-        );
-        assert!(!value_is_inline_safe(&branch));
-    }
-
-    #[test]
-    fn jit_inlines_a_reference_parameter() {
-        let read = function(
-            "read",
-            vec![Parameter::new(Slot::new(0))],
-            Type::Bit,
-            vec![Type::Reference(Box::new(Type::Bit))],
-            block(
-                vec![],
-                Value::Load(Box::new(Value::Reference {
-                    slot: Slot::new(0),
-                    bit_offset: 0,
-                })),
-            ),
-        );
-        let main = function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![Type::Bit],
-            block(
-                vec![Statement::Bind {
-                    slot: Slot::new(0),
-                    value: bit(true),
-                }],
-                Value::Call(
-                    Label::new("read"),
-                    vec![Value::Reference {
-                        slot: Slot::new(0),
-                        bit_offset: 0,
-                    }],
-                ),
-            ),
-        );
-        let program = Program::new(vec![read, main]);
-        assert_eq!(run_word(&program, "main"), 1);
-    }
-
-    #[test]
-    fn jit_calls_a_division_with_an_impure_argument() {
-        let operand_type = flat_type(64);
-        let divisor = function(
-            "divisor",
-            vec![],
-            operand_type.clone(),
-            vec![operand_type.clone()],
-            block(
-                vec![Statement::Bind {
-                    slot: Slot::new(0),
-                    value: bits(&bits_of_value(53, 64)),
-                }],
-                Value::Load(Box::new(Value::Reference {
-                    slot: Slot::new(0),
-                    bit_offset: 0,
-                })),
-            ),
-        );
-        let divide = function(
-            "divide",
-            vec![Parameter::new(Slot::new(0)), Parameter::new(Slot::new(1))],
-            Type::Collection(vec![operand_type.clone(), operand_type.clone()]),
-            vec![operand_type.clone(), operand_type.clone()],
-            block(
-                vec![],
-                Value::Intrinsic(
-                    Intrinsic::DivMod,
-                    vec![
-                        Value::Load(Box::new(Value::Reference {
-                            slot: Slot::new(0),
-                            bit_offset: 0,
-                        })),
-                        Value::Call(Label::new("divisor"), vec![]),
-                    ],
-                ),
-            ),
-        );
-        let program = Program::new(vec![divisor, divide]);
-        let (module, identifiers) = compile_for_execution(&program);
-        let divide: extern "C" fn(*mut u8, i64) =
-            unsafe { std::mem::transmute(entry(&module, &identifiers, "divide")) };
-        let mut buffer = [0u8; WIDE_BUFFER_BYTES];
-        divide(buffer.as_mut_ptr(), 100);
-        let all: Vec<bool> = (0..128)
-            .map(|index| buffer[index / 8] >> (index % 8) & 1 == 1)
-            .collect();
-        let quotient = value_of(&all[..64]);
-        let remainder = value_of(&all[64..]);
-        assert_eq!((quotient, remainder), (100 / 53, 100 % 53));
-    }
-
-    #[test]
-    fn emit_object_handles_a_statement_free_cycle() {
-        let first = function(
-            "first",
-            vec![],
-            Type::Bit,
-            vec![],
-            block(vec![], Value::Call(Label::new("second"), vec![])),
-        );
-        let second = function(
-            "second",
-            vec![],
-            Type::Bit,
-            vec![],
-            block(vec![], Value::Call(Label::new("first"), vec![])),
-        );
-        let program = Program::new(vec![first, second]);
-        assert!(emit_object(&program).is_ok());
-    }
-
-    #[test]
-    fn emitted_labels_follow_calls_from_main() {
-        let leaf = constant_function("leaf", Type::Bit, bit(false));
-        let middle = function(
-            "middle",
-            vec![],
-            Type::Bit,
-            vec![],
-            block(vec![], Value::Call(Label::new("leaf"), vec![])),
-        );
-        let main = function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![],
-            block(vec![], Value::Call(Label::new("middle"), vec![])),
-        );
-        let unused = constant_function("unused", Type::Bit, bit(true));
-        let program = Program::new(vec![leaf, middle, main, unused]);
-        let expected: HashSet<&str> = ["main", "middle", "leaf"].into_iter().collect();
-        assert_eq!(emitted_labels(&program), expected);
-    }
-
-    #[test]
-    fn emitted_labels_follow_calls_inside_blocks() {
-        let leaf = constant_function("leaf", Type::Bit, bit(false));
-        let main = function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![],
-            block(
-                vec![Statement::Bind {
-                    slot: Slot::new(0),
-                    value: Value::Call(Label::new("leaf"), vec![]),
-                }],
-                Value::Branch(
-                    Box::new(bit(true)),
-                    Block::new(
-                        vec![],
-                        Some(Box::new(Value::Call(Label::new("leaf"), vec![]))),
-                    ),
-                    Block::new(
-                        vec![Statement::Evaluate {
-                            value: Value::Call(Label::new("leaf"), vec![]),
-                        }],
-                        None,
-                    ),
-                ),
-            ),
-        );
-        let program = Program::new(vec![leaf, main]);
-        let expected: HashSet<&str> = ["main", "leaf"].into_iter().collect();
-        assert_eq!(emitted_labels(&program), expected);
-    }
-
-    #[test]
-    fn emitted_labels_keep_every_function_without_a_main() {
-        let first = constant_function("first", Type::Bit, bit(false));
-        let second = constant_function("second", Type::Bit, bit(true));
-        let program = Program::new(vec![first, second]);
-        let expected: HashSet<&str> = ["first", "second"].into_iter().collect();
-        assert_eq!(emitted_labels(&program), expected);
-    }
-
-    #[test]
-    fn inlining_removes_a_wrapper_from_the_call_graph() {
-        let wrapper = function(
-            "wrapper",
-            vec![Parameter::new(Slot::new(0))],
-            Type::Bit,
-            vec![Type::Bit],
-            block(
-                vec![],
-                Value::Intrinsic(
-                    Intrinsic::Not,
-                    vec![Value::Load(Box::new(Value::Reference {
-                        slot: Slot::new(0),
-                        bit_offset: 0,
-                    }))],
-                ),
-            ),
-        );
-        let main = function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![],
-            block(vec![], Value::Call(Label::new("wrapper"), vec![bit(false)])),
-        );
-        let program = Program::new(vec![wrapper, main]);
-        let rewritten = inline_program(&program);
-        let expected: HashSet<&str> = ["main"].into_iter().collect();
-        assert_eq!(emitted_labels(&rewritten), expected);
-    }
-
-    #[test]
-    fn inlining_removes_a_callee_with_a_binding_body() {
-        let callee = function(
-            "callee",
-            vec![Parameter::new(Slot::new(0))],
-            Type::Bit,
-            vec![Type::Bit, Type::Bit],
-            block(
-                vec![Statement::Bind {
-                    slot: Slot::new(1),
-                    value: Value::Intrinsic(
-                        Intrinsic::Not,
-                        vec![Value::Load(Box::new(Value::Reference {
-                            slot: Slot::new(0),
-                            bit_offset: 0,
-                        }))],
-                    ),
-                }],
-                Value::Load(Box::new(Value::Reference {
-                    slot: Slot::new(1),
-                    bit_offset: 0,
-                })),
-            ),
-        );
-        let main = function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![],
-            block(vec![], Value::Call(Label::new("callee"), vec![bit(false)])),
-        );
-        let program = Program::new(vec![callee, main]);
-        let rewritten = inline_program(&program);
-        let expected: HashSet<&str> = ["main"].into_iter().collect();
-        assert_eq!(emitted_labels(&rewritten), expected);
-    }
-
-    #[test]
-    fn a_callee_that_stores_keeps_its_call() {
-        let callee = function(
-            "callee",
-            vec![Parameter::new(Slot::new(0))],
-            Type::Bit,
-            vec![Type::Reference(Box::new(Type::Bit))],
-            block(
-                vec![Statement::Store {
-                    reference: Value::Load(Box::new(Value::Reference {
-                        slot: Slot::new(0),
-                        bit_offset: 0,
-                    })),
-                    value: bit(true),
-                }],
-                bit(false),
-            ),
-        );
-        let main = function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![Type::Bit],
-            block(
-                vec![],
-                Value::Call(
-                    Label::new("callee"),
-                    vec![Value::Reference {
-                        slot: Slot::new(0),
-                        bit_offset: 0,
-                    }],
-                ),
-            ),
-        );
-        let program = Program::new(vec![callee, main]);
-        let rewritten = inline_program(&program);
-        let expected: HashSet<&str> = ["main", "callee"].into_iter().collect();
-        assert_eq!(emitted_labels(&rewritten), expected);
-    }
-
-    #[test]
-    fn an_impure_argument_keeps_its_callee() {
-        let operand_type = Type::Collection(vec![Type::Bit, Type::Collection(vec![Type::Bit; 8])]);
-        let wrapper = function(
-            "wrapper",
-            vec![Parameter::new(Slot::new(0))],
-            operand_type.clone(),
-            vec![operand_type.clone()],
-            block(
-                vec![],
-                Value::Load(Box::new(Value::Reference {
-                    slot: Slot::new(0),
-                    bit_offset: 0,
-                })),
-            ),
-        );
-        let main = function(
-            "main",
-            vec![],
-            operand_type,
-            vec![],
-            block(
-                vec![],
-                Value::Call(
-                    Label::new("wrapper"),
-                    vec![Value::Extern(Operation::new(0x0400), vec![])],
-                ),
-            ),
-        );
-        let program = Program::new(vec![wrapper, main]);
-        let rewritten = inline_program(&program);
-        let expected: HashSet<&str> = ["main", "wrapper"].into_iter().collect();
-        assert_eq!(emitted_labels(&rewritten), expected);
-    }
-
-    #[test]
-    fn unreachable_functions_are_not_emitted() {
-        let broken = function(
-            "broken",
-            vec![],
-            Type::Bit,
-            vec![],
-            block(vec![], Value::Intrinsic(Intrinsic::Not, vec![])),
-        );
-        let main = constant_function("main", Type::Bit, bit(false));
-        let program = Program::new(vec![broken, main]);
-        assert!(emit_object(&program).is_ok());
-    }
-
-    #[test]
-    fn a_reachable_broken_function_is_emitted() {
-        let broken = function(
-            "broken",
-            vec![],
-            Type::Bit,
-            vec![],
-            block(vec![], Value::Intrinsic(Intrinsic::Not, vec![])),
-        );
-        let main = function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![],
-            block(vec![], Value::Call(Label::new("broken"), vec![])),
-        );
-        let program = Program::new(vec![broken, main]);
-        assert!(emit_object(&program).is_err());
-    }
-
-    #[test]
-    fn emit_object_handles_an_empty_program() {
-        let object = emit_object(&Program::new(vec![])).expect("the object emits");
-        assert!(!object.is_empty());
-    }
-
-    #[test]
-    fn jit_runs_a_nand_of_wide_elements() {
-        let collection = Value::Collection(vec![bits(&pattern_bits(65, 1)), bit(true)]);
-        let value = Value::Nand(
-            Box::new(Value::Element {
-                collection: Box::new(collection.clone()),
-                index: 1,
-            }),
-            Box::new(Value::Element {
-                collection: Box::new(collection),
-                index: 1,
-            }),
-        );
-        let program = Program::new(vec![constant_function("nand", Type::Bit, value)]);
-        assert_eq!(run_word(&program, "nand"), 0);
-    }
-
-    #[test]
-    fn jit_runs_an_ignored_element() {
-        let collection = Value::Collection(vec![bit(true), bit(false)]);
-        let program = Program::new(vec![function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![],
-            block(
-                vec![Statement::Evaluate {
-                    value: Value::Element {
-                        collection: Box::new(collection),
-                        index: 0,
-                    },
-                }],
-                bit(true),
-            ),
-        )]);
-        assert_eq!(run_word(&program, "main"), 1);
-    }
-
-    #[test]
-    fn jit_runs_an_empty_branch() {
+    fn runs_an_empty_branch() {
         let empty = Type::Collection(vec![]);
         let value = Value::Branch(
             Box::new(bit(true)),
@@ -5007,11 +2689,11 @@ mod tests {
             empty_block(vec![Statement::Evaluate { value: bit(false) }]),
         );
         let program = Program::new(vec![constant_function("branch", empty, value)]);
-        assert_eq!(run_word(&program, "branch"), 0);
+        assert_word(&program, "branch", 0);
     }
 
     #[test]
-    fn jit_runs_a_branch_with_a_wide_result() {
+    fn runs_a_branch_with_a_wide_result() {
         let wide = flat_type(65);
         for condition in [true, false] {
             let then_values = pattern_bits(65, 1);
@@ -5027,12 +2709,12 @@ mod tests {
             } else {
                 &else_values
             };
-            assert_wide_result(&program, "branch", expected);
+            assert_wide(&program, "branch", expected);
         }
     }
 
     #[test]
-    fn jit_runs_a_nested_branch_with_a_wide_result() {
+    fn runs_a_nested_branch_with_a_wide_result() {
         let wide = flat_type(65);
         let inner = Value::Branch(
             Box::new(bit(false)),
@@ -5045,11 +2727,11 @@ mod tests {
             block(vec![], bits(&pattern_bits(65, 5))),
         );
         let program = Program::new(vec![constant_function("branch", wide, outer)]);
-        assert_wide_result(&program, "branch", &pattern_bits(65, 3));
+        assert_wide(&program, "branch", &pattern_bits(65, 3));
     }
 
     #[test]
-    fn jit_runs_a_branch_with_a_wide_binding() {
+    fn runs_a_branch_with_a_wide_binding() {
         let wide = flat_type(65);
         let then_values = pattern_bits(65, 1);
         let program = Program::new(vec![function(
@@ -5084,192 +2766,242 @@ mod tests {
                 ),
             ),
         )]);
-        assert_wide_result(&program, "branch", &then_values);
+        assert_wide(&program, "branch", &then_values);
     }
 
     #[test]
-    fn jit_runs_extern_at_every_result_width() {
+    fn runs_a_division_at_every_width_boundary() {
         let cases = [
-            (Operation::new(0x0000), vec![bits(&[true; 8])], 0usize),
-            (Operation::new(0x0400), vec![], 8),
-            (Operation::new(0x0100), vec![bits(&[false; 64])], 64),
-            (
-                Operation::new(0x0200),
-                vec![
-                    bits(&[false; 64]),
-                    bits(&[false; 64]),
-                    bits(&[false; 64]),
-                    bits(&[false; 8]),
-                ],
-                64,
-            ),
+            (7u128, 2u128),
+            (1000, 10),
+            (0, 5),
+            (5, 0),
+            (0, 0),
+            (255, 1),
+            (123456789, 1000000),
         ];
-        for (operation, arguments, payload_width) in cases {
-            let result = extern_result_type(
-                lookup_operation(operation.code()).expect("the operation is known"),
-            );
+        for width in [1usize, 4, 8, 9, 16, 32, 63, 64] {
+            let mut elements = Vec::new();
+            let mut expected = Vec::new();
+            for (value, divisor) in cases {
+                let value = value & mask_wide(width);
+                let divisor = divisor & mask_wide(width);
+                elements.push(Value::Intrinsic(
+                    lapc_ir::Intrinsic::DivMod,
+                    vec![
+                        bits(&bits_of_value(value, width)),
+                        bits(&bits_of_value(divisor, width)),
+                    ],
+                ));
+                let (quotient, remainder) = if divisor == 0 {
+                    (0, 0)
+                } else {
+                    (value / divisor, value % divisor)
+                };
+                expected.extend(bits_of_value(quotient, width));
+                expected.extend(bits_of_value(remainder, width));
+            }
+            let pair = Type::Collection(vec![flat_type(width), flat_type(width)]);
             let program = Program::new(vec![constant_function(
-                "call",
-                result,
-                Value::Extern(operation, arguments),
+                "divide",
+                Type::Collection(vec![pair; cases.len()]),
+                Value::Collection(elements),
             )]);
-            let word = 1u128 | (42u128 << 1);
-            if payload_width < 64 {
-                assert_eq!(
-                    run_word(&program, "call"),
-                    (word & mask_wide(1 + payload_width)) as i64,
-                    "for payload width {payload_width}"
-                );
+            if expected.len() <= 64 {
+                assert_word(&program, "divide", bits_to_word(&expected, expected.len()));
             } else {
-                assert_wide_result(&program, "call", &bits_of_value(word, 1 + payload_width));
+                assert_wide(&program, "divide", &expected);
             }
         }
     }
 
     #[test]
-    fn jit_runs_an_extern_with_a_structured_argument() {
-        let argument = Value::Collection(vec![bits(&pattern_bits(64, 5))]);
-        let result = extern_result_type(lookup_operation(0x0101).expect("the operation is known"));
-        let value = Value::Extern(Operation::new(0x0101), vec![argument]);
-        let program = Program::new(vec![constant_function("call", result, value)]);
-        assert_eq!(run_word(&program, "call"), 1);
+    fn runs_a_division_by_a_runtime_divisor() {
+        for width in [4usize, 8, 16, 32, 64] {
+            let operand_type = flat_type(width);
+            let divide = function(
+                "divide",
+                vec![Parameter::new(Slot::new(0)), Parameter::new(Slot::new(1))],
+                Type::Collection(vec![operand_type.clone(), operand_type.clone()]),
+                vec![operand_type.clone(), operand_type.clone()],
+                block(
+                    vec![],
+                    Value::Intrinsic(
+                        lapc_ir::Intrinsic::DivMod,
+                        vec![
+                            Value::Load(Box::new(Value::Reference {
+                                slot: Slot::new(0),
+                                bit_offset: 0,
+                            })),
+                            Value::Load(Box::new(Value::Reference {
+                                slot: Slot::new(1),
+                                bit_offset: 0,
+                            })),
+                        ],
+                    ),
+                ),
+            );
+            let program = Program::new(vec![divide]);
+            for (value, divisor) in [
+                (0u64, 0u64),
+                (1, 0),
+                (7, 2),
+                (255, 10),
+                (12345, 67),
+                (1 << 63, 3),
+            ] {
+                let value = u128::from(value) & mask_wide(width);
+                let divisor = u128::from(divisor) & mask_wide(width);
+                let Some(bytes) = run_wide_call(
+                    &program,
+                    "divide",
+                    &[Argument::Word(value as u64), Argument::Word(divisor as u64)],
+                ) else {
+                    return;
+                };
+                let all: Vec<bool> = (0..2 * width)
+                    .map(|index| bytes[index / 8] >> (index % 8) & 1 == 1)
+                    .collect();
+                let (quotient, remainder) = (value_of(&all[..width]), value_of(&all[width..]));
+                let expected = if divisor == 0 {
+                    (0, 0)
+                } else {
+                    (value / divisor, value % divisor)
+                };
+                assert_eq!(
+                    (quotient, remainder),
+                    expected,
+                    "for width {width}, {value} divided by {divisor}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn jit_runs_an_extern_payload_bit() {
-        let value = Value::Element {
-            collection: Box::new(Value::Element {
-                collection: Box::new(Value::Extern(
-                    Operation::new(0x0100),
-                    vec![bits(&[false; 64])],
-                )),
-                index: 1,
-            }),
-            index: 1,
-        };
-        let program = Program::new(vec![constant_function("call", Type::Bit, value)]);
-        assert_eq!(run_word(&program, "call"), 1);
+    fn runs_an_erased_division() {
+        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nliblapc.u8.div.mod = (value: U8, divisor: U8) [U8, U8] { [[BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO], [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO]] }\nmain = () BIT { [quotient, remainder] = liblapc.u8.div.mod([BIT.ZERO, BIT.ONE, BIT.ZERO, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ZERO, BIT.ONE], [BIT.ZERO, BIT.ONE, BIT.ZERO, BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO])\n [q0, q1, q2, q3, q4, q5, q6, q7] = quotient\n [r0, r1, r2, r3, r4, r5, r6, r7] = remainder\n NAND(NAND(q4, r1), NAND(q4, r1)) }\n";
+        assert_word(&compile_source(source), "main", 1);
     }
 
     #[test]
-    fn emit_object_rejects_an_element_out_of_range() {
-        let value = Value::Element {
-            collection: Box::new(Value::Collection(vec![bit(true)])),
-            index: 1,
-        };
-        let program = Program::new(vec![constant_function("main", Type::Bit, value)]);
-        let error = emit_object(&program).expect_err("the object is rejected");
-        assert_eq!(error.message(), "an element is out of range");
+    fn runs_an_erased_program() {
+        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nliblapc.u8.add = (a: U8, b: U8) U8 { [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO] }\nmain = () BIT { sum: U8 = liblapc.u8.add([BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ONE, BIT.ZERO], [BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO])\n [b0, b1, b2, b3, b4, b5, b6, b7] = sum\n b7 }\n";
+        assert_word(&compile_source(source), "main", 1);
     }
 
     #[test]
-    fn emit_object_rejects_an_element_of_a_non_collection() {
-        let value = Value::Element {
-            collection: Box::new(bit(true)),
-            index: 0,
-        };
-        let program = Program::new(vec![constant_function("main", Type::Bit, value)]);
-        let error = emit_object(&program).expect_err("the object is rejected");
-        assert_eq!(error.message(), "an element needs a collection");
+    fn runs_every_erased_intrinsic() {
+        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\nU8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\nliblapc.bit.not = (a: BIT) BIT { NAND(a, a) }\nliblapc.bit.xor = (a: BIT, b: BIT) BIT { BIT.ZERO }\nliblapc.bit.or = (a: BIT, b: BIT) BIT { BIT.ZERO }\nliblapc.bit.and = (a: BIT, b: BIT) BIT { BIT.ZERO }\nliblapc.u8.sub = (a: U8, b: U8) U8 { [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO] }\nliblapc.u8.add = (a: U8, b: U8) U8 { [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO] }\nmain = () BIT { plain: BIT = liblapc.bit.and(liblapc.bit.not(BIT.ZERO), liblapc.bit.or(BIT.ZERO, liblapc.bit.xor(BIT.ONE, BIT.ZERO)))\n difference: U8 = liblapc.u8.sub([BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO], [BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO])\n [b0, b1, b2, b3, b4, b5, b6, b7] = difference\n NAND(plain, b7) }\n";
+        assert_word(&compile_source(source), "main", 0);
     }
 
     #[test]
-    fn emit_object_rejects_a_constant_of_the_wrong_width() {
-        let program = Program::new(vec![constant_function(
-            "main",
-            Type::Bit,
-            bits(&[true, false]),
-        )]);
-        let error = emit_object(&program).expect_err("the object is rejected");
-        assert_eq!(error.message(), "a constant has the wrong width");
-    }
-
-    #[test]
-    fn emit_object_rejects_an_unknown_operation() {
-        let value = Value::Extern(Operation::new(0x7fff), vec![]);
-        let program = Program::new(vec![constant_function("main", Type::Bit, value)]);
-        let error = emit_object(&program).expect_err("the object is rejected");
-        assert_eq!(error.message(), "an operation is unknown");
-    }
-
-    #[test]
-    fn emit_object_rejects_a_reference_of_the_wrong_type() {
-        let value = Value::Reference {
-            slot: Slot::new(0),
-            bit_offset: 0,
-        };
-        let program = Program::new(vec![function(
-            "main",
-            vec![],
-            Type::Collection(vec![Type::Bit, Type::Bit]),
-            vec![Type::Bit],
-            block(vec![], value),
-        )]);
-        let error = emit_object(&program).expect_err("the object is rejected");
-        assert_eq!(error.message(), "a reference has the wrong type");
-    }
-
-    #[test]
-    fn the_emitted_object_runs_a_wide_constant() {
-        let wide = flat_type(65);
-        let mut values = pattern_bits(65, 1);
-        values[64] = true;
-        let main = function(
-            "main",
-            vec![],
-            Type::Bit,
-            vec![wide],
-            Block::new(
-                vec![Statement::Bind {
-                    slot: Slot::new(0),
-                    value: bits(&values),
-                }],
-                Some(Box::new(Value::Element {
-                    collection: Box::new(Value::Load(Box::new(Value::Reference {
-                        slot: Slot::new(0),
-                        bit_offset: 0,
-                    }))),
-                    index: 64,
-                })),
-            ),
+    fn runs_an_extern_with_a_word_result() {
+        let result = lapc_ir::extern_result_type(
+            lapc_extern::lookup(0x0203).expect("the operation is known"),
         );
-        assert_eq!(run_object(&Program::new(vec![main]), "wide-constant"), 1);
+        let program = Program::new(vec![constant_function(
+            "call",
+            result,
+            Value::Extern(
+                lapc_extern::Operation::new(0x0203),
+                vec![bits(&bits_of_value(1, 64))],
+            ),
+        )]);
+        assert_word(&program, "call", 1);
     }
 
     #[test]
-    fn the_emitted_object_runs_a_wide_branch() {
-        let mut true_values = pattern_bits(65, 1);
-        true_values[64] = true;
-        let mut false_values = pattern_bits(65, 3);
-        false_values[64] = false;
+    fn runs_an_extern_with_a_wide_result() {
+        let result = lapc_ir::extern_result_type(
+            lapc_extern::lookup(0x0100).expect("the operation is known"),
+        );
+        let program = Program::new(vec![constant_function(
+            "call",
+            result,
+            Value::Extern(
+                lapc_extern::Operation::new(0x0100),
+                vec![bits(&bits_of_value(8, 64))],
+            ),
+        )]);
+        assert_wide(&program, "call", &bits_of_value(1, 65));
+    }
+
+    #[test]
+    fn runs_an_extern_chain() {
+        let acquired = lapc_ir::extern_result_type(
+            lapc_extern::lookup(0x0100).expect("the operation is known"),
+        );
+        let written = lapc_ir::extern_result_type(
+            lapc_extern::lookup(0x0103).expect("the operation is known"),
+        );
+        let read = lapc_ir::extern_result_type(
+            lapc_extern::lookup(0x0102).expect("the operation is known"),
+        );
+        let handle = Value::Element {
+            collection: Box::new(Value::Load(Box::new(Value::Reference {
+                slot: Slot::new(0),
+                bit_offset: 0,
+            }))),
+            index: 1,
+        };
         let main = function(
             "main",
             vec![],
             Type::Bit,
-            vec![],
+            vec![acquired.clone(), written.clone(), read.clone()],
             block(
-                vec![],
+                vec![
+                    Statement::Bind {
+                        slot: Slot::new(0),
+                        value: Value::Extern(
+                            lapc_extern::Operation::new(0x0100),
+                            vec![bits(&bits_of_value(8, 64))],
+                        ),
+                    },
+                    Statement::Bind {
+                        slot: Slot::new(1),
+                        value: Value::Extern(
+                            lapc_extern::Operation::new(0x0103),
+                            vec![
+                                handle.clone(),
+                                bits(&bits_of_value(0, 64)),
+                                bits(&bits_of_value(0xab, 8)),
+                            ],
+                        ),
+                    },
+                    Statement::Bind {
+                        slot: Slot::new(2),
+                        value: Value::Extern(
+                            lapc_extern::Operation::new(0x0102),
+                            vec![handle, bits(&bits_of_value(0, 64))],
+                        ),
+                    },
+                ],
                 Value::Element {
-                    collection: Box::new(Value::Branch(
-                        Box::new(bit(true)),
-                        block(vec![], bits(&true_values)),
-                        block(vec![], bits(&false_values)),
-                    )),
-                    index: 64,
+                    collection: Box::new(Value::Element {
+                        collection: Box::new(Value::Load(Box::new(Value::Reference {
+                            slot: Slot::new(2),
+                            bit_offset: 0,
+                        }))),
+                        index: 1,
+                    }),
+                    index: 0,
                 },
             ),
         );
-        assert_eq!(run_object(&Program::new(vec![main]), "wide-branch"), 1);
+        let program = Program::new(vec![main]);
+        assert_word(&program, "main", 1);
     }
 
     #[test]
-    fn the_emitted_object_runs_a_wide_call() {
-        let wide = flat_type(65);
-        let identity = function(
-            "identity",
+    fn runs_a_reference_argument() {
+        let word = flat_type(64);
+        let read = function(
+            "read",
             vec![Parameter::new(Slot::new(0))],
-            wide.clone(),
-            vec![wide.clone()],
+            word.clone(),
+            vec![Type::Reference(Box::new(word.clone()))],
             block(
                 vec![],
                 Value::Load(Box::new(Value::Reference {
@@ -5278,79 +3010,65 @@ mod tests {
                 })),
             ),
         );
-        let mut values = pattern_bits(65, 2);
-        values[64] = true;
+        let program = Program::new(vec![read]);
+        let values = pattern_bits(64, 9);
+        let stored = bits_to_word(&values, 64);
+        for bit in [0u64, 37] {
+            let Some(result) = run_word_call(
+                &program,
+                "read",
+                &[Argument::Reference {
+                    storage: vec![stored, 0],
+                    bit,
+                }],
+            ) else {
+                return;
+            };
+            let expected = if bit == 0 { stored } else { stored >> bit };
+            assert_eq!(result, expected, "at bit {bit}");
+        }
+    }
+
+    #[test]
+    fn runs_an_extern_payload_bit() {
+        let result = lapc_ir::extern_result_type(
+            lapc_extern::lookup(0x0100).expect("the operation is known"),
+        );
+        let acquire = || {
+            Value::Extern(
+                lapc_extern::Operation::new(0x0100),
+                vec![bits(&bits_of_value(0, 64))],
+            )
+        };
         let main = function(
             "main",
             vec![],
             Type::Bit,
-            vec![wide.clone()],
+            vec![result.clone(), result.clone()],
             block(
-                vec![Statement::Bind {
-                    slot: Slot::new(0),
-                    value: Value::Call(Label::new("identity"), vec![bits(&values)]),
-                }],
-                Value::Element {
-                    collection: Box::new(Value::Load(Box::new(Value::Reference {
+                vec![
+                    Statement::Bind {
                         slot: Slot::new(0),
-                        bit_offset: 0,
-                    }))),
-                    index: 64,
+                        value: acquire(),
+                    },
+                    Statement::Bind {
+                        slot: Slot::new(1),
+                        value: acquire(),
+                    },
+                ],
+                Value::Element {
+                    collection: Box::new(Value::Element {
+                        collection: Box::new(Value::Load(Box::new(Value::Reference {
+                            slot: Slot::new(1),
+                            bit_offset: 0,
+                        }))),
+                        index: 1,
+                    }),
+                    index: 0,
                 },
             ),
         );
-        assert_eq!(
-            run_object(&Program::new(vec![identity, main]), "wide-call"),
-            1
-        );
-    }
-
-    #[test]
-    fn the_emitted_object_runs_an_extern_with_a_wide_result() {
-        let value = Value::Element {
-            collection: Box::new(Value::Element {
-                collection: Box::new(Value::Extern(
-                    Operation::new(0x0100),
-                    vec![bits(&[false; 64])],
-                )),
-                index: 1,
-            }),
-            index: 1,
-        };
-        let main = constant_function("main", Type::Bit, value);
-        let object = emit_object(&Program::new(vec![main])).expect("the object emits");
-        assert_eq!(link_and_run("extern-wide", &object, &entry_source()), 1);
-    }
-
-    const COUNTING_PRELUDE: &str = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\n\
-         BIT.ZERO = NAND(BIT.ONE, BIT.ONE)\n\
-         bit.not = (a: BIT) BIT { NAND(a, a) }\n\
-         bit.and = (a: BIT, b: BIT) BIT { bit.not(NAND(a, b)) }\n\
-         U2 = [BIT, BIT]\n\
-         U2.ZERO = [BIT.ZERO, BIT.ZERO]\n\
-         U2.ONE = [BIT.ONE, BIT.ZERO]\n\
-         U2.TWO = [BIT.ZERO, BIT.ONE]\n\
-         U2.THREE = [BIT.ONE, BIT.ONE]\n\
-         u2.is.zero = (value: U2) BIT { [low, high] = value\n bit.and(bit.not(low), bit.not(high)) }\n\
-         u2.dec = (value: U2) U2 { [low, high] = value\n BRANCH (low) { [BIT.ZERO, high] } { [BIT.ONE, bit.not(high)] } }\n";
-
-    #[test]
-    fn jit_runs_a_self_tail_call_as_a_loop() {
-        let program = compile_source(&format!(
-            "{COUNTING_PRELUDE}\
-             count.down = (count: U2) BIT {{ BRANCH (u2.is.zero(count)) {{ BIT.ONE }} {{ count.down(u2.dec(count)) }} }}\n\
-             main = () BIT {{ count.down(U2.THREE) }}\n"
-        ));
-        assert_eq!(run_word(&program, "main"), 1);
-    }
-
-    #[test]
-    fn jit_keeps_a_tail_call_with_a_local_reference_as_a_call() {
-        let program = compile_source(&format!(
-            "{COUNTING_PRELUDE}\
-             count.down = (count: U2, target: *U2) BIT {{ BRANCH (u2.is.zero(count)) {{ [low, high] = target\n low }} {{ count.down(u2.dec(count), *count) }} }}\n\
-             main = () BIT {{ count: U2 = U2.THREE\n count.down(count, *count) }}\n"
-        ));
-        assert_eq!(run_word(&program, "main"), 1);
+        let program = Program::new(vec![main]);
+        assert_word(&program, "main", 1);
     }
 }

@@ -39,24 +39,13 @@ Windows, x86_64, clang 21.1.0 (zig), `-O2`, 16777216 iterations. Nanoseconds, fa
 
 | Benchmark | Lap | C | Lap/C |
 | --- | --- | --- | --- |
-| `00-baseline` | 8725100 | 3471300 | 2.51 |
-| `01-inlining` | 9032400 | 3395900 | 2.66 |
-| `02-mem2reg` | 30259600 | 40177700 | 0.75 |
-| `03-branch` | 16458000 | 16793300 | 0.98 |
-| `04-wide` | 8656500 | 7001300 | 1.24 |
-| `05-masks` | 33506300 | 16727700 | 2.00 |
-
-The same run with Cranelift `opt_level` at its default of `none`:
-
-| Benchmark | Lap | C | Lap/C |
-| --- | --- | --- | --- |
-| `00-baseline` | 15850300 | 3489600 | 4.54 |
-| `01-inlining` | 14579500 | 3365400 | 4.33 |
-| `02-mem2reg` | 30747300 | 40512600 | 0.76 |
-| `03-branch` | 21249000 | 16895500 | 1.26 |
-| `04-wide` | 11242600 | 6817700 | 1.65 |
-| `05-masks` | 40402100 | 16786000 | 2.41 |
+| `00-baseline` | 3535800 | 3507200 | 1.01 |
+| `01-inlining` | 5270100 | 3453700 | 1.53 |
+| `02-mem2reg` | 40157100 | 42029700 | 0.96 |
+| `03-branch` | 17261900 | 17105600 | 1.01 |
+| `04-wide` | 6796700 | 6956800 | 0.98 |
+| `05-masks` | 24333900 | 17257500 | 1.41 |
 
 ## Ownership
 
-This crate owns the benchmark programs and the measurement protocol. `lapc-driver` owns building a Lap program and finding the C compiler.
+This crate owns the benchmark programs and the measurement protocol. `lapc-codegen` owns emitting C and finding the C compiler; `lapc-driver` owns building a Lap program.

@@ -12,7 +12,7 @@
 
 `lapc` takes one or more files and appends them in the order given, top to bottom. The result is one program.
 
-`lapc check` checks a program. `lapc build` emits an object and links it with the runtime using a C compiler. `CC` names the compiler when set; otherwise the driver tries `cc`, `gcc`, `clang`, and `zig cc`, in that order, and uses the first that can compile the runtime. The runtime needs a POSIX-style C compiler: on Windows, a MinGW-w64 toolchain such as zig or MSYS2, not MSVC. On Linux the link passes `-no-pie`, because the object reaches `lap_extern` through an absolute address. The link strips debug sections, so a program does not carry the runtime library's debug info.
+`lapc check` checks a program. `lapc build` emits C and compiles it with the runtime using a C compiler. `CC` names the compiler when set; otherwise the driver tries `cc`, `gcc`, `clang`, and `zig cc`, in that order, and uses the first that can compile the runtime. The runtime needs a POSIX-style C compiler: on Windows, a MinGW-w64 toolchain such as zig or MSYS2, not MSVC. `LAPC_DUMP_C` names a file to write the generated C to, for debugging.
 
 ## Structure
 
@@ -70,13 +70,13 @@ An intrinsic is a first-class IR node, not an `EXTERN` call, so later passes sti
 
 ## Backend
 
-`lapc` lowers to Cranelift IR and emits an object file. The runtime is C, linked by the system linker. An intrinsic's lowering is a Cranelift IR sequence.
+`lapc` emits C17 and compiles it with a C compiler. The runtime is C, compiled and linked in the same step. An intrinsic's lowering is a C expression.
 
-A value of 64 bits or fewer is a word. A wider value is a stack slot. A reference is a pointer to a slot. `NAND` is `and` then `xor`, plus a mask when the width is under 64.
+A value of 64 bits or fewer is a `uint64_t`. A wider value is a `uint64_t` array of `ceil(width / 64) + 1` words; the extra word is slack for a bit-granular store that straddles a word boundary. A reference is a base pointer and a bit offset, passed as two arguments. `NAND` is `~` of `&`, masked to the width.
 
-A word binding whose slot is never addressed and never rebound stays in a register instead of its stack slot. A binding of a collection whose elements are all words stays in registers the same way. A branch result is a block parameter, not a stack slot. A copy of a value at most 512 bits wide is a straight-line sequence of word moves; a wider copy is a loop.
+The backend emits straightforward C and leaves optimization to the C compiler. It does not promote a binding to a register, inline a callee, or strength-reduce a multiply or a division; the C compiler does those. A self-tail-call becomes a `goto` to the body when no argument is a reference to a local of that frame. Only functions reachable from `main` are emitted; a program without `main` emits every function.
 
-A call whose arguments contain no call and no `EXTERN` is lowered inline when the callee's body holds only pure bindings and every block in it holds no other statement. A word parameter whose address is never taken is carried across a self-tail call instead of its stack slot. A division lowers to a zero-checked divide; a constant divisor lowers to a shift or to a multiply and a shift instead when one exists. A multiply by a constant lowers to a short sequence of shifts and adds when one exists. Only functions reachable from `main` are emitted; a program without `main` emits every function.
+A wide operation is a loop over words. It is defined for `not`, `and`, `or`, `xor`, `add`, `sub`, and `nand`. A wide value is loaded and stored a word at a time, at any bit offset. A division is defined for operands up to 64 bits; a wider operand is a codegen error.
 
 ## Runtime interface
 

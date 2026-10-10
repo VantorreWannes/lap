@@ -318,5 +318,4 @@ mod tests {
         let twice = erase_intrinsics(once.clone());
         assert_eq!(once, twice);
     }
-
 }

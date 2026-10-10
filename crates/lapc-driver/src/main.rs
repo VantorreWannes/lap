@@ -73,7 +73,7 @@ mod tests {
     use std::path::Path;
     use std::process::{Command as ProcessCommand, Stdio};
 
-    use lapc_driver::find_compiler;
+    use lapc_codegen::find_compiler;
 
     const PRELUDE: &str =
         "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\nBIT.ZERO = NAND(BIT.ONE, BIT.ONE)\n";
@@ -374,7 +374,9 @@ mod tests {
         }
         let code = build_one_and_run(
             "erased",
-            &format!("{PRELUDE}liblapc.bit.not = []\nmain = () BIT {{ liblapc.bit.not(BIT.ZERO) }}\n"),
+            &format!(
+                "{PRELUDE}liblapc.bit.not = []\nmain = () BIT {{ liblapc.bit.not(BIT.ZERO) }}\n"
+            ),
         );
         assert_eq!(code, 1);
     }
