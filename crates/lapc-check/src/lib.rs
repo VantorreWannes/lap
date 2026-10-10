@@ -570,7 +570,7 @@ impl Checker {
         if elements.len() != targets.len() {
             return Err(CheckError::new(CheckErrorKind::WrongElementCount));
         }
-        let needs_slot = source_needs_slot(targets);
+        let needs_slot = source_needs_slot(targets, &checked.value);
         let (value, slot) = if needs_slot {
             let slot = self.add_slot(checked.type_.clone());
             self.builder.statements.push(IrStatement::Bind {
@@ -1061,8 +1061,19 @@ struct DestructuringSource {
     bit_offset: usize,
 }
 
-fn source_needs_slot(targets: &[Target]) -> bool {
-    target_count(targets) > 1 || targets.iter().any(target_takes_reference)
+fn source_needs_slot(targets: &[Target], value: &Value) -> bool {
+    target_count(targets) > 1
+        || targets.iter().any(target_takes_reference)
+        || value_loses_its_type(value)
+}
+
+fn value_loses_its_type(value: &Value) -> bool {
+    match value {
+        Value::Constant(_) | Value::Branch(..) => true,
+        Value::Collection(elements) => elements.iter().any(value_loses_its_type),
+        Value::Element { collection, .. } => value_loses_its_type(collection),
+        _ => false,
+    }
 }
 
 fn target_count(targets: &[Target]) -> usize {
@@ -1279,6 +1290,32 @@ mod tests {
         assert_eq!(statements.len(), 1);
         assert!(matches!(
             &statements[0],
+            IrStatement::Bind {
+                value: Value::Element { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_single_target_destructuring_of_a_constant_binds_the_source() {
+        let program = check(
+            "ONE = [BIT]\n\
+             ONE.ONE = [BIT.ONE]\n\
+             main = () BIT { [x] = ONE.ONE\n x }\n",
+        )
+        .expect("the program checks");
+        let statements = function(&program, "main").body().statements();
+        assert_eq!(statements.len(), 2);
+        assert!(matches!(
+            &statements[0],
+            IrStatement::Bind {
+                value: Value::Constant(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            &statements[1],
             IrStatement::Bind {
                 value: Value::Element { .. },
                 ..

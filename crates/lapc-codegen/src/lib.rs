@@ -627,14 +627,14 @@ impl<'program> Emitter<'program> {
 
     fn constant(&mut self, bits: &[bool], width: usize) -> Result<Emitted, String> {
         if width <= 64 {
-            return Ok(Emitted::Word(bits_to_word(bits, width).to_string()));
+            return Ok(Emitted::Word(word_literal(bits_to_word(bits, width))));
         }
         let name = self.temporary_array(width);
         let mut offset = 0;
         while offset < width {
             let chunk = (width - offset).min(64);
             let word = bits_to_word(&bits[offset..], chunk);
-            self.line(format!("{name}[{}] = {word};", offset / 64));
+            self.line(format!("{name}[{}] = {};", offset / 64, word_literal(word)));
             offset += chunk;
         }
         Ok(Emitted::Pointer(name))
@@ -1121,6 +1121,10 @@ fn flat_type(width: usize) -> Type {
 
 fn words(width: usize) -> usize {
     width.div_ceil(64) + 1
+}
+
+fn word_literal(word: u64) -> String {
+    format!("((uint64_t)0x{word:x})")
 }
 
 fn bits_to_word(bits: &[bool], width: usize) -> u64 {
@@ -3070,5 +3074,64 @@ mod tests {
         );
         let program = Program::new(vec![main]);
         assert_word(&program, "main", 1);
+    }
+
+    #[test]
+    fn runs_a_destructured_single_bit_collection_constant() {
+        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\n\
+            BIT.ZERO = NAND(BIT.ONE, BIT.ONE)\n\
+            ONE = [BIT]\n\
+            ONE.ONE = [BIT.ONE]\n\
+            main = () BIT { [x] = ONE.ONE\n x }\n";
+        let program = compile_source(source);
+        assert_word(&program, "main", 1);
+    }
+
+    #[test]
+    fn runs_a_destructured_nested_collection_constant() {
+        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\n\
+            BIT.ZERO = NAND(BIT.ONE, BIT.ONE)\n\
+            U2 = [BIT, BIT]\n\
+            U2.ONE = [BIT.ONE, BIT.ZERO]\n\
+            WRAP = [U2]\n\
+            WRAP.ONE = [U2.ONE]\n\
+            main = () BIT { [x] = WRAP.ONE\n [a, b] = x\n a }\n";
+        let program = compile_source(source);
+        assert_word(&program, "main", 1);
+    }
+
+    #[test]
+    fn runs_a_destructured_branch_of_a_constant() {
+        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\n\
+            BIT.ZERO = NAND(BIT.ONE, BIT.ONE)\n\
+            U2 = [BIT, BIT]\n\
+            U2.ONE = [BIT.ONE, BIT.ZERO]\n\
+            U2.ZERO = [BIT.ZERO, BIT.ZERO]\n\
+            WRAP = [U2]\n\
+            WRAP.ONE = [U2.ONE]\n\
+            WRAP.ZERO = [U2.ZERO]\n\
+            main = () BIT { [x] = BRANCH (BIT.ONE) { WRAP.ONE } { WRAP.ZERO }\n [a, b] = x\n a }\n";
+        let program = compile_source(source);
+        assert_word(&program, "main", 1);
+    }
+
+    #[test]
+    fn runs_a_collection_of_a_constant_element() {
+        let source = "BIT.ONE = NAND(BIT, NAND(BIT, BIT))\n\
+            BIT.ZERO = NAND(BIT.ONE, BIT.ONE)\n\
+            U8 = [BIT, BIT, BIT, BIT, BIT, BIT, BIT, BIT]\n\
+            U32 = [U8, U8, U8, U8]\n\
+            U64 = [U32, U32]\n\
+            U8.ZERO = [BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO]\n\
+            U8.ONE = [BIT.ONE, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO, BIT.ZERO]\n\
+            U32.ZERO = [U8.ZERO, U8.ZERO, U8.ZERO, U8.ZERO]\n\
+            U32.ONE = [U8.ONE, U8.ZERO, U8.ZERO, U8.ZERO]\n\
+            pack = (low: U32) U64 { [low, U32.ONE] }\n\
+            main = () BIT { pack(U32.ZERO)\n BIT.ZERO }\n";
+        let program = compile_source(source);
+        let Some(result) = run_word_call(&program, "pack", &[Argument::Word(0x1234)]) else {
+            return;
+        };
+        assert_eq!(result, 0x1234 | (1 << 32));
     }
 }
